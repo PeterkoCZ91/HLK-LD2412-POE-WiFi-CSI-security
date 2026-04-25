@@ -1,0 +1,59 @@
+name: Feature request
+description: Suggest a new feature, detection improvement, or UX enhancement.
+title: "[Feature] "
+labels: ["enhancement", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for suggesting an improvement. Please describe the use case before the implementation — it helps evaluate alternatives.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / use case
+      description: What are you trying to do that isn't currently possible or convenient?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What would a good solution look like from a user perspective? API shape, UI change, MQTT topic, etc.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Existing workarounds, other tools, or approaches you ruled out.
+    validations:
+      required: false
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Radar detection / zones
+        - WiFi CSI / fusion
+        - Alarm state machine
+        - Web dashboard / GUI
+        - Home Assistant / MQTT
+        - Telegram bot
+        - OTA / update flow
+        - Build system / CI
+        - Documentation
+        - Other
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: Confirmation
+      options:
+        - label: I searched existing issues and discussions for a similar request.
+          required: true

@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Discussions (questions, ideas, general help)
+    url: https://github.com/PeterkoCZ91/HLK-LD2412-POE-WiFi-CSI-security/discussions
+    about: For usage questions, setup help, and ideas — not bug reports.
+  - name: Home Assistant + MQTT integration
+    url: https://github.com/PeterkoCZ91/HLK-LD2412-POE-WiFi-CSI-security/blob/main/README.md#home-assistant
+    about: Check the README first — most HA questions are answered there.

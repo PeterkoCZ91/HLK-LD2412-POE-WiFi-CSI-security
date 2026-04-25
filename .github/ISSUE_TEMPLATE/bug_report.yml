@@ -1,0 +1,102 @@
+name: Bug report
+description: Report a problem with the firmware, web UI, Home Assistant integration, or OTA flow.
+title: "[Bug] "
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug. Please fill in as much as you can — the more context, the faster it gets fixed.
+
+        **Before filing:** check [Known Issues & Limitations](https://github.com/PeterkoCZ91/HLK-LD2412-POE-WiFi-CSI-security/blob/main/README.md#known-issues--limitations) in the README.
+
+  - type: input
+    id: fw_version
+    attributes:
+      label: Firmware version
+      description: From `/api/version` or the web dashboard footer.
+      placeholder: "v5.0.0"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: build_env
+    attributes:
+      label: Build environment
+      options:
+        - esp32_poe_csi (PoE + WiFi CSI)
+        - esp32_poe (PoE radar only)
+        - esp32_wifi (WiFi radar only)
+        - ota_poe_csi
+        - Other / unsure
+    validations:
+      required: true
+
+  - type: input
+    id: hardware
+    attributes:
+      label: Hardware
+      description: ESP32 board model, radar wiring notes if relevant.
+      placeholder: "Prokyber ESP32-Stick-PoE-A + HLK-LD2412"
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Describe the bug. Include timestamps if alarm / detection-related.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect to happen?
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1.
+        2.
+        3.
+    validations:
+      required: true
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostic snapshots
+      description: |
+        Paste the JSON output of these three endpoints (redact SSIDs / IPs / MACs you don't want public):
+        ```
+        curl -u admin:<pw> http://<device-ip>/api/health
+        curl -u admin:<pw> http://<device-ip>/api/csi
+        curl -u admin:<pw> http://<device-ip>/api/telemetry
+        ```
+      render: json
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Serial / system logs (optional)
+      description: Paste relevant serial monitor output or Home Assistant logs.
+      render: text
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: Confirmation
+      options:
+        - label: I searched existing issues and didn't find a duplicate.
+          required: true
+        - label: I'm running an official release or a commit from this repo (not a fork with unrelated changes).
+          required: true

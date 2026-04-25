@@ -1,0 +1,33 @@
+# Build / IDE
+.pio/
+.platformio/
+.vscode/
+.local-notes/
+.claude/
+
+# Python
+__pycache__/
+*.pyc
+
+# OS
+*.DS_Store
+
+# Binaries
+*.bin
+*.tar.gz
+*.zip
+
+# Distribution
+dist/
+
+# Logs
+logs/
+observe_*.jsonl
+
+# Secrets — NEVER commit real credentials
+# Copy .example files and fill in your values:
+#   cp include/secrets.h.example include/secrets.h
+#   cp include/known_devices.h.example include/known_devices.h
+include/secrets.h
+include/secrets_*.h
+include/known_devices.h
