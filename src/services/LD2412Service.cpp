@@ -210,6 +210,32 @@ void LD2412Service::attemptRadarRecovery() {
         _radar = new LD2412(*_serial);
         esp_task_wdt_reset();
 
+        // Verify the new UART link is alive at the configured baud before we
+        // try to push engineering-mode commands. readFirmwareVersion() returns
+        // nullptr if the radar didn't ACK — fall back to the alternate baud
+        // (115200 default vs 256000 high-speed) and re-init once.
+        int* fwCheck = _radar->readFirmwareVersion();
+        if (!fwCheck) {
+            uint32_t altBaud = (_currentBaud == 115200) ? 256000 : 115200;
+            DBG("RADAR", "Hard reset: no ACK at %u — retrying at %u",
+                (unsigned)_currentBaud, (unsigned)altBaud);
+            delete _radar;
+            _serial->end();
+            vTaskDelay(pdMS_TO_TICKS(100));
+            _serial->begin(altBaud, SERIAL_8N1, _rxPin, _txPin);
+            vTaskDelay(pdMS_TO_TICKS(500));
+            _radar = new LD2412(*_serial);
+            esp_task_wdt_reset();
+            int* fwRetry = _radar->readFirmwareVersion();
+            if (fwRetry) {
+                _currentBaud = altBaud;
+                DBG("RADAR", "Hard reset: alt baud %u OK", (unsigned)altBaud);
+            } else {
+                DBG("RADAR", "Hard reset: alt baud %u also unresponsive",
+                    (unsigned)altBaud);
+            }
+        }
+
         // Restore engineering mode if it was active before hard reset
         if (_engineeringMode && _fwMajor != 294) {
             DBG("RADAR", "Hard reset: restoring Engineering Mode...");
@@ -240,7 +266,12 @@ void LD2412Service::attemptRadarRecovery() {
 // =============================================================================
 
 void LD2412Service::update() {
-    if (xSemaphoreTake(_mutex, pdMS_TO_TICKS(2)) != pdTRUE) return;
+    // 50 ms timeout: at 12.5 Hz frame rate (80 ms/frame) this leaves enough
+    // headroom for one frame-interval of contention without dropping the
+    // current cycle. Earlier 2 ms value caused silent skips under CSI/MQTT
+    // load. getData() uses 100 ms (TASK-014) — keep them both above the
+    // longest lock holder.
+    if (xSemaphoreTake(_mutex, pdMS_TO_TICKS(50)) != pdTRUE) return;
     if (!_radar) { xSemaphoreGive(_mutex); return; }
 
     unsigned long now = millis();
@@ -258,11 +289,18 @@ void LD2412Service::update() {
         _tamperDetected = _tamperExternal || _tamperRadarFailure;
         if (_tamperDetected != prevTamper) _stateChanged = true;
 
-        // Get measurements from snapshot (all from same frame)
-        int movDist = snap.movingDistance;
-        int movEn = snap.movingEnergy;
+        // Get measurements from snapshot (all from same frame). Sanity-clamp
+        // each field so a corrupted UART byte (e.g. distance = 0xFFFF cm) can't
+        // propagate into zone/alarm logic. LD2412 valid ranges: distance 0..600 cm,
+        // energy 0..100; treat anything outside as missing.
+        int movDist  = snap.movingDistance;
+        int movEn    = snap.movingEnergy;
         int statDist = snap.staticDistance;
-        int statEn = snap.staticEnergy;
+        int statEn   = snap.staticEnergy;
+        if (movDist  < 0 || movDist  > 600) movDist  = -1;
+        if (statDist < 0 || statDist > 600) statDist = -1;
+        if (movEn    < 0 || movEn    > 100) movEn    = -1;
+        if (statEn   < 0 || statEn   > 100) statEn   = -1;
 
         // Update internal values
         _lastMovEn = (movEn >= 0) ? movEn : 0;

@@ -56,9 +56,11 @@ void SecurityMonitor::begin(NotificationService* notifService, MQTTService* mqtt
 }
 
 void SecurityMonitor::update() {
-    // Increased to 200ms — critical state transitions (PENDING→TRIGGERED,
-    // ARMING→ARMED) must not be silently skipped due to mutex contention
-    if (_mutex && xSemaphoreTake(_mutex, pdMS_TO_TICKS(200)) != pdTRUE) {
+    // 500 ms — critical state transitions (PENDING→TRIGGERED, ARMING→ARMED)
+    // must not be silently skipped due to mutex contention. The previous
+    // 200 ms value left no headroom for processRadarData() bursts under CSI
+    // fusion / heavy MQTT publish phases; setArmed() already uses 500 ms.
+    if (_mutex && xSemaphoreTake(_mutex, pdMS_TO_TICKS(500)) != pdTRUE) {
         DBG("SecMon", "update() mutex timeout — state transitions deferred");
         return;
     }
@@ -139,6 +141,12 @@ void SecurityMonitor::setArmed(bool armed, bool immediate) {
         _lastPresenceWhileDisarmed = 0;
         _presenceWhileDisarmedStart = 0;
         _lastDisarmReminder = 0;
+        // Clear sticky reflector-zone filter so the exit delay starts fresh.
+        // Without this, low-energy wobbles right before the schedule fired
+        // could leave the filter latched and block legitimate motion until
+        // STATIC_FILTER_CLEAR_FRAMES of sustained activity arrived.
+        _isStaticFiltered = false;
+        _staticFilterMoveFrames = 0;
     } else {
         AlarmState prev = _alarmState;
         // FIX #1: Always deactivate siren on disarm (covers TRIGGERED + any corrupted state)
@@ -270,7 +278,7 @@ void SecurityMonitor::processRadarData(uint16_t distance, uint8_t move_energy, u
     if (_mutex && xSemaphoreTake(_mutex, pdMS_TO_TICKS(50)) != pdTRUE) return;
     unsigned long now = millis();
 
-    // static filter is sticky — managed in the filter block below.
+    // csi10e: static filter is sticky — managed in the filter block below.
     // Do NOT unconditionally clear it here: brief move_energy spikes from
     // reflector wobble must not reset it within a single frame.
 
@@ -426,7 +434,7 @@ void SecurityMonitor::processRadarData(uint16_t distance, uint8_t move_energy, u
     }
 
     // 4a2. Static reflector filter — independent of armed state
-    // sticky hysteresis. Once engaged in a behavior==3 zone, require
+    // csi10e: sticky hysteresis. Once engaged in a behavior==3 zone, require
     // STATIC_FILTER_CLEAR_FRAMES consecutive frames of move_energy >= threshold
     // before clearing. This prevents reflector-wobble spikes (e.g. move=35 for
     // one frame) from bypassing the filter → no spurious pending/triggered.
@@ -563,7 +571,7 @@ void SecurityMonitor::processRadarData(uint16_t distance, uint8_t move_energy, u
     // Uses fusion result: radar FP (CSI disagrees) won't trigger alarm,
     // CSI-only presence (radar blind) CAN trigger alarm via entry delay.
     // FIX #4: Debounce — require N consecutive qualifying frames before transition
-    // radarQualifies respects the sticky static filter. Without this,
+    // csi10e: radarQualifies respects the sticky static filter. Without this,
     // a brief move-energy spike could lift the filter in a behavior==3 zone
     // just long enough for this path to pass (and with ML=1.0 the entry delay
     // then expires immediately on the next PENDING check → TRIGGERED).

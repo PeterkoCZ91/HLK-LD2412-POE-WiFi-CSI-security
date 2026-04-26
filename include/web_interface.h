@@ -145,6 +145,16 @@ const char index_html[] PROGMEM = R"rawliteral(
       threshold_label: "Práh detekce (variance threshold):",
       save_config: "Uložit konfiguraci", upload_fw: "Nahrát Firmware", saved: "Uloženo",
       fw_update_title: "Aktualizace FW",
+      pull_ota_title: "Pull OTA z URL",
+      pull_ota_help: "ESP si stáhne firmware sám z dané URL. Funguje s HTTPS i přesměrováním. Auth header je volitelný (např. <code>Bearer &lt;token&gt;</code>).",
+      pull_ota_btn: "⤓ Stáhnout a flashnout",
+      pull_ota_running: "Stahuji & flashuji…",
+      pull_ota_phase_idle: "—",
+      pull_ota_phase_downloading: "Stahuji…",
+      pull_ota_phase_writing: "Zapisuji firmware…",
+      pull_ota_phase_success: "✅ Hotovo, restartuji",
+      pull_ota_phase_error: "❌ Chyba",
+      pull_ota_no_url: "Zadej URL k firmware .bin",
       ota_cold_label: "Před OTA restartovat (doporučeno pro 100% úspěšnost)",
       ota_cold_restart: "Restartuji zařízení...", ota_waiting_reboot: "Čekám na zařízení",
       ota_ready_uploading: "Zařízení naběhlo, nahrávám...", ota_uploading: "Nahrávám firmware...",
@@ -277,6 +287,16 @@ const char index_html[] PROGMEM = R"rawliteral(
       threshold_label: "Detection threshold (variance):",
       save_config: "Save Configuration", upload_fw: "Upload Firmware", saved: "Saved",
       fw_update_title: "Firmware Update",
+      pull_ota_title: "Pull OTA from URL",
+      pull_ota_help: "Device fetches the firmware itself from the given URL. HTTPS + redirects supported. Auth header optional (e.g. <code>Bearer &lt;token&gt;</code>).",
+      pull_ota_btn: "⤓ Fetch & flash",
+      pull_ota_running: "Fetching & flashing…",
+      pull_ota_phase_idle: "—",
+      pull_ota_phase_downloading: "Downloading…",
+      pull_ota_phase_writing: "Writing firmware…",
+      pull_ota_phase_success: "✅ Done, rebooting",
+      pull_ota_phase_error: "❌ Error",
+      pull_ota_no_url: "Enter URL to firmware .bin",
       ota_cold_label: "Reboot device before OTA (recommended for 100% success)",
       ota_cold_restart: "Rebooting device...", ota_waiting_reboot: "Waiting for device",
       ota_ready_uploading: "Device up, uploading...", ota_uploading: "Uploading firmware...",
@@ -967,6 +987,16 @@ const char index_html[] PROGMEM = R"rawliteral(
         <div id="ota_status" style="margin-top:4px; font-size:0.85em; color:#aaa; min-height:1.1em"></div>
         <div id="ota_bar" style="height:5px; background:#333; margin-top:5px; width:0%; transition:width 0.2s; background:var(--accent)"></div>
         <button id="btn_ota" onclick="uploadFW()" data-i18n="upload_fw">Nahrát Firmware</button>
+
+        <hr style="border:none; border-top:1px solid #333; margin:14px 0 10px">
+        <div class="stat-row"><span data-i18n="pull_ota_title">Pull OTA z URL</span></div>
+        <div style="font-size:0.75rem; color:#777; margin-bottom:6px">
+            <span data-i18n="pull_ota_help">ESP si stáhne firmware sám z dané URL. Funguje s HTTPS i přesměrováním. Auth header je volitelný (např. <code>Bearer &lt;token&gt;</code>).</span>
+        </div>
+        <input type="text" id="pull_url" placeholder="https://example.com/firmware.bin" style="width:100%; box-sizing:border-box; margin-bottom:6px">
+        <input type="text" id="pull_auth" placeholder="Bearer …" style="width:100%; box-sizing:border-box; margin-bottom:6px">
+        <div id="pull_status" style="margin-top:4px; font-size:0.85em; color:#aaa; min-height:1.1em"></div>
+        <button id="btn_pull" onclick="pullFW()" class="sec" data-i18n="pull_ota_btn">⤓ Stáhnout a flashnout</button>
     </div>
   </div>
 
@@ -2183,6 +2213,65 @@ function uploadFW() {
     } else {
         _otaSendUpload(f);
     }
+}
+
+// --- PULL OTA ---
+function _pullStatus(msg) { $('pull_status').innerText = msg || ''; }
+function _pullPhaseLabel(phase) {
+    if (phase === 'downloading' || phase === 'fetching') return t('pull_ota_phase_downloading');
+    if (phase === 'writing' || phase === 'flashing')     return t('pull_ota_phase_writing');
+    if (phase === 'success')                              return t('pull_ota_phase_success');
+    if (phase === 'error')                                return t('pull_ota_phase_error');
+    return t('pull_ota_phase_idle');
+}
+function _pullPoll(tries) {
+    if (tries > 60) { $('btn_pull').disabled = false; return; }
+    fetch('/api/update/pull/status', {credentials:'include'})
+        .then(r => r.json())
+        .then(d => {
+            const phase = (d.phase || 'idle').toLowerCase();
+            const lbl = _pullPhaseLabel(phase);
+            const err = d.last_error ? (' — ' + d.last_error) : '';
+            _pullStatus(lbl + err);
+            if (phase === 'success') {
+                setTimeout(() => location.reload(), 4000);
+                return;
+            }
+            if (phase === 'error') {
+                $('btn_pull').disabled = false;
+                return;
+            }
+            setTimeout(() => _pullPoll(tries + 1), 2000);
+        })
+        .catch(() => setTimeout(() => _pullPoll(tries + 1), 2000));
+}
+function pullFW() {
+    const url = ($('pull_url').value || '').trim();
+    if (!url) { _pullStatus(t('pull_ota_no_url')); return; }
+    const auth = ($('pull_auth').value || '').trim();
+    const body = auth ? {url, auth} : {url};
+    $('btn_pull').disabled = true;
+    _pullStatus(t('pull_ota_running'));
+    fetch('/api/update/pull', {
+        method: 'POST',
+        credentials: 'include',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(body)
+    })
+    .then(r => r.json().catch(() => ({})))
+    .then(d => {
+        if (d && d.error) {
+            _pullStatus(t('pull_ota_phase_error') + ' — ' + d.error);
+            $('btn_pull').disabled = false;
+            return;
+        }
+        // accepted; start polling
+        setTimeout(() => _pullPoll(0), 1500);
+    })
+    .catch(e => {
+        _pullStatus(t('pull_ota_phase_error') + ' — ' + e);
+        $('btn_pull').disabled = false;
+    });
 }
 
 // --- ALARM ---

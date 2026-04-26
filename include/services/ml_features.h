@@ -3,7 +3,7 @@
 
 // 17-feature extractor for CSI motion detection MLP (17 -> 18 -> 9 -> 1).
 // Ported from espectre (Francesco Pace, GPLv3) components/espectre/ml_features.h.
-// Trained with DSER/PLCR features; test F1 = 0.852.
+// Retrained 2026-04-23 with DSER/PLCR; test F1 = 0.852.
 //
 // Features (must match training order in train_ml_model.py):
 //   0 turb_mean       1 turb_std        2 turb_max       3 turb_min

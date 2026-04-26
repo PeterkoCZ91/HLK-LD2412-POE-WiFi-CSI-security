@@ -97,6 +97,11 @@ void EventLog::flushToDisk() {
         DBG("EventLog", "CRIT: alloc failed heap=%u maxAlloc=%u",
             ESP.getFreeHeap(), ESP.getMaxAllocHeap());
         xSemaphoreGive(_mutex);
+        // Defer the next attempt by another flush interval. Without this,
+        // flush() would re-enter on every loop tick (the 60 s rate-limit
+        // gate uses _lastFlush, which is only bumped on success below) and
+        // re-take the mutex under starvation, blocking addEvent() callers.
+        _lastFlush = millis();
         return;
     }
     for (uint32_t i = 0; i < newEvents; i++) {

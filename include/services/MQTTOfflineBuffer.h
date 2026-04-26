@@ -22,7 +22,10 @@ struct MQTTBufHeader {
 };  // 16 bytes
 
 static constexpr uint32_t MQTT_BUF_MAGIC    = 0x4D510001;
-static constexpr size_t   MQTT_BUF_CAPACITY = 50;
+// 200 slots × 288 B = ~57.6 KB on LittleFS (well within 16 MB partition).
+// Sized for ~5 min outage at typical state-change publish rate so HA timeline
+// stays continuous; pre-fix 50 dropped most messages on long ETH/MQTT gaps.
+static constexpr size_t   MQTT_BUF_CAPACITY = 200;
 static constexpr size_t   MQTT_BUF_HDR_SIZE = sizeof(MQTTBufHeader);
 static constexpr size_t   MQTT_BUF_MSG_SIZE = sizeof(BufferedMsg);
 

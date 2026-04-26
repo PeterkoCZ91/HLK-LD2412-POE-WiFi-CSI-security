@@ -54,7 +54,7 @@ public:
     float getVariance() const { return _runningVariance; }
     uint32_t getPacketCount() const { return _totalPackets; }
 
-    // HT LTF presence flag — true after first valid HT LTF frame.
+    // csi10c: HT LTF presence flag — true after first valid HT LTF frame.
     // Stays false when AP emits only HE PHY (WiFi 6 hardware) — lets users
     // distinguish "AP incompatible" from "WiFi not associated" within seconds.
     bool isHtLtfSeen() const { return _htLtfSeen; }
@@ -101,7 +101,7 @@ public:
     uint32_t getSiteLearningRejectedMotion() const { return _siteLearnRejectedMotion; }
     uint32_t getSiteLearningRejectedRadar()  const { return _siteLearnRejectedRadar; }
     uint32_t getSiteLearningResetBssid()     const { return _siteLearnBssidResetCount; }
-    // feed radar ground-truth presence into site-learning filter so
+    // csi6b: feed radar ground-truth presence into site-learning filter so
     // stationary humans (low CSI variance + breathing hold) don't poison the
     // quiet-site baseline. Called from main loop before csiService.update().
     void notePresenceFromRadar(bool present) { _radarPresent = present; }
@@ -112,7 +112,7 @@ public:
     float getLearnedVarianceStd() const { return _learnedStdVar; }
     float getLearnedVarianceMax() const { return _learnedMaxVar; }
     uint32_t getLearnedSampleCount() const { return _learnedSampleCount; }
-    // continuous EMA refresh of learned model (adapts to seasonal / furniture changes)
+    // csi10: continuous EMA refresh of learned model (adapts to seasonal / furniture changes)
     uint32_t getLearnRefreshCount() const { return _learnRefreshCount; }
 
     // Auto-calibration on quiet environment
@@ -134,23 +134,23 @@ public:
         _autoCalQuietStart = 0;
     }
 
-    // stuck-in-motion auto-raise (port from espectre 02b84e3)
+    // csi2: stuck-in-motion auto-raise (port from espectre 02b84e3)
     uint32_t getStuckMotionCount() const { return _stuckMotionCount; }
     uint8_t  getStuckRaiseCount()  const { return _stuckRaiseCount; }
     float    getBaseThreshold()    const { return _baseThreshold; }
     void     resetStuckMotion() { _stuckMotionCount = 0; _stuckRaiseCount = 0; _threshold = _baseThreshold; }
 
-    // BSSID change detection (auto-reset baseline on AP roam)
+    // csi3: BSSID change detection (auto-reset baseline on AP roam)
     uint32_t getBssidChangeCount() const { return _bssidChangeCount; }
 
-    // adaptive P95 rolling threshold
+    // csi4: adaptive P95 rolling threshold
     void     setAdaptiveThreshold(bool enabled) { _adaptiveThresholdEnabled = enabled; }
     bool     isAdaptiveThresholdEnabled() const { return _adaptiveThresholdEnabled; }
     float    getAdaptiveThreshold()       const { return _adaptiveThreshold; }
     float    getEffectiveThreshold() const;
     uint16_t getP95SampleCount()    const { return _p95BufCount; }
 
-    // NBVI subcarrier auto-selection (port from espectre NBVICalibrator, EWMA-lite)
+    // csi5: NBVI subcarrier auto-selection (port from espectre NBVICalibrator, EWMA-lite)
     void     setNbviEnabled(bool enabled) {
         _nbviEnabled = enabled;
         if (!enabled) { _nbviReady = false; _nbviActiveCount = NUM_SUBCARRIERS; }
@@ -166,7 +166,7 @@ public:
     float    getNbviBestScore()  const { return _nbviBestScore; }
     float    getNbviWorstScore() const { return _nbviWorstScore; }
 
-    // OTA-aware pause. While set, update() and _restoreEthDefaultNetif()
+    // csi7b: OTA-aware pause. While set, update() and _restoreEthDefaultNetif()
     // short-circuit so CSI does not touch WiFi/lwIP state during OTA transfer.
     // WiFi reconnects and netif_set_default() otherwise risk dropping the TCP
     // stream mid-upload. Set from ArduinoOTA.onStart / HTTP OTA Update.begin;
@@ -174,7 +174,7 @@ public:
     static void setOtaInProgress(bool active) { _otaInProgress.store(active); }
     static bool isOtaInProgress() { return _otaInProgress.load(); }
 
-    // MLP motion detection (15-feature MLP 15->16->8->1, F1=0.795 baseline).
+    // csi8: MLP motion detection (15-feature MLP 15->16->8->1, F1=0.795 baseline).
     // Runs in parallel with variance-threshold path so HA can A/B compare ML vs radar.
     void  setMlEnabled(bool enabled) { _mlEnabled = enabled; if (!enabled) _mlMotion = false; }
     bool  isMlEnabled()       const { return _mlEnabled; }
@@ -298,7 +298,7 @@ private:
     // Timing
     uint32_t _totalPackets = 0;
     uint32_t _windowPackets = 0;
-    volatile bool _htLtfSeen = false;  // set in _processCSI on first valid HT LTF frame
+    volatile bool _htLtfSeen = false;  // csi10c: set in _processCSI on first valid HT LTF frame
     uint32_t _lastPublishMs = 0;
     float    _packetRate = 0.0f;
     bool     _reconnectRequested = false;
@@ -316,7 +316,7 @@ private:
     bool     _autoCalDone = false;
     uint32_t _autoCalQuietStart = 0;
 
-    // stuck-in-motion auto-raise
+    // csi2: stuck-in-motion auto-raise
     uint32_t _stuckMotionCount = 0;
     uint8_t  _stuckRaiseCount = 0;
     float    _baseThreshold = 0.5f;
@@ -324,12 +324,12 @@ private:
     static constexpr uint8_t  STUCK_RAISE_MAX = 3;
     static constexpr float    STUCK_RAISE_FACTOR = 1.5f;
 
-    // BSSID change detection
+    // csi3: BSSID change detection
     uint8_t  _lastBSSID[6] = {0};
     bool     _bssidInitialized = false;
     uint32_t _bssidChangeCount = 0;
 
-    // adaptive P95 rolling threshold
+    // csi4: adaptive P95 rolling threshold
     static constexpr uint16_t P95_BUFFER_SIZE = 300;
     static constexpr uint16_t P95_UPDATE_EVERY = 30;
     static constexpr float    P95_FACTOR = 1.1f;
@@ -340,7 +340,7 @@ private:
     bool     _adaptiveThresholdEnabled = true;
     float    _adaptiveThreshold = 0.0f;
 
-    // NBVI-lite subcarrier auto-selection
+    // csi5: NBVI-lite subcarrier auto-selection
     static constexpr float    NBVI_ALPHA        = 0.01f;
     static constexpr uint32_t NBVI_MIN_SAMPLES  = 200;
     static constexpr uint32_t NBVI_RECALC_EVERY = 500;
@@ -361,7 +361,7 @@ private:
     float    _nbviBestScore   = 0;
     float    _nbviWorstScore  = 0;
 
-    // long-term quiet-site learning (hours/days). Saved to NVS via _prefs.
+    // csi6: long-term quiet-site learning (hours/days). Saved to NVS via _prefs.
     Preferences* _prefs = nullptr;
     bool     _siteLearningActive = false;
     uint32_t _siteLearnStartMs = 0;
@@ -376,9 +376,10 @@ private:
     float    _siteLearnMaxVar = 0.0f;
     bool     _siteModelReady = false;
     float    _learnedThreshold = 0.0f;
-    // absolute floor for learned variance threshold. Below this the
+    // csi10e: absolute floor for learned variance threshold. Below this the
     // baseline becomes a hair-trigger — even normal WiFi jitter, weather, or
     // distant-room RF drift will exceed it and false-positive the CSI signal.
+    // Observed production false-alarm on 2026-04-24 had learned_threshold=0.001.
     static constexpr float MIN_LEARNED_THRESHOLD = 0.005f;
     float    _learnedMeanVar = 0.0f;
     float    _learnedStdVar = 0.0f;
@@ -387,11 +388,11 @@ private:
     float    _learnedIdleMeanTurb = 0.0f;
     float    _learnedIdleMeanPhase = 0.0f;
     float    _learnedIdleAmpBaseline = 0.0f;
-    // continuous EMA refresh state
+    // csi10: continuous EMA refresh state
     unsigned long _lastLearnRefreshSaveMs = 0;
     uint32_t _learnRefreshCount = 0;
 
-    // MLP motion detection state (15 -> 16 -> 8 -> 1, dual-threshold hysteresis)
+    // csi8: MLP motion detection state (15 -> 16 -> 8 -> 1, dual-threshold hysteresis)
     bool     _mlEnabled     = true;
     float    _mlThreshold   = 0.50f;      // enter threshold; exit = threshold * ML_EXIT_FACTOR
     float    _mlProbability = 0.0f;

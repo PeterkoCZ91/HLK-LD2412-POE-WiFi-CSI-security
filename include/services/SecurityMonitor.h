@@ -258,7 +258,7 @@ private:
     bool _zoneAlertTriggered = false;
 
     // Static reflector filter
-    // sticky across frames; brief move_energy spikes must sustain
+    // csi10e: sticky across frames; brief move_energy spikes must sustain
     // for STATIC_FILTER_CLEAR_FRAMES before the filter lifts.
     bool _isStaticFiltered = false;
     uint8_t _staticFilterMoveFrames = 0;

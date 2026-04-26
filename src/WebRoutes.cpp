@@ -49,6 +49,46 @@ bool checkAuth(AsyncWebServerRequest *request) {
     return true;
 }
 
+// Pull-OTA URL whitelist: only private RFC1918 ranges and mDNS .local/.lan.
+// Trust anchor for OTA integrity is the optional MD5 hash; the URL check
+// prevents accidental fetches from external mirrors and limits the blast
+// radius of a stolen admin password to the local network.
+static bool isPrivateLanUrl(const String& url) {
+    int s = url.indexOf("://");
+    if (s < 0) return false;
+    s += 3;
+    int e = url.indexOf('/', s);
+    if (e < 0) e = url.length();
+    int colon = url.indexOf(':', s);
+    if (colon > 0 && colon < e) e = colon;
+    if (e <= s) return false;
+    String host = url.substring(s, e);
+    host.toLowerCase();
+    if (host.startsWith("192.168.")) return true;
+    if (host.startsWith("10.")) return true;
+    if (host.startsWith("172.")) {
+        // Search past the literal '.' at index 3, otherwise indexOf returns 3
+        // and substring(3, 3) is empty → 172.16/12 (16..31) is wrongly rejected.
+        int dot = host.indexOf('.', 4);
+        if (dot > 4) {
+            int second = host.substring(4, dot).toInt();
+            if (second >= 16 && second <= 31) return true;
+        }
+    }
+    if (host.endsWith(".local") || host.endsWith(".lan")) return true;
+    return false;
+}
+
+// Validate hex-encoded MD5 (32 chars, [0-9a-fA-F]).
+static bool isValidMd5Hex(const char* s) {
+    if (!s || strlen(s) != 32) return false;
+    for (int i = 0; i < 32; i++) {
+        char c = s[i];
+        if (!((c>='0'&&c<='9') || (c>='a'&&c<='f') || (c>='A'&&c<='F'))) return false;
+    }
+    return true;
+}
+
 void setup(Dependencies& deps) {
     // Copy all pointers to static storage
     _deps = deps;
@@ -179,8 +219,8 @@ void setupTelemetryRoutes() {
             csi["auto_cal_done"]    = _deps.csiService->isAutoCalDone();
             csi["auto_cal_quiet_s"] = _deps.csiService->getAutoCalQuietSeconds();
             csi["auto_cal_elapsed"] = _deps.csiService->getAutoCalQuietElapsed();
-            // WiFi RSSI diagnostics — surface warning fields for HA operators
-            // so they can see when CSI quality is degraded by weak signal.
+            // WiFi RSSI diagnostics (Codex 2026-04-22: device observed -81..-83 dBm,
+            // surface warning for HA operators so they can see CSI is degraded).
             int rssi = _deps.csiService->getWifiRSSI();
             csi["wifi_rssi"]     = rssi;
             csi["rssi_low_snr"]  = (rssi != 0 && rssi < CSI_RSSI_WEAK_DBM);
@@ -623,33 +663,63 @@ void setupConfigRoutes() {
     _deps.server->on("/api/zones", HTTP_POST, [](AsyncWebServerRequest *request) {
         if (!checkAuth(request)) return;
 
-        char* bodyData = (char*)request->_tempObject;
-        if (bodyData) {
-            if (strlen(bodyData) > 0) {
-                if (_deps.zonesMutex && xSemaphoreTake(*_deps.zonesMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-                    *_deps.pendingZonesJson = String(bodyData);
-                    *_deps.pendingZonesUpdate = true;
-                    xSemaphoreGive(*_deps.zonesMutex);
-                }
-            }
-            free(bodyData);
-            request->_tempObject = nullptr;
+        // Slab layout matches /api/config/import: byte[0]=status (1=oversize),
+        // byte[1..]=null-terminated JSON. Validate JSON shape here before
+        // queueing so the worker thread can trust pendingZonesJson.
+        uint8_t* slab = (uint8_t*)request->_tempObject;
+        if (!slab) {
+            request->send(400, "text/plain", "Body required");
+            return;
         }
-
+        if (slab[0] == 1) {
+            free(slab);
+            request->_tempObject = nullptr;
+            request->send(413, "text/plain", "Body too large (max 4 KB)");
+            return;
+        }
+        char* bodyData = (char*)(slab + 1);
+        if (strlen(bodyData) == 0) {
+            free(slab);
+            request->_tempObject = nullptr;
+            request->send(400, "text/plain", "Body empty");
+            return;
+        }
+        JsonDocument validateDoc;
+        DeserializationError jerr = deserializeJson(validateDoc, bodyData);
+        if (jerr) {
+            free(slab);
+            request->_tempObject = nullptr;
+            request->send(400, "text/plain", String("Invalid JSON: ") + jerr.c_str());
+            return;
+        }
+        if (_deps.zonesMutex && xSemaphoreTake(*_deps.zonesMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            *_deps.pendingZonesJson = String(bodyData);
+            *_deps.pendingZonesUpdate = true;
+            xSemaphoreGive(*_deps.zonesMutex);
+        }
+        free(slab);
+        request->_tempObject = nullptr;
         request->send(200, "text/plain", "Zones received");
     }, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
         if (!checkAuth(request)) return;
 
         if (index == 0) {
-            if (total > 4096) return;  // Limit body size
-            request->_tempObject = malloc(total + 1);
-            if (request->_tempObject) ((char*)request->_tempObject)[0] = '\0';
+            if (total > 4096) {
+                request->_tempObject = malloc(1);
+                if (request->_tempObject) ((uint8_t*)request->_tempObject)[0] = 1;
+                return;
+            }
+            request->_tempObject = malloc(1 + total + 1);
+            if (request->_tempObject) {
+                ((uint8_t*)request->_tempObject)[0] = 0;
+                ((char*)request->_tempObject)[1] = '\0';
+            }
         }
 
-        char* buf = (char*)request->_tempObject;
-        if (buf && index + len <= total) {
-            memcpy(buf + index, data, len);
-            buf[index + len] = '\0';
+        uint8_t* slab = (uint8_t*)request->_tempObject;
+        if (slab && slab[0] == 0 && index + len <= total) {
+            memcpy(slab + 1 + index, data, len);
+            ((char*)slab)[1 + index + len] = '\0';
         }
     });
 
@@ -737,15 +807,30 @@ void setupConfigRoutes() {
     _deps.server->on("/api/config/import", HTTP_POST, [](AsyncWebServerRequest *request) {
         if (!checkAuth(request)) return;
 
-        char* importData = (char*)request->_tempObject;
+        // Layout written by the upload callback: byte[0] = status flag
+        //   (0 = ok, 1 = oversize), byte[1..] = null-terminated JSON when ok.
+        // Pre-fix the upload callback dropped oversize bodies silently and
+        // the device still answered 200 + reboot — now we surface 413/400.
+        uint8_t* slab = (uint8_t*)request->_tempObject;
+        if (!slab) {
+            request->send(400, "text/plain", "Body required");
+            return;
+        }
+        if (slab[0] == 1) {
+            free(slab);
+            request->_tempObject = nullptr;
+            request->send(413, "text/plain", "Body too large (max 4 KB)");
+            return;
+        }
+        char* importData = (char*)(slab + 1);
         if (importData) {
             if (strlen(importData) > 0) {
                 JsonDocument doc;
                 DeserializationError err = deserializeJson(doc, importData);
                 if (err) {
-                    free(importData);
+                    free(slab);
                     request->_tempObject = nullptr;
-                    request->send(400, "text/plain", "Invalid JSON");
+                    request->send(400, "text/plain", String("Invalid JSON: ") + err.c_str());
                     return;
                 }
 
@@ -815,9 +900,14 @@ void setupConfigRoutes() {
                 if (doc["csi_ml_thr"].is<float>()) _deps.preferences->putFloat("csi_ml_thr", doc["csi_ml_thr"].as<float>());
 
                 if (doc["zones"].is<String>()) _deps.preferences->putString("zones_json", doc["zones"].as<String>());
+            } else {
+                free(slab);
+                request->_tempObject = nullptr;
+                request->send(400, "text/plain", "Body empty");
+                return;
             }
 
-            free(importData);
+            free(slab);
             request->_tempObject = nullptr;
         }
 
@@ -826,16 +916,25 @@ void setupConfigRoutes() {
     }, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total){
         if (!checkAuth(request)) return;
 
+        // Slab layout: [status:1][payload:total+1]. Status 1 = oversize sentinel
+        // so the main handler can return 413 instead of silently 200-rebooting.
         if (index == 0) {
-            if (total > 4096) return;  // Limit body size
-            request->_tempObject = malloc(total + 1);
-            if (request->_tempObject) ((char*)request->_tempObject)[0] = '\0';
+            if (total > 4096) {
+                request->_tempObject = malloc(1);
+                if (request->_tempObject) ((uint8_t*)request->_tempObject)[0] = 1;
+                return;
+            }
+            request->_tempObject = malloc(1 + total + 1);
+            if (request->_tempObject) {
+                ((uint8_t*)request->_tempObject)[0] = 0;
+                ((char*)request->_tempObject)[1] = '\0';
+            }
         }
 
-        char* buf = (char*)request->_tempObject;
-        if (buf && index + len <= total) {
-            memcpy(buf + index, data, len);
-            buf[index + len] = '\0';
+        uint8_t* slab = (uint8_t*)request->_tempObject;
+        if (slab && slab[0] == 0 && index + len <= total) {
+            memcpy(slab + 1 + index, data, len);
+            ((char*)slab)[1 + index + len] = '\0';
         }
     });
 }
@@ -921,10 +1020,10 @@ void setupSystemRoutes() {
             }
             otaAuthorized = true;
             DBG("OTA", "Update start: %s (%u bytes)", filename.c_str(), request->contentLength());
-            // freeze CSI WiFi/lwIP interactions so they can't drop the
+            // csi7b: freeze CSI WiFi/lwIP interactions so they can't drop the
             // in-flight upload TCP (see CSIService::setOtaInProgress comment).
             CSIService::setOtaInProgress(true);
-            // same treatment for MQTT. PubSubClient's blocking
+            // csi10w: same treatment for MQTT. PubSubClient's blocking
             // WiFiClient.connect() on a failing reconnect was causing
             // non-deterministic upload stalls (42-90% completion).
             MQTTService::setOtaInProgress(true);
@@ -956,10 +1055,22 @@ void setupSystemRoutes() {
                 *_deps.shouldReboot = true;
             } else {
                 Update.printError(Serial);
+                String err = Update.errorString();
                 Update.abort();
                 if (radarTaskHandle) vTaskResume(radarTaskHandle);
                 CSIService::setOtaInProgress(false);
                 MQTTService::setOtaInProgress(false);
+                // Surface the failure outside the serial console so an operator
+                // pushing to a sealed unit notices instead of seeing only the
+                // generic 200 response from AsyncWebServer.
+                if (_deps.systemLog) {
+                    _deps.systemLog->error(String("OTA HTTP failed at ") +
+                        String((unsigned)(index + len)) + " B: " + err);
+                }
+                if (_deps.telegramBot && _deps.telegramBot->isEnabled()) {
+                    _deps.telegramBot->sendAlert("OTA upload failed",
+                        String("at ") + String((unsigned)(index + len)) + " B: " + err);
+                }
             }
             otaAuthorized = false;
         }
@@ -980,8 +1091,11 @@ void setupSystemRoutes() {
     //   connect failures don't starve the device of radar data.
     //
     // Request:  POST /api/update/pull
-    //   Body (JSON): {"url":"...","auth":"Bearer <token>"}  (auth optional)
-    // Response: 200 (accepted) | 400 (bad body) | 409 (already in flight)
+    //   Body (JSON): {"url":"...","auth":"Bearer <token>","md5":"<32 hex>"}
+    //   - url: REQUIRED, must resolve to a private LAN host (RFC1918 or .local/.lan)
+    //   - auth: optional Authorization header forwarded to the source server
+    //   - md5: optional 32-char hex; if present, Update verifies and rejects mismatch
+    // Response: 200 (accepted) | 400 (bad body / non-LAN URL / bad md5) | 409 (in flight)
     static volatile bool otaPullInFlight = false;
 
     _deps.server->on("/api/update/pull", HTTP_POST,
@@ -1004,13 +1118,24 @@ void setupSystemRoutes() {
         }
         const char* url  = doc["url"]  | "";
         const char* auth = doc["auth"] | "";
+        const char* md5  = doc["md5"]  | "";
         if (strlen(url) == 0) {
             request->send(400, "text/plain", "Missing 'url' field");
             return;
         }
+        if (!isPrivateLanUrl(String(url))) {
+            request->send(400, "text/plain",
+                "URL host must be a private LAN address (192.168/16, 10/8, 172.16/12) "
+                "or *.local/*.lan");
+            return;
+        }
+        if (strlen(md5) > 0 && !isValidMd5Hex(md5)) {
+            request->send(400, "text/plain", "'md5' must be 32 hex characters");
+            return;
+        }
 
-        struct PullParams { String url; String auth; };
-        PullParams* p = new(std::nothrow) PullParams{ String(url), String(auth) };
+        struct PullParams { String url; String auth; String md5; };
+        PullParams* p = new(std::nothrow) PullParams{ String(url), String(auth), String(md5) };
         if (!p) {
             request->send(500, "text/plain", "Out of memory");
             return;
@@ -1063,7 +1188,7 @@ void setupSystemRoutes() {
             } else {
                 plain = new(std::nothrow) WiFiClient();
                 if (plain) {
-                    plain->setTimeout(30);  // seconds on plain WiFiClient (API diff)
+                    plain->setTimeout(30000);  // milliseconds, matches WiFiClientSecure
                     client = plain;
                 }
             }
@@ -1103,28 +1228,47 @@ void setupSystemRoutes() {
             MQTTService::setOtaInProgress(true);
             setPhase("fetching");
 
-            httpUpdate.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
-            httpUpdate.rebootOnUpdate(false);  // we'll reboot explicitly, after status is persisted
-            t_httpUpdate_return ret = httpUpdate.update(http);
-
+            // Manual streaming flash: the HTTPUpdate variant in this
+            // arduino-esp32 build doesn't expose an MD5 setter, so we drive
+            // Update directly. setMD5() before begin() makes Update.end()
+            // validate the digest of all bytes written and fail-close on
+            // mismatch — primary integrity defense for pulled binaries.
             bool doReboot = false;
-            switch (ret) {
-                case HTTP_UPDATE_OK:
-                    DBG("OTA-PULL", "Update OK — rebooting");
-                    setPhase("success_rebooting", "Update applied, rebooting", 0);
-                    doReboot = true;
-                    break;
-                case HTTP_UPDATE_NO_UPDATES:
-                    DBG("OTA-PULL", "No update available");
-                    setPhase("no_update", "Server returned no-update", 0);
-                    break;
-                case HTTP_UPDATE_FAILED:
-                default: {
-                    int errCode = httpUpdate.getLastError();
-                    String errStr = httpUpdate.getLastErrorString();
-                    DBG("OTA-PULL", "FAILED: err=%d '%s'", errCode, errStr.c_str());
-                    setPhase("failed", errStr.c_str(), errCode);
-                    break;
+            int httpCode = http.GET();
+            if (httpCode != HTTP_CODE_OK) {
+                DBG("OTA-PULL", "GET failed: HTTP %d", httpCode);
+                setPhase("failed", (String("HTTP ") + httpCode).c_str(), httpCode);
+            } else {
+                int contentLength = http.getSize();
+                if (contentLength <= 0) {
+                    DBG("OTA-PULL", "Server didn't report size");
+                    setPhase("failed", "Missing Content-Length", -3);
+                } else if (p->md5.length() > 0 && !Update.setMD5(p->md5.c_str())) {
+                    DBG("OTA-PULL", "Update.setMD5 rejected '%s'", p->md5.c_str());
+                    setPhase("failed", "setMD5 rejected", -4);
+                } else if (!Update.begin((size_t)contentLength)) {
+                    String err = Update.errorString();
+                    DBG("OTA-PULL", "Update.begin failed: %s", err.c_str());
+                    setPhase("failed", err.c_str(), Update.getError());
+                } else {
+                    Stream& stream = http.getStream();
+                    size_t written = Update.writeStream(stream);
+                    if (written != (size_t)contentLength) {
+                        String err = Update.errorString();
+                        DBG("OTA-PULL", "writeStream short: %u/%d (%s)",
+                            (unsigned)written, contentLength, err.c_str());
+                        setPhase("failed", err.c_str(), Update.getError());
+                        Update.abort();
+                    } else if (!Update.end(true)) {
+                        // MD5 mismatch surfaces here as "MD5 Check Failed".
+                        String err = Update.errorString();
+                        DBG("OTA-PULL", "Update.end failed: %s", err.c_str());
+                        setPhase("failed", err.c_str(), Update.getError());
+                    } else {
+                        DBG("OTA-PULL", "Update OK — rebooting");
+                        setPhase("success_rebooting", "Update applied, rebooting", 0);
+                        doReboot = true;
+                    }
                 }
             }
             http.end();
@@ -2183,7 +2327,7 @@ void setupCSIRoutes() {
             }
         }
 
-        // ML MLP toggle + threshold — runtime + NVS persist
+        // csi9: ML MLP toggle + threshold — runtime + NVS persist
         if (request->hasParam("ml_enabled")) {
             bool en = request->getParam("ml_enabled")->value() == "1";
             _deps.preferences->putBool("csi_ml_en", en);

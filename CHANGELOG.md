@@ -2,6 +2,35 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.0.1-poe-wifi] - 2026-04-26
+
+Bug fix release for v5.0.0 — pull-OTA hardening, alarm and runtime stability.
+
+### Security
+
+- **Pull-OTA URL whitelist** — `POST /api/update/pull` now rejects URLs that don't resolve to a private RFC1918 host (`192.168/16`, `10/8`, `172.16/12`) or an mDNS `*.local` / `*.lan` name. Limits the blast radius of a stolen admin password to the local LAN.
+- **Pull-OTA MD5 verification** — body accepts an optional `md5` field (32 hex chars). When present, the device passes it to `Update::setMD5()` before streaming the image with `Update::writeStream()`, and `Update::end(true)` fail-closes on mismatch. The previous flow had no integrity check on the downloaded binary.
+
+### Fixed
+
+- **Pull-OTA plain-HTTP timeout** — `WiFiClient::setTimeout()` was called with `30` (interpreted as 30 ms by ESP32 arduino-core), so HTTP pulls timed out almost immediately. Now `30000` ms, matching `WiFiClientSecure`.
+- **`/api/config/import` and `/api/zones`** — oversize bodies (> 4 KB) and malformed JSON used to silently 200 and reboot. They now return `413 Payload Too Large` or `400 Invalid JSON` with a descriptive message.
+- **HTTP OTA failure visibility** — failed multipart uploads now publish to system log and Telegram alert instead of only printing to the serial console.
+- **LD2412 `update()` mutex timeout** — raised from `2 ms` to `50 ms`. The previous value silently dropped radar frames under CSI / MQTT load.
+- **LD2412 frame value clamping** — distance and energy fields are clamped to datasheet ranges (`0..600 cm`, `0..100`) before propagating to the alarm logic, so a corrupted UART byte can't fake a zone hit.
+- **LD2412 hard-reset baud verification** — after a recovery `_serial->begin()` the service now calls `readFirmwareVersion()` and falls back to the alternate baud (115200 ↔ 256000) once if the radar doesn't respond.
+- **`SecurityMonitor::update()` mutex timeout** — raised from `200 ms` to `500 ms`; matches the `setArmed()` budget and prevents critical state transitions from being deferred under fusion load.
+- **Sticky reflector static-filter** — cleared on `DISARMED → ARMING` so the exit delay starts with a clean filter and a quiet pre-arm window can't latch the filter into the armed state.
+- **Scheduled arm / disarm** — validates `HH:MM` ranges, latches per `tm_yday`, and fires once per day per direction. Late ticks (`HH:MM:30` instead of `:00`) are no longer missed.
+- **`EventLog::flushToDisk()` heap-fail spin** — bumps `_lastFlush` when `LogEvent[]` allocation fails so the next flush attempt is deferred by the rate-limit window. Fixes a hot-loop that held the mutex under heap pressure.
+- **`isPrivateLanUrl()` 172.16/12 parser** — used `indexOf('.', 3)`, which returned the literal `.` at index 3 and left the second-octet substring empty, so 172.x.x.x addresses were wrongly rejected by the whitelist.
+
+### Changed
+
+- **MQTT offline buffer** — capacity raised from 50 to 200 slots (~57.6 KB on LittleFS) so a 5-minute outage no longer drops state-change history from the Home Assistant timeline.
+- **CSI WiFi hostname** — aligned with the Ethernet hostname so mDNS advertises a single identity for the device.
+- **DMS counter NVS reset** — read-before-write on the success path avoids a redundant flash erase when the counter is already zero.
+
 ## [5.0.0-poe-wifi] - 2026-04-25
 
 Major release consolidating four months of CSI work, radar fusion improvements, and operational hardening.

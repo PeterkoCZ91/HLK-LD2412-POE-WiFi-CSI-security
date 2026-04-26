@@ -43,7 +43,7 @@
 // -------------------------------------------------------------------------
 #include <Update.h>
 #ifndef FW_VERSION
-#define FW_VERSION "v5.0.0"
+#define FW_VERSION "v5.0.1"
 #endif
 #define WDT_TIMEOUT_SECONDS 60
 
@@ -900,11 +900,11 @@ void setup() {
         if (preferences.isKey("csi_ticmp")) csiService.setTrafficICMP(preferences.getBool("csi_ticmp", false));
         if (preferences.isKey("csi_tpps"))  csiService.setTrafficRate(preferences.getUInt("csi_tpps", 100));
 
-        // ML MLP runtime settings from NVS (defaults: enabled=true, threshold=0.50)
+        // csi9: ML MLP runtime settings from NVS (defaults: enabled=true, threshold=0.50)
         if (preferences.isKey("csi_ml_en"))  csiService.setMlEnabled(preferences.getBool("csi_ml_en", true));
         if (preferences.isKey("csi_ml_thr")) csiService.setMlThreshold(preferences.getFloat("csi_ml_thr", 0.50f));
 
-        // prefer NVS-stored SSID/pass (GUI-editable) over compile-time defaults
+        // csi10c: prefer NVS-stored SSID/pass (GUI-editable) over compile-time defaults
         const SystemConfig& cfg = configManager.getConfig();
         const char* effSsid = (cfg.csi_ssid[0] != '\0') ? cfg.csi_ssid : CSI_WIFI_SSID;
         const char* effPass = (cfg.csi_ssid[0] != '\0') ? cfg.csi_pass : CSI_WIFI_PASS;
@@ -950,7 +950,7 @@ void loop() {
     if (configManager.getConfig().mqtt_enabled) mqttService.update();
 #ifdef USE_CSI
     if (configManager.getConfig().csi_enabled) {
-        // ground-truth presence from LD2412 radar — keeps stationary humans
+        // csi6b: ground-truth presence from LD2412 radar — keeps stationary humans
         // (CSI variance low, breathing hold active) out of quiet-site learning.
         RadarData csiRadarGate = radar.getData();
         csiService.notePresenceFromRadar(csiRadarGate.valid &&
@@ -972,9 +972,9 @@ void loop() {
         lastPub.distance_cm = 0xFFFF;
         lastPub.energy_mov = 0xFF;
         lastPub.energy_stat = 0xFF;
-        // TIER 3 diagnostics — after MQTT reconnect, stable values
-        // (health_score=100, uart_state=RUNNING, etc.) would stay gated by
-        // deadband forever. Invalidate so next publish re-fires them.
+        // TIER 3 diagnostics — addresses Codex ESP↔HA link check report 2026-04-21:
+        // after MQTT reconnect, stable values (health_score=100, uart_state=RUNNING, etc.)
+        // would stay gated by deadband forever. Invalidate so next publish re-fires them.
         lastPub.health_score  = 0xFF;
         lastPub.frame_rate    = -1.0f;
         lastPub.error_count   = 0xFFFFFFFFUL;
@@ -1038,9 +1038,15 @@ void loop() {
         }
     }
 
-    // Scheduled arm/disarm (check every 30s)
+    // Scheduled arm/disarm (check every 30s).
+    // Track the last day-of-year we acted on each side so a 30 s tick that
+    // lands at HH:MM:30 still arms (was: tight curMinutes == armMinutes match
+    // missed late ticks). The day field resets the latch at midnight so we
+    // act once per day per direction.
     {
         static unsigned long lastSchedCheck = 0;
+        static int lastArmYday = -1;
+        static int lastDisarmYday = -1;
         if (now - lastSchedCheck > 30000) {
             lastSchedCheck = now;
             time_t epoch = time(nullptr);
@@ -1048,13 +1054,17 @@ void loop() {
                 struct tm timeinfo;
                 localtime_r(&epoch, &timeinfo);
                 int curMinutes = timeinfo.tm_hour * 60 + timeinfo.tm_min;
+                int curYday = timeinfo.tm_yday;
                 const char* armTime = configManager.getConfig().sched_arm_time;
                 const char* disarmTime = configManager.getConfig().sched_disarm_time;
                 int armH, armM, disH, disM;
-                if (strlen(armTime) >= 4 && sscanf(armTime, "%d:%d", &armH, &armM) == 2) {
+                if (strlen(armTime) >= 4 && sscanf(armTime, "%d:%d", &armH, &armM) == 2 &&
+                    armH >= 0 && armH < 24 && armM >= 0 && armM < 60) {
                     int armMinutes = armH * 60 + armM;
-                    if (curMinutes == armMinutes && !securityMonitor.isArmed()) {
+                    if (curMinutes == armMinutes && lastArmYday != curYday &&
+                        !securityMonitor.isArmed()) {
                         securityMonitor.setArmed(true);
+                        lastArmYday = curYday;
                         DBG("SCHED", "Auto-armed at %s", armTime);
                         systemLog.info("Scheduled arm at " + String(armTime));
                         if (telegramBot.isEnabled()) {
@@ -1062,10 +1072,13 @@ void loop() {
                         }
                     }
                 }
-                if (strlen(disarmTime) >= 4 && sscanf(disarmTime, "%d:%d", &disH, &disM) == 2) {
+                if (strlen(disarmTime) >= 4 && sscanf(disarmTime, "%d:%d", &disH, &disM) == 2 &&
+                    disH >= 0 && disH < 24 && disM >= 0 && disM < 60) {
                     int disMinutes = disH * 60 + disM;
-                    if (curMinutes == disMinutes && securityMonitor.isArmed()) {
+                    if (curMinutes == disMinutes && lastDisarmYday != curYday &&
+                        securityMonitor.isArmed()) {
                         securityMonitor.setArmed(false);
+                        lastDisarmYday = curYday;
                         DBG("SCHED", "Auto-disarmed at %s", disarmTime);
                         systemLog.info("Scheduled disarm at " + String(disarmTime));
                         if (telegramBot.isEnabled()) {
@@ -1271,9 +1284,13 @@ void loop() {
     } else if (dmsReconnectPending && !dmsPublishStale) {
         dmsReconnectPending = false;
     }
-    // Reset DMS counter after successful publish
+    // Reset DMS counter after successful publish — read-before-write so a
+    // RAM-only reset doesn't issue a redundant flash erase on the dms_count
+    // NVS page.
     if (dmsRestarts > 0 && mqttService.getLastPublishTime() > 0 && !dmsPublishStale) {
-        preferences.putUInt("dms_count", 0);
+        if (preferences.getUInt("dms_count", 0) != 0) {
+            preferences.putUInt("dms_count", 0);
+        }
         dmsRestarts = 0;
         if (dmsDegraded) {
             dmsDegraded = false;
@@ -1312,7 +1329,7 @@ void loop() {
             csi["calibrating"] = csiService.isCalibrating();
             csi["calib_pct"] = csiService.getCalibrationProgress();
 
-            // live ML + site learning for GUI tab 6
+            // csi9: live ML + site learning for GUI tab 6
             csi["ml_enabled"]     = csiService.isMlEnabled();
             csi["ml_motion"]      = csiService.getMlMotionState();
             csi["ml_probability"] = csiService.getMlProbability();
@@ -1528,8 +1545,8 @@ void loop() {
 
             // Heartbeat: every 5 min invalidate deadband-gated cache so HA
             // receives periodic refresh of unchanged diagnostics (health_score,
-            // uart_state, frame_rate, heap). Without this, HA last_reported
-            // freezes on stable values even while the ESP stays healthy.
+            // uart_state, frame_rate, heap). Addresses Codex 23-min follow-up
+            // finding: HA last_reported froze on stable values while ESP was healthy.
             static unsigned long lastTier3Heartbeat = 0;
             if (now - lastTier3Heartbeat >= INTERVAL_TIER3_HEARTBEAT_MS) {
                 lastTier3Heartbeat = now;

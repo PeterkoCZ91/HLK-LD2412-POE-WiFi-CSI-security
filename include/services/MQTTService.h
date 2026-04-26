@@ -133,7 +133,7 @@ public:
     const char* getPort() const { return _port; }
     bool consumeReconnect() { bool v = _justReconnected; _justReconnected = false; return v; }
 
-    // halt all MQTT activity (loop + reconnect) while HTTP/ArduinoOTA
+    // csi10w: halt all MQTT activity (loop + reconnect) while HTTP/ArduinoOTA
     // upload is in flight. Without this, a failing self-IP reconnect attempt
     // opens/closes lwIP sockets mid-chunk and disturbs the AsyncTCP receive
     // path, producing non-deterministic upload stalls.

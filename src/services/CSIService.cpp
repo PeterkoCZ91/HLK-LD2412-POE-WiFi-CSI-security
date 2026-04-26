@@ -73,6 +73,13 @@ CSIService::CSIService() {}
 void CSIService::_initWiFiForCSI(const char* ssid, const char* password) {
     WiFi.mode(WIFI_STA);
 
+    // Align WiFi hostname with the Ethernet one so mDNS / DHCP advertise a
+    // single identity for the device. Must be called before WiFi.begin().
+    const char* ethHost = ETH.getHostname();
+    if (ethHost && ethHost[0] != '\0') {
+        WiFi.setHostname(ethHost);
+    }
+
     // Force 802.11n protocol for HT20 CSI (64 subcarriers)
     esp_err_t ret = esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11N);
     if (ret != ESP_OK) {
@@ -108,7 +115,7 @@ void CSIService::_initWiFiForCSI(const char* ssid, const char* password) {
     _restoreEthDefaultNetif();
 }
 
-// When CSI WiFi lands on the same subnet as Ethernet (flat LAN + router-hosted AP),
+// csi7: When CSI WiFi lands on the same subnet as Ethernet (flat LAN + router-hosted AP),
 // lwIP's default_netif becomes WiFi after WiFi.begin(), which breaks outbound TCP from
 // services expecting Ethernet (MQTT rc=-2, OTA, HTTP clients). Force Ethernet back as
 // default — CSI RX is callback-driven and doesn't need to be default netif.
@@ -190,7 +197,7 @@ void CSIService::begin(const char* ssid, const char* password,
     _initWiFiForCSI(ssid, password);
 
     // Configure and enable CSI
-    // match espectre (csi_manager.cpp:289-295). Previous setup with
+    // csi10f: match espectre (csi_manager.cpp:289-295). Previous setup with
     // lltf_en=true + stbc_htltf2_en=true + ltf_merge_en=true was too permissive —
     // on WiFi 6 APs in backward-compat mode, L-LTF preamble entries fired the
     // callback at non-HT20 lengths which then dropped at the HT20_CSI_LEN gate
@@ -479,7 +486,7 @@ void CSIService::_processCSI(wifi_csi_info_t* info) {
     // Validate: only accept standard HT20 length
     if (len != HT20_CSI_LEN) return;
 
-    // first valid HT LTF frame → set AP-compatibility flag.
+    // csi10c: first valid HT LTF frame → set AP-compatibility flag.
     // If AP emits only HE PHY (wifi6), this never flips true despite association.
     _htLtfSeen = true;
 
@@ -755,7 +762,7 @@ void CSIService::_processCSI(wifi_csi_info_t* info) {
 void CSIService::_updateMotionState() {
     if (_bufCount < _windowSize) return;
 
-    // effective threshold is max of user-set and adaptive-P95.
+    // csi4: effective threshold is max of user-set and adaptive-P95.
     float effThr = _threshold;
     if (_adaptiveThresholdEnabled && _adaptiveThreshold > effThr) {
         effThr = _adaptiveThreshold;
@@ -825,7 +832,7 @@ void CSIService::_updateMotionState() {
 }
 
 // ============================================================================
-// Continuous EMA refresh of learned site model
+// csi10: Continuous EMA refresh of learned site model
 // ----------------------------------------------------------------------------
 // After one-shot site-learning completes, keep nudging _learnedThreshold /
 // _learnedMeanVar / _learnedStdVar toward current quiet-site samples so the
@@ -863,7 +870,7 @@ void CSIService::_continuousLearnRefresh() {
     _learnedStdVar = alpha * dev + (1.0f - alpha) * _learnedStdVar;
 
     float newThr = _learnedMeanVar + 3.0f * _learnedStdVar;
-    // hard absolute floor before any other clamp
+    // csi10e: hard absolute floor before any other clamp
     if (newThr < MIN_LEARNED_THRESHOLD) newThr = MIN_LEARNED_THRESHOLD;
     if (newThr < _threshold) newThr = _threshold;  // never drop below user-set sensitivity
     _learnedThreshold = newThr;
@@ -879,7 +886,7 @@ void CSIService::_continuousLearnRefresh() {
 }
 
 // ============================================================================
-// MLP motion inference (15 -> 16 -> 8 -> 1) — parallel A/B path
+// csi8: MLP motion inference (15 -> 16 -> 8 -> 1) — parallel A/B path
 // ============================================================================
 
 void CSIService::_runMlInference() {
@@ -1028,7 +1035,7 @@ void CSIService::_publishMQTT() {
 void CSIService::update() {
     if (!_active) return;
 
-    // Pause all WiFi/lwIP manipulation while an OTA transfer is active.
+    // csi7b: Pause all WiFi/lwIP manipulation while an OTA transfer is active.
     // WiFi.reconnect(), netif_set_default() and raw_sendto traffic gen all risk
     // dropping the in-flight OTA TCP stream. Hooks in main.cpp / WebRoutes.cpp
     // set this flag at OTA start and clear it at end/error.
@@ -1062,7 +1069,7 @@ void CSIService::update() {
             lastAttempt = millis();
             DBG("CSI", "TrafficGen retry: WiFi=%d IP=%s",
                 WiFi.status(), WiFi.localIP().toString().c_str());
-            // each WiFi (re)connect resets lwIP default netif to WiFi.
+            // csi7: each WiFi (re)connect resets lwIP default netif to WiFi.
             // Restore Ethernet as default before starting traffic gen.
             _restoreEthDefaultNetif();
             _startTrafficGen();
@@ -1104,7 +1111,7 @@ void CSIService::update() {
                     float newThr = mean * 1.5f;
                     if (newThr < 0.001f) newThr = 0.001f;
                     _threshold = newThr;
-                    _baseThreshold = newThr;          // sync base so stuck-raise is relative to calibrated value
+                    _baseThreshold = newThr;          // csi2: sync base so stuck-raise is relative to calibrated value
                     _stuckRaiseCount = 0;
                     _stuckMotionCount = 0;
                     if (_prefs) _prefs->putFloat("csi_thr", _threshold);
@@ -1139,7 +1146,7 @@ void CSIService::update() {
             }
         }
 
-        // detect AP roam (BSSID change) → invalidate baseline + rerun auto-cal.
+        // csi3: detect AP roam (BSSID change) → invalidate baseline + rerun auto-cal.
         // Channel/AP change makes existing stats stale; cheapest fix is full reset.
         if (WiFi.status() == WL_CONNECTED) {
             uint8_t* curBSSID = WiFi.BSSID();
@@ -1160,7 +1167,7 @@ void CSIService::update() {
                     _p95BufCount = 0;
                     _adaptiveThreshold = 0.0f;
                     _p95TickSinceUpdate = 0;
-                    // re-learn per-SC stability on new AP.
+                    // csi5: re-learn per-SC stability on new AP.
                     _nbviReady = false;
                     _nbviSamples = 0;
                     _nbviLastRecalcSamples = 0;
@@ -1168,7 +1175,7 @@ void CSIService::update() {
                     for (uint8_t i = 0; i < NUM_SUBCARRIERS; i++) {
                         _nbviMean[i] = 0; _nbviVar[i] = 0; _nbviScore[i] = 0; _nbviMask[i] = 1;
                     }
-                    // if site-learning is in progress, discard accumulated stats
+                    // csi6b: if site-learning is in progress, discard accumulated stats
                     // and restart the window on the new AP — mixing two APs' variance
                     // distributions gives a meaningless mean/σ.
                     if (_siteLearningActive) {
@@ -1187,7 +1194,7 @@ void CSIService::update() {
             }
         }
 
-        // stuck-in-motion escalation. Count consecutive MOTION publish ticks;
+        // csi2: stuck-in-motion escalation. Count consecutive MOTION publish ticks;
         // after STUCK_MOTION_LIMIT (~24h @ 1Hz) raise threshold ×1.5 and reset counter.
         // Max STUCK_RAISE_MAX raises per boot. Any IDLE transition resets the counter
         // so transient motion doesn't accumulate.
@@ -1212,7 +1219,7 @@ void CSIService::update() {
             _stuckMotionCount = 0;
         }
 
-        // adaptive P95 rolling threshold. Append variance sample to ring buffer;
+        // csi4: adaptive P95 rolling threshold. Append variance sample to ring buffer;
         // every P95_UPDATE_EVERY ticks recompute P95 × P95_FACTOR. Effective threshold
         // (used by _updateMotionState) = max(_threshold, _adaptiveThreshold).
         if (_bufCount >= _windowSize) {
@@ -1337,7 +1344,7 @@ uint16_t CSIService::getNbviMask() const {
 }
 
 // ============================================================================
-// Long-term quiet-site learning
+// csi6: Long-term quiet-site learning
 // ============================================================================
 
 bool CSIService::startSiteLearning(uint32_t durationMs) {
@@ -1463,8 +1470,8 @@ float CSIService::_computeSiteLearningThreshold() const {
     float maxGuard = _siteLearnMaxVar * 1.15f;
 
     if (candidate < maxGuard) candidate = maxGuard;
-    // absolute floor — lower thresholds produce hair-trigger baselines on very
-    // quiet sites where normal WiFi jitter alone exceeds the learned variance.
+    // csi10e: absolute floor raised 0.001 → 0.005; lower produced hair-trigger
+    // baselines on very quiet production sites (see 2026-04-24 false-alarm report).
     if (candidate < MIN_LEARNED_THRESHOLD) candidate = MIN_LEARNED_THRESHOLD;
     if (candidate > 100.0f) candidate = 100.0f;
     return candidate;

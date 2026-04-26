@@ -165,7 +165,7 @@ void MQTTService::handleMessage(char* topic, byte* payload, unsigned int length)
 
 void MQTTService::update() {
     if (strlen(_server) == 0) return;
-    // freeze MQTT entirely during HTTP/ArduinoOTA upload. PubSubClient
+    // csi10w: freeze MQTT entirely during HTTP/ArduinoOTA upload. PubSubClient
     // uses blocking WiFiClient.connect() which opens lwIP sockets; a failing
     // reconnect mid-OTA (e.g. broker unreachable) starves AsyncTCP of receive
     // bandwidth and produces non-deterministic upload stalls.

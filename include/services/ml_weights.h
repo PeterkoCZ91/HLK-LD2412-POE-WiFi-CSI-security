@@ -2,10 +2,10 @@
 #define ML_WEIGHTS_H
 
 // Auto-generated MLP weights (17 -> 18 -> 9 -> 1) for CSI motion detection.
-// Trained with DSER/PLCR features.
+// Retrained on sister project csi_log.db 2026-04-23 with DSER/PLCR features.
 // Test F1 = 0.852 (precision 0.944, recall 0.776, accuracy 0.866).
-// Based on the espectre training pipeline (GPLv3).
-// DO NOT EDIT — regenerate via the training script export.
+// Source: WiFi-CSI-esp-projekt/components/espectre/ml_weights.h (GPLv3).
+// DO NOT EDIT — regenerate via train_ml_model.py export.
 
 namespace csi_ml {
 
