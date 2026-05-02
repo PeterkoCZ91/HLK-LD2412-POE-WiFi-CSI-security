@@ -1098,12 +1098,14 @@ void setupSystemRoutes() {
                 Update.abort();
             }
             // Re-arm the freeze flags. Idempotent if already false.
+#ifdef USE_CSI
             CSIService::setOtaInProgress(false);
+#endif
             MQTTService::setOtaInProgress(false);
             uint32_t heapAtStart = ESP.getFreeHeap();
-            // csi7b: freeze CSI WiFi/lwIP interactions so they can't drop the
-            // in-flight upload TCP (see CSIService::setOtaInProgress comment).
+#ifdef USE_CSI
             CSIService::setOtaInProgress(true);
+#endif
             // csi10w: same treatment for MQTT. PubSubClient's blocking
             // WiFiClient.connect() on a failing reconnect was causing
             // non-deterministic upload stalls (42-90% completion).
@@ -1167,7 +1169,9 @@ void setupSystemRoutes() {
                 String err = Update.errorString();
                 Update.abort();
                 if (radarTaskHandle) vTaskResume(radarTaskHandle);
+#ifdef USE_CSI
                 CSIService::setOtaInProgress(false);
+#endif
                 MQTTService::setOtaInProgress(false);
                 // Surface the failure outside the serial console so an operator
                 // pushing to a sealed unit notices instead of seeing only the
@@ -1333,7 +1337,9 @@ void setupSystemRoutes() {
             // Now that we're about to do the heavy flash work, free radar CPU
             // and freeze CSI WiFi/lwIP manipulation for the duration of the pull.
             if (radarTaskHandle) vTaskSuspend(radarTaskHandle);
+#ifdef USE_CSI
             CSIService::setOtaInProgress(true);
+#endif
             MQTTService::setOtaInProgress(true);
             setPhase("fetching");
 
@@ -1385,7 +1391,9 @@ void setupSystemRoutes() {
             delete p;
 
             if (radarTaskHandle) vTaskResume(radarTaskHandle);
+#ifdef USE_CSI
             CSIService::setOtaInProgress(false);
+#endif
             MQTTService::setOtaInProgress(false);
             otaPullInFlight = false;
 
@@ -1407,7 +1415,9 @@ void setupSystemRoutes() {
                 _deps.preferences->putInt("ota_err", -5);
             }
             if (radarTaskHandle) vTaskResume(radarTaskHandle);
+#ifdef USE_CSI
             CSIService::setOtaInProgress(false);
+#endif
             MQTTService::setOtaInProgress(false);
             otaPullInFlight = false;
             delete p;

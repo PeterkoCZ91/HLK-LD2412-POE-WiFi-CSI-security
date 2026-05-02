@@ -899,7 +899,9 @@ void setup() {
 
 #ifndef LITE_BUILD
     ArduinoOTA.onStart([]() {
+#ifdef USE_CSI
         CSIService::setOtaInProgress(true);
+#endif
         MQTTService::setOtaInProgress(true);
         String type;
         if (ArduinoOTA.getCommand() == U_FLASH)
@@ -917,11 +919,15 @@ void setup() {
         }
     });
     ArduinoOTA.onEnd([]() {
+#ifdef USE_CSI
         CSIService::setOtaInProgress(false);
+#endif
         MQTTService::setOtaInProgress(false);
     });
     ArduinoOTA.onError([](ota_error_t) {
+#ifdef USE_CSI
         CSIService::setOtaInProgress(false);
+#endif
         MQTTService::setOtaInProgress(false);
     });
 
