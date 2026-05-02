@@ -28,11 +28,66 @@ void SecurityMonitor::enqueueAlarmEvent() {
     _lastAlarmEventValid = true;
 }
 
+// rc2: Push a sample into the pre-trigger ring buffer (rate-limited to RING_PUSH_INTERVAL_MS)
+void SecurityMonitor::pushRingSample(uint16_t distance, uint8_t mov, uint8_t stat,
+                                     uint8_t fusionSrc, bool fusionPresence) {
+    unsigned long now = millis();
+    if (now - _lastRingPushMs < RING_PUSH_INTERVAL_MS) return;
+    _lastRingPushMs = now;
+
+    PreTriggerSample& s = _ringBuffer[_ringHead];
+    s.age_ms = (uint16_t)(now & 0xFFFF); // store raw millis lo16; snapshot turns it into delta
+    s.distance_cm = distance;
+    s.move_energy = mov;
+    s.static_energy = stat;
+    s.fusion_source = fusionSrc;
+    s.flags = (mov > 0 ? 0x1 : 0)
+            | (stat > 0 ? 0x2 : 0)
+            | (_isStaticFiltered ? 0x4 : 0)
+            | (fusionPresence ? 0x8 : 0);
+
+    _ringHead = (_ringHead + 1) % PRE_TRIGGER_WINDOW;
+    if (_ringCount < PRE_TRIGGER_WINDOW) _ringCount++;
+}
+
+// rc2: Snapshot the ring buffer into an AlarmTriggerEvent, oldest→newest, with age relative to trigger
+void SecurityMonitor::snapshotRingTo(AlarmTriggerEvent& evt, unsigned long triggerMs) const {
+    evt.ring_count = _ringCount;
+    if (_ringCount == 0) return;
+    // Oldest sample is at (_ringHead - _ringCount + PRE_TRIGGER_WINDOW) % SIZE
+    uint8_t startIdx = (uint8_t)((_ringHead + PRE_TRIGGER_WINDOW - _ringCount) % PRE_TRIGGER_WINDOW);
+    uint16_t triggerLo = (uint16_t)(triggerMs & 0xFFFF);
+    for (uint8_t i = 0; i < _ringCount; i++) {
+        uint8_t src = (uint8_t)((startIdx + i) % PRE_TRIGGER_WINDOW);
+        evt.ring[i] = _ringBuffer[src];
+        // Convert stored lo16 millis to age_ms relative to trigger.
+        // Ring push interval is 500 ms × 10 = 5 s window, well under the 65 s lo16 wrap, so subtract is safe.
+        uint16_t sampleLo = _ringBuffer[src].age_ms;
+        evt.ring[i].age_ms = (uint16_t)(triggerLo - sampleLo);
+    }
+}
+
 static const char* motionTypeStr(uint8_t mov, uint8_t stat) {
     if (mov > 0 && stat > 0) return "both";
     if (mov > 0) return "moving";
     if (stat > 0) return "static";
     return "none";
+}
+
+// rc2: Fill the rc2 forensic fields on the staging _pendingEvent. Called at every trigger site.
+static void fillForensicFieldsImpl(AlarmTriggerEvent& evt,
+                                   const char* triggerSource,
+                                   float fusionConf,
+                                   bool staticFiltered,
+                                   const char* zone,
+                                   const char* prevZone) {
+    strncpy(evt.trigger_source, triggerSource, sizeof(evt.trigger_source) - 1);
+    evt.trigger_source[sizeof(evt.trigger_source) - 1] = '\0';
+    evt.fusion_confidence = fusionConf;
+    evt.static_filtered = staticFiltered ? 1 : 0;
+    evt.zone_was_none = (!zone || zone[0] == '\0' || strcmp(zone, "none") == 0) ? 1 : 0;
+    strncpy(evt.prev_zone, prevZone ? prevZone : "", sizeof(evt.prev_zone) - 1);
+    evt.prev_zone[sizeof(evt.prev_zone) - 1] = '\0';
 }
 
 SecurityMonitor::SecurityMonitor() {
@@ -110,7 +165,7 @@ void SecurityMonitor::update() {
     if (_mutex) xSemaphoreGive(_mutex);
 }
 
-void SecurityMonitor::setArmed(bool armed, bool immediate) {
+void SecurityMonitor::setArmed(bool armed, bool immediate, bool homeMode) {
     if (_mutex && xSemaphoreTake(_mutex, pdMS_TO_TICKS(500)) != pdTRUE) return;
     unsigned long now = millis();
     if (armed) {
@@ -120,21 +175,28 @@ void SecurityMonitor::setArmed(bool armed, bool immediate) {
             if (_mutex) xSemaphoreGive(_mutex);
             return;
         }
-        // Already arming/armed — idempotent, no-op
+        // Already arming/armed — idempotent, but allow upgrade/flip of homeMode flag
         if (_alarmState == AlarmState::ARMING || _alarmState == AlarmState::ARMED) {
-            DBG("SecMon", "setArmed(true) ignored — already %s", getAlarmStateStr());
+            if (_homeMode != homeMode) {
+                _homeMode = homeMode;
+                DBG("SecMon", "setArmed(true) flip homeMode=%d (state=%s)", (int)homeMode, getAlarmStateStr());
+                if (_prefs) _prefs->putBool("sec_home_mode", homeMode);
+            } else {
+                DBG("SecMon", "setArmed(true) ignored — already %s", getAlarmStateStr());
+            }
             if (_mutex) xSemaphoreGive(_mutex);
             return;
         }
+        _homeMode = homeMode;
         if (immediate) {
             _alarmState = AlarmState::ARMED;
-            DBG("SecMon", "ARMED (immediate)");
-            triggerAlert(NotificationType::ALARM_STATE_CHANGE, "🔒 System ARMED", "Immediate activation.");
+            DBG("SecMon", "ARMED (immediate, home=%d)", (int)homeMode);
+            triggerAlert(NotificationType::ALARM_STATE_CHANGE, "🔒 System ARMED", homeMode ? "Immediate activation (home)." : "Immediate activation.");
         } else {
             _alarmState = AlarmState::ARMING;
             _exitDelayStart = now;
-            DBG("SecMon", "ARMING (exit delay %lu s)", _exitDelay / 1000);
-            triggerAlert(NotificationType::ALARM_STATE_CHANGE, "⏳ ARMING...", "Exit delay: " + String(_exitDelay / 1000) + "s");
+            DBG("SecMon", "ARMING (exit delay %lu s, home=%d)", _exitDelay / 1000, (int)homeMode);
+            triggerAlert(NotificationType::ALARM_STATE_CHANGE, "⏳ ARMING...", "Exit delay: " + String(_exitDelay / 1000) + "s" + (homeMode ? " (home)" : ""));
         }
         clearApproachLog();
         _armedDebounceCount = 0;
@@ -152,6 +214,7 @@ void SecurityMonitor::setArmed(bool armed, bool immediate) {
         // FIX #1: Always deactivate siren on disarm (covers TRIGGERED + any corrupted state)
         deactivateSiren();
         _alarmState = AlarmState::DISARMED;
+        _homeMode = false;
         _entryDelayStart = 0;
         _exitDelayStart = 0;
         _lastPresenceWhileDisarmed = 0;
@@ -171,6 +234,7 @@ void SecurityMonitor::setArmed(bool armed, bool immediate) {
     // Persist
     if (_prefs) {
         _prefs->putBool("sec_armed", armed);
+        _prefs->putBool("sec_home_mode", armed ? _homeMode : false);
     }
     if (_mutex) xSemaphoreGive(_mutex);
 }
@@ -179,7 +243,7 @@ const char* SecurityMonitor::getAlarmStateStr() const {
     switch (_alarmState) {
         case AlarmState::DISARMED:  return "disarmed";
         case AlarmState::ARMING:    return "arming";
-        case AlarmState::ARMED:     return "armed_away";
+        case AlarmState::ARMED:     return _homeMode ? "armed_home" : "armed_away";
         case AlarmState::PENDING:   return "pending";
         case AlarmState::TRIGGERED: return "triggered";
         default: return "disarmed";
@@ -567,6 +631,10 @@ void SecurityMonitor::processRadarData(uint16_t distance, uint8_t move_energy, u
         logApproach(distance, move_energy, static_energy);
     }
 
+    // rc2: Pre-trigger ring buffer — push every ~500 ms regardless of state, so the
+    // window before any future trigger is always populated.
+    pushRingSample(distance, move_energy, static_energy, _fusionSource, _fusionPresence);
+
     // 4c. Armed state: entry delay / triggered logic
     // Uses fusion result: radar FP (CSI disagrees) won't trigger alarm,
     // CSI-only presence (radar blind) CAN trigger alarm via entry delay.
@@ -633,6 +701,8 @@ void SecurityMonitor::processRadarData(uint16_t distance, uint8_t move_energy, u
                 _pendingEvent.distance_cm = evtDistance; _pendingEvent.energy_mov = move_energy; _pendingEvent.energy_stat = static_energy;
                 strncpy(_pendingEvent.motion_type, motionType, sizeof(_pendingEvent.motion_type) - 1);
                 _pendingEvent.uptime_s = now / 1000; fillISOTime(_pendingEvent.iso_time, sizeof(_pendingEvent.iso_time));
+                fillForensicFieldsImpl(_pendingEvent, getFusionSourceStr(), _fusionConfidence, _isStaticFiltered, zoneName, _prevZoneName.c_str());
+                snapshotRingTo(_pendingEvent, now);
                 enqueueAlarmEvent();
                 DBG("SecMon", "PENDING — move in static-filter zone '%s'", _currentZoneName.c_str());
                 triggerAlert(NotificationType::ENTRY_DETECTED, "⏳ ENTRY DETECTED!",
@@ -646,6 +716,8 @@ void SecurityMonitor::processRadarData(uint16_t distance, uint8_t move_energy, u
             _pendingEvent.distance_cm = evtDistance; _pendingEvent.energy_mov = move_energy; _pendingEvent.energy_stat = static_energy;
             strncpy(_pendingEvent.motion_type, motionType, sizeof(_pendingEvent.motion_type) - 1);
             _pendingEvent.uptime_s = now / 1000; fillISOTime(_pendingEvent.iso_time, sizeof(_pendingEvent.iso_time));
+            fillForensicFieldsImpl(_pendingEvent, getFusionSourceStr(), _fusionConfidence, _isStaticFiltered, zoneName, _prevZoneName.c_str());
+            snapshotRingTo(_pendingEvent, now);
             enqueueAlarmEvent();
             DBG("SecMon", "IMMEDIATE TRIGGER in zone '%s'!", zoneName);
             triggerAlert(NotificationType::ALARM_TRIGGERED, "🚨 ALARM TRIGGERED!", "Immediate trigger in zone: " + String(zoneName) + "\n" + formatApproachLog(), evtDistance);
@@ -658,6 +730,8 @@ void SecurityMonitor::processRadarData(uint16_t distance, uint8_t move_energy, u
             _pendingEvent.distance_cm = evtDistance; _pendingEvent.energy_mov = move_energy; _pendingEvent.energy_stat = static_energy;
             strncpy(_pendingEvent.motion_type, motionType, sizeof(_pendingEvent.motion_type) - 1);
             _pendingEvent.uptime_s = now / 1000; fillISOTime(_pendingEvent.iso_time, sizeof(_pendingEvent.iso_time));
+            fillForensicFieldsImpl(_pendingEvent, getFusionSourceStr(), _fusionConfidence, _isStaticFiltered, zoneName, _prevZoneName.c_str());
+            snapshotRingTo(_pendingEvent, now);
             enqueueAlarmEvent();
             DBG("SecMon", "PENDING (entry delay %lu s, source=%s)", _entryDelay / 1000, getFusionSourceStr());
             triggerAlert(NotificationType::ENTRY_DETECTED, "⏳ ENTRY DETECTED!", "Entry delay: " + String(_entryDelay / 1000) + "s\nSource: " + String(getFusionSourceStr()) + "\n" + formatApproachLog() + "Use /disarm to deactivate.", evtDistance);
@@ -667,8 +741,11 @@ void SecurityMonitor::processRadarData(uint16_t distance, uint8_t move_energy, u
         _alarmState = AlarmState::TRIGGERED;
         _triggerStartTime = now;
         strncpy(_pendingEvent.reason, "entry_delay_expired", sizeof(_pendingEvent.reason) - 1);
-        // zone/distance/energy from last PENDING event preserved — update uptime
+        // zone/distance/energy from last PENDING event preserved — update uptime + refresh forensic snapshot
         _pendingEvent.uptime_s = now / 1000; fillISOTime(_pendingEvent.iso_time, sizeof(_pendingEvent.iso_time));
+        fillForensicFieldsImpl(_pendingEvent, getFusionSourceStr(), _fusionConfidence, _isStaticFiltered,
+                               _pendingEvent.zone, _prevZoneName.c_str());
+        snapshotRingTo(_pendingEvent, now);
         enqueueAlarmEvent();
         DBG("SecMon", "ALARM TRIGGERED!");
         triggerAlert(NotificationType::ALARM_TRIGGERED, "🚨 ALARM TRIGGERED!", "Entry delay expired!\n" + formatApproachLog(), _pendingEvent.distance_cm);

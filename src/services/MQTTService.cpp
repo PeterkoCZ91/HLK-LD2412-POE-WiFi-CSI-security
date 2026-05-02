@@ -251,6 +251,13 @@ void MQTTService::forceReconnect() {
 }
 
 bool MQTTService::publish(const char* topic, const char* payload, bool retained) {
+    // rc7-fix1c (2026-05-02): drop-on-floor during OTA. Bench reproducer
+    // showed MQTT offline buffer (200-slot ring) push pattern continued
+    // during /api/update on a broker-disconnected node, fragmenting heap
+    // until min_heap dropped to 72 KB and AsyncTCP pbuf alloc started
+    // failing mid-upload. update()'s reconnect was already gated, but
+    // publish() callers (radar, security, telemetry) kept storing.
+    if (_otaInProgress.load()) return false;
     if (!_mqttClient.connected()) {
         if (_offlineBuffer) _offlineBuffer->store(topic, payload, retained);
         return false;
@@ -364,7 +371,7 @@ void MQTTService::publishDiscoveryStep() {
         case 20: {
             char alarmExtra[256];
             snprintf(alarmExtra, sizeof(alarmExtra),
-                "{\"cmd_t\":\"%s\",\"stat_t\":\"%s\",\"sup_feat\":[\"arm_away\"]}",
+                "{\"cmd_t\":\"%s\",\"stat_t\":\"%s\",\"sup_feat\":[\"arm_away\",\"arm_home\"]}",
                 _topics.alarm_set, _topics.alarm_state);
             publishOneDiscovery("alarm_control_panel", "alarm", "Security Alarm", _topics.alarm_state, "", "mdi:shield-home", "", alarmExtra);
             break;

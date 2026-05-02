@@ -3,14 +3,14 @@
 [![PlatformIO](https://img.shields.io/badge/PlatformIO-ESP32-orange?logo=platformio)](https://platformio.org/)
 [![ESP32](https://img.shields.io/badge/MCU-ESP32--WROOM--32-blue?logo=espressif)](https://www.espressif.com/)
 [![License](https://img.shields.io/badge/License-GPL--3.0-blue)](LICENSE)
-[![Version](https://img.shields.io/badge/Version-5.0.0--poe--wifi-blue)]()
+[![Version](https://img.shields.io/badge/Version-5.0.2--poe--wifi-blue)]()
 
 **Dual-sensor intrusion detection system** — ESP32 + HLK-LD2412 24 GHz mmWave radar + **WiFi CSI (Channel State Information) passive motion detection** over **wired Ethernet with Power over Ethernet**. Full alarm state machine, zone management, Home Assistant integration, Telegram bot, and a dark-mode web dashboard. No cloud required.
 
 WiFi CSI detection algorithms based on [ESPectre](https://github.com/francescopace/espectre) by Francesco Pace (GPLv3).
 
 > [!TIP]
-> **v5.0.0** — Major release: WiFi CSI presence detection (variance / turbulence / DSER / PLCR), site learning with NVS persistence, MLP classifier (F1=0.852), 3-way radar+CSI+ML fusion, NBVI subcarrier auto-selection, adaptive P95 threshold. Pull-based OTA, cold-reboot-before-OTA flow, Network/Schedule/Timezone tabs, config export/import. All JSON HTTP responses streamed to fix endpoint failure under sustained polling on weak-RSSI deployments. See [CHANGELOG.md](CHANGELOG.md#500-poe-wifi---2026-04-25) for the full feature list.
+> **v5.0.2** — OTA reliability: MQTT heap fragmentation during upload fixed (drop-on-floor mode), pull-OTA endpoint shadow bug fixed (`AsyncURIMatcher::exact`), write-buffer crash on large JSON endpoints fixed (Basic auth for heavy routes). New: **ARM_HOME** mode, pre-trigger ring buffer in alarm status, RTC-backed crash uptime, `/healthz` unauthenticated liveness probe. See [CHANGELOG.md](CHANGELOG.md) for the full history.
 
 ---
 
@@ -247,7 +247,7 @@ Default credentials: `admin` / `admin` — **change immediately** in the Network
         ▲                              │
         │ disarm                       │ exit delay expires
         │                              ▼
-        │◄──────────── disarm ──── ARMED
+        │◄──────────── disarm ──── ARMED ◄─── ARM_HOME (stay mode)
         │                              │
         │                              │ detection (debounced)
         │                              ▼
@@ -261,6 +261,8 @@ Default credentials: `admin` / `admin` — **change immediately** in the Network
                                        ▼  or auto-disarm)
                                    ARMED/DISARMED
 ```
+
+**ARM_HOME mode** — arm while staying inside. Uses the same ARMED state but with a separate zone profile that excludes interior motion zones (e.g., living room) while keeping perimeter zones active. Activated via `?home=1` on `/api/alarm/arm` or MQTT command `ARM_HOME`.
 
 **Entry/exit path validation:** Zones can require a specific previous zone (e.g., "hallway" must precede "living room"). Invalid path → immediate trigger (no entry delay).
 
@@ -473,6 +475,7 @@ All endpoints require Digest auth except where noted.
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | GET | `/api/health` | Uptime, Ethernet info, MQTT, heap, CSI status, reset history |
+| GET | `/healthz` | Unauthenticated liveness probe — heap + uptime. Use for external monitoring when auth may be degraded. |
 | GET | `/api/telemetry` | Radar state, distance, energy, UART stats |
 | GET | `/api/version` | Firmware version string (no auth — used by GUI before login) |
 | GET/DELETE | `/api/debug` | Last 4 KB of DBG() ring buffer; DELETE clears it |
@@ -482,7 +485,7 @@ All endpoints require Digest auth except where noted.
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | GET | `/api/alarm/status` | Alarm state, current zone, debounce, last event |
-| POST | `/api/alarm/arm` | Arm system (`?immediate=1` for no delay) |
+| POST | `/api/alarm/arm` | Arm system (`?immediate=1` for no delay, `?home=1` for ARM_HOME mode) |
 | POST | `/api/alarm/disarm` | Disarm system |
 | GET/POST | `/api/alarm/config` | Entry/exit delay, debounce frames, disarm reminder |
 | GET/POST | `/api/security/config` | Anti-masking, loitering, heartbeat, pet immunity |
@@ -700,6 +703,8 @@ A: Yes. Each device gets a unique `device_id` (auto-derived from MAC) so HA disc
 | v4.5.5-poe-wifi | Fix Engineering Mode initial state publish (HA showed Unknown until toggled) |
 | v4.5.6-poe-wifi | MQTT recovery hardening — publish fail-streak disconnect, 2-min soft-recovery reconnect, failed-while-connected buffering, `lastPub.*` cache gated on publish success, publish-health diagnostics in `/api/health` |
 | v5.0.0-poe-wifi | **Major release.** Site learning + EMA refresh, MLP classifier (F1=0.852), 3-way radar+CSI+ML fusion, NBVI subcarrier auto-selection, adaptive P95 threshold, stuck-motion auto-raise, BSSID-change baseline reset, AP compatibility probe (`ht_ltf_seen`). Pull-based OTA endpoint, cold-reboot-before-OTA GUI flow, Network/Schedule/Timezone tabs, config export/import, MQTT heartbeat topic, Telegram test endpoint, radar Bluetooth disable-on-boot. All JSON HTTP responses streamed via `AsyncResponseStream` to fix endpoint failure under sustained polling on weak-RSSI deployments. Static-zone false-alarm sticky filter. |
+| v5.0.1-poe-wifi | Pull-OTA hardening (URL whitelist, MD5 verification, timeout fix), alarm and runtime stability (mutex timeouts, frame clamping, baud fallback, event flush fix), MQTT offline buffer raised to 200 slots. |
+| v5.0.2-poe-wifi | **OTA reliability:** MQTT heap fragmentation during upload fixed; pull-OTA endpoint shadow bug fixed (`AsyncURIMatcher::exact`); write-buffer crash on large JSON responses fixed (Basic auth for heavy endpoints). **New:** ARM_HOME mode, pre-trigger event ring buffer, RTC crash-uptime tracker, `/healthz` unauthenticated liveness probe, `xTaskCreatePinnedToCore` failure handler. |
 
 ---
 

@@ -34,18 +34,57 @@
 // CPU/UART contention with flash writes.
 extern TaskHandle_t radarTaskHandle;
 
+// Stability-test reboot inhibit (defined in main.cpp). When ON, soft reboot
+// paths are suppressed; OTA success sets g_otaRebootForce so the slot swap
+// still completes regardless of the inhibit.
+#include <atomic>
+extern std::atomic<bool> g_rebootInhibit;
+extern std::atomic<bool> g_otaRebootForce;
+
 namespace WebRoutes {
 
 // Static copy of dependencies - persists after setup() returns
 static Dependencies _deps;
 
+// rc3: Auth instrumentation for /healthz diag endpoint. These are diagnostic
+// counters only — they are not used to make security decisions and contain no
+// secrets. They let the unauth /healthz observer correlate the moment digest
+// auth starts failing with heap / uptime / TCP state.
+static uint32_t _authOkCount = 0;
+static uint32_t _authFailCount = 0;
+static unsigned long _lastAuthOkMs = 0;
+static unsigned long _lastAuthFailMs = 0;
+
 // Authentication helper implementation
 bool checkAuth(AsyncWebServerRequest *request) {
     if (_deps.config == nullptr) return false;
     if (!request->authenticate(_deps.config->auth_user, _deps.config->auth_pass)) {
+        _authFailCount++;
+        _lastAuthFailMs = millis();
         request->requestAuthentication();
         return false;
     }
+    _authOkCount++;
+    _lastAuthOkMs = millis();
+    return true;
+}
+
+// Basic-auth variant for heavy JSON endpoints. On auth failure we challenge
+// with Basic instead of Digest. Digest keeps nonce/body-hash state that
+// AsyncTCP on LAN8720A loses under write-buffer backpressure, causing
+// RemoteDisconnected on large JSON payloads — the same root cause as the
+// classic 64 KB OTA stall. Basic is stateless and avoids this.
+bool checkAuthBasic(AsyncWebServerRequest *request) {
+    if (_deps.config == nullptr) return false;
+    if (!request->authenticate(_deps.config->auth_user, _deps.config->auth_pass)) {
+        _authFailCount++;
+        _lastAuthFailMs = millis();
+        // false = Basic challenge (default true would be Digest)
+        request->requestAuthentication(nullptr, false);
+        return false;
+    }
+    _authOkCount++;
+    _lastAuthOkMs = millis();
     return true;
 }
 
@@ -125,7 +164,7 @@ void setup(Dependencies& deps) {
 
 void setupTelemetryRoutes() {
     _deps.server->on("/api/telemetry", HTTP_GET, [](AsyncWebServerRequest *request) {
-        if (!checkAuth(request)) return;
+        if (!checkAuthBasic(request)) return;
         JsonDocument doc;
         _deps.radar->getTelemetryJson(doc);
         doc["hold_time"] = _deps.radar->getHoldTime();
@@ -159,6 +198,7 @@ void setupTelemetryRoutes() {
         doc["free_heap"] = ESP.getFreeHeap();
         doc["min_heap"] = ESP.getMinFreeHeap();
         doc["chip_temp"] = temperatureRead();
+        doc["reboot_inhibit"] = g_rebootInhibit.load();
 
         // OTA rollback state
         const esp_partition_t* running = esp_ota_get_running_partition();
@@ -649,7 +689,7 @@ void setupConfigRoutes() {
 
     // --- Zones ---
     _deps.server->on("/api/zones", HTTP_GET, [](AsyncWebServerRequest *request) {
-        if (!checkAuth(request)) return;
+        if (!checkAuthBasic(request)) return;
         String copy;
         if (_deps.zonesMutex && xSemaphoreTake(*_deps.zonesMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
             copy = *_deps.zonesJson;
@@ -661,7 +701,7 @@ void setupConfigRoutes() {
     });
 
     _deps.server->on("/api/zones", HTTP_POST, [](AsyncWebServerRequest *request) {
-        if (!checkAuth(request)) return;
+        if (!checkAuthBasic(request)) return;
 
         // Slab layout matches /api/config/import: byte[0]=status (1=oversize),
         // byte[1..]=null-terminated JSON. Validate JSON shape here before
@@ -941,7 +981,7 @@ void setupConfigRoutes() {
 
 void setupSecurityRoutes() {
     _deps.server->on("/api/security/config", HTTP_GET, [](AsyncWebServerRequest *request) {
-        if (!checkAuth(request)) return;
+        if (!checkAuthBasic(request)) return;
         JsonDocument doc;
         doc["antimask_time"] = _deps.securityMonitor->getAntiMaskTime() / 1000;
         doc["antimask_enabled"] = _deps.securityMonitor->isAntiMaskEnabled();
@@ -955,7 +995,7 @@ void setupSecurityRoutes() {
     });
 
     _deps.server->on("/api/security/config", HTTP_POST, [](AsyncWebServerRequest *request) {
-        if (!checkAuth(request)) return;
+        if (!checkAuthBasic(request)) return;
 
         if (request->hasParam("antimask")) {
             unsigned long val = request->getParam("antimask")->value().toInt() * 1000;
@@ -995,7 +1035,37 @@ void setupSecurityRoutes() {
 }
 
 void setupSystemRoutes() {
-    _deps.server->on("/api/update", HTTP_POST, [](AsyncWebServerRequest *request) {
+    // rc3: Unauthenticated diagnostic endpoint — by design no checkAuth().
+    // Purpose: be reachable when /api/* digest auth degrades (.161 pattern:
+    // boot+~1h11min → 100% 401). Returns liveness + heap + auth counters so
+    // an external observer can see the web server is alive and quantify auth
+    // failure rate even after digest auth starts rejecting authenticated
+    // requests. Payload contains no secrets, no config, no PII.
+    _deps.server->on("/healthz", HTTP_GET, [](AsyncWebServerRequest *request) {
+        JsonDocument doc;
+        unsigned long now = millis();
+        doc["fw"] = _deps.fwVersion ? _deps.fwVersion : "";
+        doc["uptime_s"] = now / 1000;
+        doc["heap_free"] = ESP.getFreeHeap();
+        doc["heap_largest"] = ESP.getMaxAllocHeap();      // largest free block (fragmentation indicator)
+        doc["heap_min_ever"] = ESP.getMinFreeHeap();
+        doc["auth_ok"]   = _authOkCount;
+        doc["auth_fail"] = _authFailCount;
+        // Age in seconds since last successful / failed auth. -1 = never seen yet.
+        doc["last_auth_ok_age_s"]   = (_lastAuthOkMs   == 0) ? -1 : (long)((now - _lastAuthOkMs)   / 1000);
+        doc["last_auth_fail_age_s"] = (_lastAuthFailMs == 0) ? -1 : (long)((now - _lastAuthFailMs) / 1000);
+        AsyncResponseStream* response = request->beginResponseStream("application/json");
+        // Force fresh TCP per probe so observer can isolate connection-pool issues
+        response->addHeader("Connection", "close");
+        response->addHeader("Cache-Control", "no-store");
+        serializeJson(doc, *response);
+        request->send(response);
+    });
+
+    // Exact match required — default BackwardCompatible matcher would shadow
+    // /api/update/pull and /api/update/pull/status (matched as prefix), routing
+    // their POSTs into the multipart upload handler below.
+    _deps.server->on(AsyncURIMatcher::exact("/api/update"), HTTP_POST, [](AsyncWebServerRequest *request) {
         if (!checkAuth(request)) return;
         bool success = !Update.hasError();
         AsyncWebServerResponse *response = request->beginResponse(200, "text/plain", success ? "OK" : "FAIL");
@@ -1019,7 +1089,18 @@ void setupSystemRoutes() {
                 return;
             }
             otaAuthorized = true;
-            DBG("OTA", "Update start: %s (%u bytes)", filename.c_str(), request->contentLength());
+            // rc7-fix1c: stale-session cleanup. If a previous OTA dropped
+            // mid-stream (no `final=true` callback), Update lib still has
+            // _size>0, our setOtaInProgress flags are stuck, and radarTask
+            // remains suspended. Clean up before starting fresh.
+            if (Update.isRunning()) {
+                DBG("OTA", "Stale Update session detected — aborting");
+                Update.abort();
+            }
+            // Re-arm the freeze flags. Idempotent if already false.
+            CSIService::setOtaInProgress(false);
+            MQTTService::setOtaInProgress(false);
+            uint32_t heapAtStart = ESP.getFreeHeap();
             // csi7b: freeze CSI WiFi/lwIP interactions so they can't drop the
             // in-flight upload TCP (see CSIService::setOtaInProgress comment).
             CSIService::setOtaInProgress(true);
@@ -1029,29 +1110,57 @@ void setupSystemRoutes() {
             MQTTService::setOtaInProgress(true);
             // Reduce runtime load so AsyncTCP receive buffer can keep draining
             // while Update.write() blocks on flash sector writes (~10–20 ms each).
-            if (radarTaskHandle) vTaskSuspend(radarTaskHandle);
+            // eTaskState check — vTaskSuspend on already-suspended task is OK
+            // but log it so a stuck radarTask is visible across upload retries.
+            if (radarTaskHandle) {
+                eTaskState st = eTaskGetState(radarTaskHandle);
+                if (st == eSuspended) {
+                    DBG("OTA", "radarTask was already suspended (prior failed OTA)");
+                } else {
+                    vTaskSuspend(radarTaskHandle);
+                }
+            }
             if (_deps.configSnapshot && _deps.preferences) {
                 _deps.configSnapshot->saveSnapshot(_deps.preferences, _deps.fwVersion, "ota_http");
             }
+            DBG("OTA", "Update start: %s (%u bytes), heap=%u",
+                filename.c_str(), request->contentLength(), heapAtStart);
             size_t updateSize = (request->contentLength() > 0) ? request->contentLength() : UPDATE_SIZE_UNKNOWN;
             if (!Update.begin(updateSize)) {
-                Update.printError(Serial);
+                String berr = Update.errorString();
+                DBG("OTA", "Update.begin failed: %s", berr.c_str());
+                if (_deps.systemLog) _deps.systemLog->error("OTA begin: " + berr);
             }
         }
         if (!otaAuthorized) return;
         if (!Update.hasError()) {
-            if (Update.write(data, len) != len) {
-                Update.printError(Serial);
+            size_t wrote = Update.write(data, len);
+            if (wrote != len) {
+                String werr = Update.errorString();
+                DBG("OTA", "Update.write %u/%u failed: %s",
+                    (unsigned)wrote, (unsigned)len, werr.c_str());
+                if (_deps.systemLog) {
+                    _deps.systemLog->error(String("OTA write @") +
+                        String((unsigned)(index + len)) + " B: " + werr);
+                }
             }
             esp_task_wdt_reset();
-            // Yield so AsyncTCP task can ACK and drain socket buffer. Without
-            // this, flash writes monopolise the handler and the 64 KB receive
-            // buffer fills before the next chunk can land → connection stall.
-            vTaskDelay(pdMS_TO_TICKS(1));
+            // rc7-fix1 (2026-05-02): heap-aware yield. Bench reproducer with
+            // base 1 ms delay dropped at 70% with min_heap=72 KB and "Empty
+            // reply from server" — AsyncTCP pbuf alloc was hitting heap
+            // pressure. Keep 1 ms in the common path (preserves throughput),
+            // jump to 10 ms when free heap < 80 KB so the AsyncTCP task can
+            // drain pbufs and let RAM recover before the next chunk. Higher
+            // values (5+ ms unconditional) caused server-side parse stalls.
+            uint32_t freeHeap = ESP.getFreeHeap();
+            TickType_t yieldMs = (freeHeap < 80000) ? 10 : 1;
+            vTaskDelay(pdMS_TO_TICKS(yieldMs));
         }
         if (final) {
             if (!Update.hasError() && Update.end(true)) {
                 DBG("OTA", "Update success: %u B — reboot scheduled", index + len);
+                // OTA success bypasses reboot inhibit so the slot swap completes.
+                g_otaRebootForce.store(true);
                 *_deps.shouldReboot = true;
             } else {
                 Update.printError(Serial);
@@ -1161,7 +1270,7 @@ void setupSystemRoutes() {
             "Pull accepted. Watch /api/update/pull/status for progress. "
             "Device reboots only on successful image swap.");
 
-        xTaskCreatePinnedToCore([](void* arg) {
+        BaseType_t taskOk = xTaskCreatePinnedToCore([](void* arg) {
             PullParams* p = static_cast<PullParams*>(arg);
             Preferences* prefs = _deps.preferences;
 
@@ -1286,6 +1395,23 @@ void setupSystemRoutes() {
             }
             vTaskDelete(NULL);
         }, "ota_pull", 16384, p, 5, nullptr, 1);  // 16 KB stack for HTTPS+HTTPUpdate
+
+        if (taskOk != pdPASS) {
+            DBG("OTA-PULL", "xTaskCreatePinnedToCore failed");
+            if (_deps.systemLog) {
+                _deps.systemLog->error("OTA pull task create failed");
+            }
+            if (_deps.preferences) {
+                _deps.preferences->putString("ota_phase", "failed");
+                _deps.preferences->putString("ota_msg", "task create failed");
+                _deps.preferences->putInt("ota_err", -5);
+            }
+            if (radarTaskHandle) vTaskResume(radarTaskHandle);
+            CSIService::setOtaInProgress(false);
+            MQTTService::setOtaInProgress(false);
+            otaPullInFlight = false;
+            delete p;
+        }
     },
     NULL,
     [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
@@ -1330,8 +1456,69 @@ void setupSystemRoutes() {
 
     _deps.server->on("/api/restart", HTTP_POST, [](AsyncWebServerRequest *request) {
         if (!checkAuth(request)) return;
+        if (g_rebootInhibit.load()) {
+            request->send(503, "text/plain",
+                "Reboot inhibit is ON. POST /api/reboot_inhibit {\"enabled\":false} to allow manual restarts.");
+            return;
+        }
         request->send(200, "text/plain", "Rebooting...");
         *_deps.shouldReboot = true;
+    });
+
+    // Stability-test inhibit toggle. GET reports current state; POST {"enabled":bool}
+    // updates atomic + persists to NVS. Successful OTA flashes always bypass the
+    // inhibit (g_otaRebootForce path) so they can swap slots regardless of this.
+    _deps.server->on("/api/reboot_inhibit", HTTP_GET, [](AsyncWebServerRequest *request) {
+        if (!checkAuth(request)) return;
+        JsonDocument doc;
+        doc["enabled"] = g_rebootInhibit.load();
+        doc["ota_force_pending"] = g_otaRebootForce.load();
+        String out;
+        serializeJson(doc, out);
+        request->send(200, "application/json", out);
+    });
+    _deps.server->on("/api/reboot_inhibit", HTTP_POST,
+    [](AsyncWebServerRequest *request) {
+        if (!checkAuth(request)) return;
+        if (!request->_tempObject) {
+            request->send(400, "text/plain", "Body missing");
+            return;
+        }
+        JsonDocument doc;
+        DeserializationError jerr = deserializeJson(doc, (const char*)request->_tempObject);
+        if (jerr) {
+            request->send(400, "text/plain", String("Invalid JSON: ") + jerr.c_str());
+            return;
+        }
+        if (!doc["enabled"].is<bool>()) {
+            request->send(400, "text/plain", "Missing 'enabled' boolean");
+            return;
+        }
+        bool enabled = doc["enabled"].as<bool>();
+        g_rebootInhibit.store(enabled);
+        if (_deps.preferences) {
+            _deps.preferences->putBool("reboot_inhibit", enabled);
+        }
+        if (_deps.systemLog) {
+            _deps.systemLog->info(String("Reboot inhibit set ") + (enabled ? "ON" : "OFF") + " via API");
+        }
+        JsonDocument resp;
+        resp["enabled"] = enabled;
+        resp["persisted"] = true;
+        String out;
+        serializeJson(resp, out);
+        request->send(200, "application/json", out);
+    },
+    NULL,
+    [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+        if (index == 0) {
+            if (total > 256) return;
+            request->_tempObject = malloc(total + 1);
+            if (!request->_tempObject) return;
+            ((char*)request->_tempObject)[total] = '\0';
+        }
+        if (!request->_tempObject) return;
+        memcpy((char*)request->_tempObject + index, data, len);
     });
 
     _deps.server->on("/api/radar/restart", HTTP_POST, [](AsyncWebServerRequest *request) {
@@ -1661,7 +1848,7 @@ void setupSystemRoutes() {
 
 void setupAlarmRoutes() {
     _deps.server->on("/api/alarm/status", HTTP_GET, [](AsyncWebServerRequest *request) {
-        if (!checkAuth(request)) return;
+        if (!checkAuthBasic(request)) return;
         JsonDocument doc;
         doc["armed"] = _deps.securityMonitor->isArmed();
         doc["state"] = _deps.securityMonitor->getAlarmStateStr();
@@ -1681,6 +1868,24 @@ void setupAlarmRoutes() {
             last["motion_type"] = evt.motion_type;
             last["uptime_s"]    = evt.uptime_s;
             if (evt.iso_time[0] != '\0') last["time"] = evt.iso_time;
+            // rc2: forensic fields
+            last["trigger_source"]    = evt.trigger_source;
+            last["fusion_confidence"] = evt.fusion_confidence;
+            last["static_filtered"]   = (bool)evt.static_filtered;
+            last["zone_was_none"]     = (bool)evt.zone_was_none;
+            last["prev_zone"]         = evt.prev_zone;
+            if (evt.ring_count > 0) {
+                JsonArray ring = last["pre_trigger"].to<JsonArray>();
+                for (uint8_t i = 0; i < evt.ring_count; i++) {
+                    JsonObject s = ring.add<JsonObject>();
+                    s["age_ms"] = evt.ring[i].age_ms;
+                    s["d"]      = evt.ring[i].distance_cm;
+                    s["mov"]    = evt.ring[i].move_energy;
+                    s["stat"]   = evt.ring[i].static_energy;
+                    s["src"]    = evt.ring[i].fusion_source;
+                    s["fl"]     = evt.ring[i].flags;
+                }
+            }
         }
         AsyncResponseStream* response = request->beginResponseStream("application/json");
         serializeJson(doc, *response);
@@ -1743,7 +1948,7 @@ void setupLogRoutes() {
     });
 
     _deps.server->on("/api/events", HTTP_GET, [](AsyncWebServerRequest *request) {
-        if (!checkAuth(request)) return;
+        if (!checkAuthBasic(request)) return;
         uint32_t offset = request->hasParam("offset") ? request->getParam("offset")->value().toInt() : 0;
         uint32_t limit  = request->hasParam("limit")  ? request->getParam("limit")->value().toInt()  : 50;
         int8_t   type   = request->hasParam("type")   ? request->getParam("type")->value().toInt()   : -1;
@@ -2057,7 +2262,7 @@ void setupCSIRoutes() {
 #ifdef USE_CSI
     // GET — runtime config + live values + status
     _deps.server->on(AsyncURIMatcher::exact("/api/csi"), HTTP_GET, [](AsyncWebServerRequest *request) {
-        if (!checkAuth(request)) return;
+        if (!checkAuthBasic(request)) return;
         JsonDocument doc;
         doc["compiled"] = true;
         doc["enabled"]  = _deps.config->csi_enabled;
@@ -2249,7 +2454,7 @@ void setupCSIRoutes() {
     // Register as an exact match only: the AsyncWebServer default matcher is
     // backward-compatible and would otherwise also catch /api/csi/<action>.
     _deps.server->on(AsyncURIMatcher::exact("/api/csi"), HTTP_POST, [](AsyncWebServerRequest *request) {
-        if (!checkAuth(request)) return;
+        if (!checkAuthBasic(request)) return;
         bool needsRestart = false;
         bool changed = false;
 
@@ -2369,12 +2574,12 @@ void setupCSIRoutes() {
 #else
     // No-CSI build — stubs so GUI can detect "not compiled in"
     _deps.server->on("/api/csi", HTTP_GET, [](AsyncWebServerRequest *request) {
-        if (!checkAuth(request)) return;
+        if (!checkAuthBasic(request)) return;
         request->send(200, "application/json",
                       "{\"compiled\":false,\"enabled\":false,\"active\":false}");
     });
     _deps.server->on("/api/csi", HTTP_POST, [](AsyncWebServerRequest *request) {
-        if (!checkAuth(request)) return;
+        if (!checkAuthBasic(request)) return;
         request->send(503, "text/plain", "CSI not compiled into this firmware");
     });
 #endif

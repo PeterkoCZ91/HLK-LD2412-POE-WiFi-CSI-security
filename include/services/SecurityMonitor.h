@@ -22,16 +22,38 @@ enum class AlarmState {
     TRIGGERED
 };
 
+// rc2: Pre-trigger ring buffer sample (snapshot of radar+fusion state)
+struct PreTriggerSample {
+    uint16_t age_ms;        // millis() age relative to trigger time
+    uint16_t distance_cm;
+    uint8_t move_energy;
+    uint8_t static_energy;
+    uint8_t fusion_source;  // bitmask: bit0=radar, bit1=csi, bit2=ml
+    uint8_t flags;          // bit0=move>0, bit1=stat>0, bit2=static_filtered, bit3=fusion_presence
+};
+
+// rc2: Compact pre-trigger window — 10 samples × ~500 ms = ~5 s
+static constexpr uint8_t PRE_TRIGGER_WINDOW = 10;
+
 // Alarm trigger event — published atomically to MQTT alarm/event
 struct AlarmTriggerEvent {
     char reason[24];     // "entry_delay" | "immediate" | "entry_delay_expired" | "disarmed"
     char zone[16];
+    char prev_zone[16];   // rc2: previous zone (entry-path forensics)
     uint16_t distance_cm;
     uint8_t energy_mov;
     uint8_t energy_stat;
     char motion_type[8]; // "moving" | "static" | "both" | "none"
     uint32_t uptime_s;
     char iso_time[20];   // "2026-03-21T22:14:05" or "" if NTP not synced
+    // rc2: forensic context fields
+    char trigger_source[12]; // fusion source string at trigger ("radar", "csi", "radar+csi", ...)
+    float fusion_confidence; // 0.0-1.0 at trigger
+    uint8_t static_filtered; // 0/1 — was static reflector filter active just before trigger?
+    uint8_t zone_was_none;   // 0/1 — trigger occurred without configured zone context
+    // rc2: pre-trigger ring buffer snapshot (newest sample at index ring_count-1)
+    PreTriggerSample ring[PRE_TRIGGER_WINDOW];
+    uint8_t ring_count;
 };
 
 // Security event types
@@ -100,8 +122,9 @@ public:
     void setPetImmunity(uint8_t energy) { _petImmunityThreshold = energy; }
 
     // Armed/Disarmed
-    void setArmed(bool armed, bool immediate = false);
+    void setArmed(bool armed, bool immediate = false, bool homeMode = false);
     bool isArmed() const { return _alarmState == AlarmState::ARMED || _alarmState == AlarmState::ARMING || _alarmState == AlarmState::PENDING || _alarmState == AlarmState::TRIGGERED; }
+    bool isHomeMode() const { return _homeMode; }
     AlarmState getAlarmState() const { return _alarmState; }
     const char* getAlarmStateStr() const;
     void setEntryDelay(unsigned long ms) { _entryDelay = ms; }
@@ -188,6 +211,7 @@ private:
 
     // Armed/Disarmed state
     AlarmState _alarmState = AlarmState::DISARMED;
+    bool _homeMode = false;  // true = armed_home, false = armed_away
     unsigned long _entryDelay = 30000;
     unsigned long _exitDelay = 30000;
     unsigned long _exitDelayStart = 0;
@@ -299,6 +323,16 @@ private:
     static constexpr uint8_t CSI_SUPPRESS_FRAMES = 6;  // Frames CSI must disagree to suppress radar
     static constexpr float CSI_ONLY_MIN_SCORE = 0.4f;  // Minimum composite score for CSI-only presence
     static constexpr unsigned long CSI_ONLY_HOLD_MS = 3000;  // CSI must persist 3s alone before fusion accepts
+
+    // rc2: Pre-trigger ring buffer — captures radar+fusion state at ~500 ms cadence,
+    // continuously (regardless of alarm state). Snapshotted into AlarmTriggerEvent on trigger.
+    PreTriggerSample _ringBuffer[PRE_TRIGGER_WINDOW];
+    uint8_t _ringHead = 0;       // next write index
+    uint8_t _ringCount = 0;      // valid samples (≤ PRE_TRIGGER_WINDOW)
+    unsigned long _lastRingPushMs = 0;
+    static constexpr unsigned long RING_PUSH_INTERVAL_MS = 500;
+    void pushRingSample(uint16_t distance, uint8_t mov, uint8_t stat, uint8_t fusionSrc, bool fusionPresence);
+    void snapshotRingTo(AlarmTriggerEvent& evt, unsigned long triggerMs) const;
 
     // Approach tracker — records detections while ARMED for forensic analysis
     static constexpr uint8_t APPROACH_LOG_SIZE = 16;

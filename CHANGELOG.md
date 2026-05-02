@@ -2,6 +2,28 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.0.2-poe-wifi] - 2026-05-02
+
+OTA reliability, auth stability, ARM_HOME mode, and crash forensics.
+
+### Added
+
+- **ARM_HOME mode** — new alarm state for stay-at-home scenarios. MQTT command `ARM_HOME` activates the arm sequence with a separate perimeter profile; state persists across reboots via NVS.
+- **RTC uptime tracker** — `RTC_DATA_ATTR` counter updated every main-loop tick. Survives Task WDT / panic / SW reset (cleared only on power-on / brownout), giving ~1 s resolution on crash time in `reset_history` instead of the previous 1 h NVS granularity.
+- **Pre-trigger ring buffer** — `/api/alarm/status` now includes the last N motion events before the alarm fired, giving operators forensic context for investigating false positives.
+- **`/healthz` liveness endpoint** — unauthenticated, returns heap + uptime so external monitors can distinguish a live-but-auth-degraded device from a dead one.
+- **`xTaskCreatePinnedToCore` failure handler** — startup task creation failures are now logged and surfaced instead of silently ignored.
+
+### Fixed
+
+- **MQTT heap fragmentation → OTA stall** — the 200-slot offline publish buffer churned heap allocations during an active OTA upload, fragmenting free memory enough to stall `ArduinoOTA` authentication. Fix: drop-on-floor mode when `CSIService::isOtaInProgress()` is set; a separate `g_otaRebootForce` flag ensures the slot swap still completes even when the reboot-inhibit is on.
+- **Pull-OTA endpoint shadow** — `AsyncWebServer`'s backward-compatible prefix matcher routed `POST /api/update/pull` to the multipart-upload handler (which stalls at 65 536 B) instead of the pull handler. Fix: `AsyncURIMatcher::exact()` on the pull route.
+- **Write-buffer crash on heavy JSON endpoints** — `GET /api/zones`, `GET /api/security/config`, and `GET /api/alarm/status` (with ring buffer) triggered `RemoteDisconnected` under sustained polling because Digest auth maintains per-request nonce state that AsyncTCP on LAN8720A drops under backpressure. Fix: switched those endpoints to Basic auth (stateless challenge), the same approach already used for `/api/update`.
+
+### Changed
+
+- **AsyncTCP / ESPAsyncWebServer pinned** — `lib_deps` now references specific commits known to work on ESP32 + LAN8720A to prevent silent regressions from upstream changes.
+
 ## [5.0.1-poe-wifi] - 2026-04-26
 
 Bug fix release for v5.0.0 — pull-OTA hardening, alarm and runtime stability.

@@ -31,3 +31,4 @@ observe_*.jsonl
 include/secrets.h
 include/secrets_*.h
 include/known_devices.h
+bench_*.jsonl

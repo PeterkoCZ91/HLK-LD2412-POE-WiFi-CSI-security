@@ -64,11 +64,20 @@ namespace WebRoutes {
     };
 
     /**
-     * @brief Authentication helper - checks HTTP Basic Auth
+     * @brief Authentication helper — checks HTTP auth, challenges with Digest on failure
      * @param request The incoming HTTP request
-     * @return true if authenticated, false otherwise (sends 401)
+     * @return true if authenticated, false otherwise (sends 401 + Digest challenge)
      */
     bool checkAuth(AsyncWebServerRequest *request);
+
+    /**
+     * @brief rc4: Authentication helper — challenges with Basic on failure.
+     * Used by heavy JSON endpoints to avoid Digest nonce/body-hash state under
+     * AsyncTCP write-buffer pressure (see definition for full rationale).
+     * @param request The incoming HTTP request
+     * @return true if authenticated, false otherwise (sends 401 + Basic challenge)
+     */
+    bool checkAuthBasic(AsyncWebServerRequest *request);
 
     /**
      * @brief Initialize all web routes

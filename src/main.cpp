@@ -10,6 +10,7 @@
 #endif
 #include <Preferences.h>
 #include <esp_task_wdt.h>
+#include <atomic>
 #ifndef LITE_BUILD
 #include <HTTPClient.h>
 #endif
@@ -43,9 +44,18 @@
 // -------------------------------------------------------------------------
 #include <Update.h>
 #ifndef FW_VERSION
-#define FW_VERSION "v5.0.1"
+#define FW_VERSION "v5.0.2"
 #endif
 #define WDT_TIMEOUT_SECONDS 60
+
+// v5.0.2-rc1: RTC slow-memory uptime tracker for finer-grained TWDT crash forensics.
+// Hourly NVS save quantizes reset_history uptimes to 1h/2h/5h boundaries — useless for
+// pattern detection. RTC mem survives Task WDT / panic / SW reset (cleared only on
+// power-on / brownout), so updating it every loop tick gives ~1s resolution on crash
+// time without NVS wear. Magic guards against uninitialized RTC junk after power-on.
+RTC_DATA_ATTR uint32_t rtc_uptime_magic = 0;
+RTC_DATA_ATTR uint32_t rtc_last_uptime_s = 0;
+constexpr uint32_t RTC_UPTIME_MAGIC = 0xDECAFBAD;
 
 // NTP Config
 const char* ntpServer = "pool.ntp.org";
@@ -174,6 +184,13 @@ bool shouldSaveConfig = false;
 volatile bool shouldReboot = false;
 bool bootValidated = false;
 
+// Reboot inhibit. When ON, every soft restart path (safeRestart, DMS phase 2,
+// ETH watchdog, /api/restart) is suppressed and only logged. OTA success sets
+// g_otaRebootForce so slot swap still completes regardless. NVS key
+// "reboot_inhibit" persists the choice across reboots.
+std::atomic<bool> g_rebootInhibit{false};
+std::atomic<bool> g_otaRebootForce{false};
+
 static String pendingZonesJson = "";
 static volatile bool pendingZonesUpdate = false;
 SemaphoreHandle_t zonesMutex = NULL;
@@ -277,6 +294,13 @@ void onEthEvent(arduino_event_id_t event) {
 // Safe Restart
 // -------------------------------------------------------------------------
 void safeRestart(const char* reason) {
+    bool force = g_otaRebootForce.load();
+    if (g_rebootInhibit.load() && !force) {
+        DBG("SYSTEM", ">>> REBOOT INHIBIT: '%s' suppressed (uptime %lus, heap %u)",
+            reason, millis() / 1000, ESP.getFreeHeap());
+        systemLog.warn(String("Reboot inhibit: ") + reason + " suppressed");
+        return;
+    }
     preferences.putString("restart_cause", reason);
     preferences.putULong("last_uptime", millis() / 1000);
     preferences.putULong("last_heap", ESP.getFreeHeap());
@@ -363,6 +387,13 @@ void connectivityTask(void* param) {
     for (;;) {
         vTaskDelay(delayTicks);
 
+        // Skip the watchdog cycle entirely while a /api/update is in flight.
+        // The watchdog otherwise prints DBG, hits ETH.linkUp() / mqtt state,
+        // and (without inhibit) could reboot mid-upload.
+#ifdef USE_CSI
+        if (CSIService::isOtaInProgress()) continue;
+#endif
+
         // --- ETH link watchdog ---
         if (!ETH.linkUp()) {
             if (ethDownSince == 0) {
@@ -375,8 +406,17 @@ void connectivityTask(void* param) {
                     downFor / 1000, ETH_LINK_WATCHDOG_MS / 1000);
 
                 if (downFor >= ETH_LINK_WATCHDOG_MS) {
-                    systemLog.error("ETH link down > 5min — rebooting");
-                    safeRestart("eth_link_lost");
+                    if (g_rebootInhibit.load()) {
+                        // Avoid log-spam each loop: throttle to once / minute
+                        static unsigned long lastInhibitLog = 0;
+                        if (millis() - lastInhibitLog > 60000) {
+                            lastInhibitLog = millis();
+                            systemLog.warn("ETH link down >5min, reboot inhibit ON — staying up");
+                        }
+                    } else {
+                        systemLog.error("ETH link down > 5min — rebooting");
+                        safeRestart("eth_link_lost");
+                    }
                 }
             }
             mqttFailCount = 0;
@@ -465,6 +505,15 @@ void setup() {
 
     preferences.begin("radar_config", false);
 
+    // Reboot inhibit: dev build default ON. Persisted choice wins on subsequent
+    // boots so toggling via /api/reboot_inhibit survives reboots within the
+    // same firmware build.
+    {
+        bool persisted = preferences.getBool("reboot_inhibit", true);
+        g_rebootInhibit.store(persisted);
+        Serial.printf("[SYSTEM] Reboot inhibit: %s (NVS)\n", persisted ? "ON" : "OFF");
+    }
+
     Serial.print(">> MQTT Broker Target: "); Serial.println(configManager.getConfig().mqtt_server);
     Serial.println("=============================================\n");
 
@@ -517,10 +566,22 @@ void setup() {
     String prevRestartCause = preferences.getString("restart_cause", "none");
     g_prevRestartCause = prevRestartCause;
 
+    // v5.0.2-rc1: prefer RTC slow-memory uptime (1s resolution, survives TWDT/panic/SW)
+    // over NVS last_uptime (1h resolution, survives power-on too). Magic check rejects
+    // uninitialized RTC junk after first power-on.
+    uint32_t crashUptime = preferences.getULong("last_uptime", 0);
+    bool rtcValid = (rtc_uptime_magic == RTC_UPTIME_MAGIC);
+    if (rtcValid && rtc_last_uptime_s > 0) {
+        crashUptime = rtc_last_uptime_s;
+    }
+    rtc_uptime_magic = RTC_UPTIME_MAGIC;  // arm for next crash
+    rtc_last_uptime_s = 0;
+
     JsonObject entry = arr.add<JsonObject>();
     entry["reason"] = reasonStr;
     entry["cause"] = prevRestartCause;
-    entry["uptime"] = preferences.getULong("last_uptime", 0);
+    entry["uptime"] = crashUptime;
+    entry["uptime_src"] = rtcValid ? "rtc" : "nvs";
     entry["ts"] = millis();
 
     while (arr.size() > 10) arr.remove(0);
@@ -751,7 +812,8 @@ void setup() {
                 radar.startCalibration();
             } else if (strcmp(topic, t.alarm_set) == 0) {
                 String cmd = String(payload);
-                if (cmd == "ARM_AWAY") securityMonitor.setArmed(true, false);
+                if (cmd == "ARM_AWAY") securityMonitor.setArmed(true, false, false);
+                else if (cmd == "ARM_HOME") securityMonitor.setArmed(true, false, true);
                 else if (cmd == "DISARM") securityMonitor.setArmed(false);
             } else if (strstr(topic, "/supervision/alive") != nullptr) {
                 const char* start = topic + 9; // skip "security/"
@@ -831,7 +893,8 @@ void setup() {
     securityMonitor.setAlarmEnergyThreshold(preferences.getUChar("sec_alarm_en", DEFAULT_ALARM_ENERGY_THRESHOLD));
     securityMonitor.setSirenPin(SIREN_PIN);
     if (preferences.getBool("sec_armed", false)) {
-        securityMonitor.setArmed(true, false);
+        bool homeMode = preferences.getBool("sec_home_mode", false);
+        securityMonitor.setArmed(true, false, homeMode);
     }
 
 #ifndef LITE_BUILD
@@ -929,12 +992,23 @@ void setup() {
 void loop() {
     unsigned long now = millis();
     esp_task_wdt_reset();
+
+    // v5.0.2-rc1: RTC uptime tracker — every loop tick. Survives Task WDT/panic
+    // so reset_history gets ~1s resolution on crash time instead of hourly.
+    rtc_last_uptime_s = now / 1000;
+
 #ifndef LITE_BUILD
     ArduinoOTA.handle();
 #endif
 
     if (shouldReboot) {
-        safeRestart("manual_reboot");
+        if (g_rebootInhibit.load() && !g_otaRebootForce.load()) {
+            DBG("SYSTEM", "shouldReboot=true but inhibit ON — clearing");
+            systemLog.warn("Manual reboot suppressed by inhibit");
+            shouldReboot = false;
+        } else {
+            safeRestart(g_otaRebootForce.load() ? "ota_complete" : "manual_reboot");
+        }
     }
 
     // Process pending zones update from async web handler
@@ -1249,7 +1323,16 @@ void loop() {
     unsigned long dmsPublishAge = (unsigned long)(now - mqttService.getLastPublishTime());
     // Guard against millis() overflow: if age > 30 days, it's clearly wrap-around, not real staleness
     bool dmsPublishStale = (dmsPublishAge > TIMEOUT_DMS_NO_PUBLISH_MS) && (dmsPublishAge < 2592000000UL);
-    if (!dmsDegraded && configManager.getConfig().mqtt_enabled && strlen(configManager.getConfig().mqtt_server) > 0 && (now - bootTime) > TIMEOUT_DMS_STARTUP_MS &&
+    // Skip DMS entirely while an OTA is mid-flight (hypothesis #4 from
+    // docs/OTA_FAILURE_2026_05_02.md: 30-min DMS firing mid-upload returns
+    // Update.hasError()=true on resume) or while the operator has explicitly
+    // pinned the device for stability testing via reboot inhibit.
+#ifdef USE_CSI
+    bool dmsBlocked = CSIService::isOtaInProgress() || g_rebootInhibit.load();
+#else
+    bool dmsBlocked = g_rebootInhibit.load();
+#endif
+    if (!dmsDegraded && !dmsBlocked && configManager.getConfig().mqtt_enabled && strlen(configManager.getConfig().mqtt_server) > 0 && (now - bootTime) > TIMEOUT_DMS_STARTUP_MS &&
         dmsPublishStale) {
 
         if (!dmsReconnectPending) {
@@ -1302,7 +1385,16 @@ void loop() {
     // SSE Realtime Telemetry (250ms)
 #ifndef LITE_BUILD
     static unsigned long lastSSE = 0;
-    if (now - lastSSE > INTERVAL_SSE_UPDATE_MS && ESP.getFreeHeap() >= HEAP_MIN_FOR_PUBLISH) {
+    // rc7-fix1c: skip SSE JSON serialization during OTA. Per Petr 2026-05-02
+    // ("nezatěžovat ESP během flashe"): JsonDocument allocation + events->send
+    // every 250 ms is wasted heap pressure when AsyncTCP needs every byte
+    // for the upload pbuf chain.
+#ifdef USE_CSI
+    bool sseSkipForOta = CSIService::isOtaInProgress();
+#else
+    bool sseSkipForOta = false;
+#endif
+    if (!sseSkipForOta && now - lastSSE > INTERVAL_SSE_UPDATE_MS && ESP.getFreeHeap() >= HEAP_MIN_FOR_PUBLISH) {
         lastSSE = now;
         JsonDocument doc;
         radar.getTelemetryJson(doc);
@@ -1462,6 +1554,27 @@ void loop() {
                     evtDoc["motion_type"] = evt.motion_type;
                     evtDoc["uptime_s"]    = evt.uptime_s;
                     if (evt.iso_time[0]) evtDoc["time"] = evt.iso_time;
+
+                    // rc2: forensic fields
+                    evtDoc["trigger_source"]    = evt.trigger_source;
+                    evtDoc["fusion_confidence"] = evt.fusion_confidence;
+                    evtDoc["static_filtered"]   = (bool)evt.static_filtered;
+                    evtDoc["zone_was_none"]     = (bool)evt.zone_was_none;
+                    evtDoc["prev_zone"]         = evt.prev_zone;
+
+                    // rc2: pre-trigger ring buffer (oldest → newest, age_ms = ms before trigger)
+                    if (evt.ring_count > 0) {
+                        JsonArray ring = evtDoc["pre_trigger"].to<JsonArray>();
+                        for (uint8_t i = 0; i < evt.ring_count; i++) {
+                            JsonObject s = ring.add<JsonObject>();
+                            s["age_ms"] = evt.ring[i].age_ms;
+                            s["d"]      = evt.ring[i].distance_cm;
+                            s["mov"]    = evt.ring[i].move_energy;
+                            s["stat"]   = evt.ring[i].static_energy;
+                            s["src"]    = evt.ring[i].fusion_source;
+                            s["fl"]     = evt.ring[i].flags;
+                        }
+                    }
 
                     // Mesh: include verification status
                     if (peerCount > 0) {
