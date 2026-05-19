@@ -44,7 +44,7 @@
 // -------------------------------------------------------------------------
 #include <Update.h>
 #ifndef FW_VERSION
-#define FW_VERSION "v5.0.2"
+#define FW_VERSION "v5.0.3"
 #endif
 #define WDT_TIMEOUT_SECONDS 60
 

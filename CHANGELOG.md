@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.0.3-poe-wifi] - 2026-05-19
+
+### Fixed
+
+- **i18n: `gate_legend` not translated to Czech** — CS entry was a copy of the EN string. Translated to Czech.
+- **Gate tab corrupted legend HTML** — Mixed Czech/English text, broken `&#9632;` entity references, and extra `</span>` tags (merge artifact). Replaced with clean `data-i18n` wiring so both language mutations render correctly.
+
 ## [5.0.2-poe-wifi] - 2026-05-02
 
 OTA reliability, auth stability, ARM_HOME mode, and crash forensics.
