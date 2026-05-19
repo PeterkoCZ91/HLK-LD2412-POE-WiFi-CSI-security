@@ -23,6 +23,7 @@ dist/
 # Logs
 logs/
 observe_*.jsonl
+UPDATES_FROM_ESPECTRE*.md
 
 # Secrets — NEVER commit real credentials
 # Copy .example files and fill in your values:
