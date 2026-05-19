@@ -116,7 +116,7 @@ const char index_html[] PROGMEM = R"rawliteral(
       light_thr: "Práh světla (0-255)", light_cur: "Aktuální světlo",
       light_hint: "OUT pin aktivní jen když je světlo pod/nad prahem.<br>Ideální pro noční zabezpečení (režim \"pod práh\").",
       movement: "Pohyb", static_: "Statika",
-      gate_legend: "Higher = more sensitive &middot; <span style='opacity:0.4'>gray = outside min/max range</span>",
+      gate_legend: "Vyšší = citlivější &middot; <span style='opacity:0.4'>šedá = mimo min/max rozsah</span>",
       set_all: "Nastavit vše:", indoor: "Interiér", outdoor: "Exteriér", pets: "Zvířata",
       save_gates: "Uložit Hradla", save_mqtt: "Uložit MQTT", save: "Uložit",
       username: "Uživatel", new_pass: "Nové heslo", change_pass: "Změnit heslo",
@@ -596,9 +596,9 @@ const char index_html[] PROGMEM = R"rawliteral(
             <div id="range_summary" style="font-size:0.8rem; color:#888; margin-bottom:8px; text-align:center"></div>
 
             <div style="font-size:0.75rem; color:#888; margin-bottom:8px; line-height:1.5">
-                <span style="color:#03dac6; font-weight:bold">&#9632; Pohyb</span> = citlivost na pohybující se objekty#9632; <span data-i18n="movement">Pohyb</span></span> = move sensitivity &middot;
-                <span style="color:#bb86fc; font-weight:bold">&#9632; Statika</span> = citlivost na nehybné objekty#9632; <span data-i18n="static_">Statika</span></span> = static sensitivity<br>
-                Higher = more sensitive &middot; <span style="opacity:0.4">gray = outside min/max range</span>
+                <span style="color:#03dac6; font-weight:bold">&#9632; <span data-i18n="movement">Pohyb</span></span> &middot;
+                <span style="color:#bb86fc; font-weight:bold">&#9632; <span data-i18n="static_">Statika</span></span><br>
+                <span data-i18n="gate_legend">Vyšší = citlivější &middot; <span style="opacity:0.4">šedá = mimo min/max rozsah</span></span>
             </div>
 
             <div style="background:#111; border-radius:8px; padding:8px; margin-bottom:8px">
