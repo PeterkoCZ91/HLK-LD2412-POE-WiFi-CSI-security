@@ -372,7 +372,7 @@ const char index_html[] PROGMEM = R"rawliteral(
       dow_fr: "Fr", dow_sa: "Sa", dow_su: "Su",
     }
   };
-  let LANG = localStorage.getItem('lang') || 'cs';
+  let LANG = localStorage.getItem('lang') || 'en';
   function t(k) { return (I18N[LANG] && I18N[LANG][k]) || (I18N.en[k]) || k; }
   function setLang(l) { LANG = l; localStorage.setItem('lang', l); applyLang(); }
   function applyLang() {
@@ -1069,6 +1069,7 @@ function init() {
     fetch('/api/version').then(r=>r.text()).then(v => $('fw_ver').innerText = v);
     
     fetch('/api/health').then(r=>r.json()).then(d => {
+        g_isDefaultPass = !!d.is_default_pass;
         if(d.is_default_pass) $('security_warning').style.display = 'block';
         if(d.auth_user) $('txt_auth_user').value = d.auth_user;
         if(d.hostname) $('txt_hostname').value = d.hostname;
@@ -2276,6 +2277,7 @@ function pullFW() {
 
 // --- ALARM ---
 let alarmArmed = false;
+let g_isDefaultPass = false;
 function loadAlarmStatus() {
     fetch('/api/alarm/status').then(r=>r.json()).then(d => {
         alarmArmed = d.armed;
@@ -2295,6 +2297,10 @@ function updateAlarmUI(state) {
     else if(state === 'triggered') { badge.innerText = t('triggered'); badge.style.color='red'; btn.innerText=t('disarm'); btn.style.background='#3700b3'; }
 }
 function toggleArm() {
+    if(!alarmArmed && g_isDefaultPass) {
+        showToast(t('default_pass_warn'));
+        return;
+    }
     if(alarmArmed) {
         api('alarm/disarm', {method:'POST'}).then(()=>{ alarmArmed=false; loadAlarmStatus(); });
     } else {

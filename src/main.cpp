@@ -44,7 +44,7 @@
 // -------------------------------------------------------------------------
 #include <Update.h>
 #ifndef FW_VERSION
-#define FW_VERSION "v5.0.3"
+#define FW_VERSION "v5.0.4"
 #endif
 #define WDT_TIMEOUT_SECONDS 60
 
@@ -812,9 +812,26 @@ void setup() {
                 radar.startCalibration();
             } else if (strcmp(topic, t.alarm_set) == 0) {
                 String cmd = String(payload);
-                if (cmd == "ARM_AWAY") securityMonitor.setArmed(true, false, false);
-                else if (cmd == "ARM_HOME") securityMonitor.setArmed(true, false, true);
-                else if (cmd == "DISARM") securityMonitor.setArmed(false);
+                // PIN guard: if sec_mqtt_pin is set, payload must be "CMD:pin"
+                const String mqttPin = preferences.getString("sec_mqtt_pin", "");
+                bool pinOk = true;
+                String cmdBase = cmd;
+                if (mqttPin.length() > 0) {
+                    int sep = cmd.indexOf(':');
+                    if (sep < 0) {
+                        pinOk = false;
+                        DBG("SecMon", "MQTT alarm cmd '%s' rejected — PIN required", cmd.c_str());
+                    } else {
+                        cmdBase = cmd.substring(0, sep);
+                        pinOk = (cmd.substring(sep + 1) == mqttPin);
+                        if (!pinOk) DBG("SecMon", "MQTT alarm cmd rejected — wrong PIN");
+                    }
+                }
+                if (pinOk) {
+                    if (cmdBase == "ARM_AWAY") securityMonitor.setArmed(true, false, false);
+                    else if (cmdBase == "ARM_HOME") securityMonitor.setArmed(true, false, true);
+                    else if (cmdBase == "DISARM") securityMonitor.setArmed(false);
+                }
             } else if (strstr(topic, "/supervision/alive") != nullptr) {
                 const char* start = topic + 9; // skip "security/"
                 const char* end = strstr(start, "/supervision");

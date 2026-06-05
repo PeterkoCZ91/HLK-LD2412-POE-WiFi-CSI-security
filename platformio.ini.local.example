@@ -1,0 +1,12 @@
+; Local PlatformIO overrides — copy this file to platformio.ini.local and fill in your values.
+; This file is gitignored so your OTA password is never committed.
+
+[env:ota_poe_dev]
+upload_port = 192.168.X.X
+upload_flags =
+    --auth=your_ota_password
+
+[env:ota_poe_csi]
+upload_port = 192.168.X.X
+upload_flags =
+    --auth=your_ota_password

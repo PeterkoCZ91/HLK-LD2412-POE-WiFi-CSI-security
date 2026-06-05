@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.0.4-poe-wifi] - 2026-06-05
+
+Security hardening release — MQTT alarm PIN guard, dashboard ARM block on default credentials, and HTTP security headers.
+
+### Added
+
+- **MQTT alarm PIN guard** — `security/{id}/alarm/set` now requires `CMD:pin` format when `sec_mqtt_pin` is configured in NVS. Commands without the correct PIN are rejected. New API endpoint `POST /api/security/mqtt-pin?pin=<pin>` sets or clears the PIN.
+- **HTTP security headers** — all web responses now include `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, and `Referrer-Policy: no-referrer`.
+
+### Changed
+
+- **ARM blocked on default credentials** — the web dashboard blocks ARM/DISARM actions when the admin password is still the factory default (`admin`/`admin`). The UI shows a warning prompting the operator to change the password first.
+- **Default dashboard language** — changed from Czech to English so new deployments open in English by default; language preference is still persisted in localStorage as before.
+- **OTA password moved to `platformio.ini.local`** — the upload password is no longer stored in the committed `platformio.ini`. Copy `platformio.ini.local.example` to `platformio.ini.local` and set your password there.
+
 ## [5.0.3-poe-wifi] - 2026-05-19
 
 ### Fixed

@@ -3,14 +3,14 @@
 [![PlatformIO](https://img.shields.io/badge/PlatformIO-ESP32-orange?logo=platformio)](https://platformio.org/)
 [![ESP32](https://img.shields.io/badge/MCU-ESP32--WROOM--32-blue?logo=espressif)](https://www.espressif.com/)
 [![License](https://img.shields.io/badge/License-GPL--3.0-blue)](LICENSE)
-[![Version](https://img.shields.io/badge/Version-5.0.2--poe--wifi-blue)]()
+[![Version](https://img.shields.io/badge/Version-5.0.4--poe--wifi-blue)]()
 
 **Dual-sensor intrusion detection system** — ESP32 + HLK-LD2412 24 GHz mmWave radar + **WiFi CSI (Channel State Information) passive motion detection** over **wired Ethernet with Power over Ethernet**. Full alarm state machine, zone management, Home Assistant integration, Telegram bot, and a dark-mode web dashboard. No cloud required.
 
 WiFi CSI detection algorithms based on [ESPectre](https://github.com/francescopace/espectre) by Francesco Pace (GPLv3).
 
 > [!TIP]
-> **v5.0.2** — OTA reliability: MQTT heap fragmentation during upload fixed (drop-on-floor mode), pull-OTA endpoint shadow bug fixed (`AsyncURIMatcher::exact`), write-buffer crash on large JSON endpoints fixed (Basic auth for heavy routes). New: **ARM_HOME** mode, pre-trigger ring buffer in alarm status, RTC-backed crash uptime, `/healthz` unauthenticated liveness probe. See [CHANGELOG.md](CHANGELOG.md) for the full history.
+> **v5.0.4** — Security hardening: MQTT alarm PIN guard (`security/{id}/alarm/set` requires `CMD:pin` when PIN is set in NVS), ARM blocked in dashboard when default credentials are active, HTTP security headers (`X-Frame-Options`, `X-Content-Type-Options`, `Referrer-Policy`). See [CHANGELOG.md](CHANGELOG.md) for the full history.
 
 ---
 
@@ -378,6 +378,7 @@ After the timed run completes, the firmware **continues to refresh the baseline 
 | Supervision | Heartbeat + mesh peer verification (60s alive, 3min timeout) |
 | Mesh verification | Cross-node alarm confirmation via MQTT (5s window) |
 | Fusion alarm | CSI-only can trigger alarm; radar FP suppressed by CSI |
+| MQTT alarm PIN | `security/{id}/alarm/set` requires `CMD:pin` format when PIN is configured in NVS |
 | Offline buffer | MQTT messages queued to LittleFS during network outage |
 
 ### System
@@ -490,6 +491,7 @@ All endpoints require Digest auth except where noted.
 | GET/POST | `/api/alarm/config` | Entry/exit delay, debounce frames, disarm reminder |
 | GET/POST | `/api/security/config` | Anti-masking, loitering, heartbeat, pet immunity |
 | POST | `/api/security/event/ack` | Acknowledge a security event |
+| POST | `/api/security/mqtt-pin` | Set or clear the MQTT alarm PIN (`?pin=1234`; omit value to clear) |
 | GET/POST | `/api/schedule` | Scheduled arm/disarm times |
 | GET/POST | `/api/timezone` | Timezone and DST offset |
 
@@ -705,6 +707,8 @@ A: Yes. Each device gets a unique `device_id` (auto-derived from MAC) so HA disc
 | v5.0.0-poe-wifi | **Major release.** Site learning + EMA refresh, MLP classifier (F1=0.852), 3-way radar+CSI+ML fusion, NBVI subcarrier auto-selection, adaptive P95 threshold, stuck-motion auto-raise, BSSID-change baseline reset, AP compatibility probe (`ht_ltf_seen`). Pull-based OTA endpoint, cold-reboot-before-OTA GUI flow, Network/Schedule/Timezone tabs, config export/import, MQTT heartbeat topic, Telegram test endpoint, radar Bluetooth disable-on-boot. All JSON HTTP responses streamed via `AsyncResponseStream` to fix endpoint failure under sustained polling on weak-RSSI deployments. Static-zone false-alarm sticky filter. |
 | v5.0.1-poe-wifi | Pull-OTA hardening (URL whitelist, MD5 verification, timeout fix), alarm and runtime stability (mutex timeouts, frame clamping, baud fallback, event flush fix), MQTT offline buffer raised to 200 slots. |
 | v5.0.2-poe-wifi | **OTA reliability:** MQTT heap fragmentation during upload fixed; pull-OTA endpoint shadow bug fixed (`AsyncURIMatcher::exact`); write-buffer crash on large JSON responses fixed (Basic auth for heavy endpoints). **New:** ARM_HOME mode, pre-trigger event ring buffer, RTC crash-uptime tracker, `/healthz` unauthenticated liveness probe, `xTaskCreatePinnedToCore` failure handler. |
+| v5.0.3-poe-wifi | i18n fix: `gate_legend` Czech translation; gate tab corrupted HTML repaired. |
+| v5.0.4-poe-wifi | **Security hardening:** MQTT alarm PIN guard (`CMD:pin` format, `/api/security/mqtt-pin` endpoint); ARM blocked in dashboard on default credentials; HTTP security headers (`X-Frame-Options`, `X-Content-Type-Options`, `Referrer-Policy`). Default dashboard language changed to English. OTA password moved out of committed `platformio.ini`. |
 
 ---
 

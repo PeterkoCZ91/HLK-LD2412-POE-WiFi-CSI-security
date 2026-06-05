@@ -25,6 +25,9 @@ logs/
 observe_*.jsonl
 UPDATES_FROM_ESPECTRE*.md
 
+# PlatformIO local overrides (OTA passwords, local upload ports)
+platformio.ini.local
+
 # Secrets — NEVER commit real credentials
 # Copy .example files and fill in your values:
 #   cp include/secrets.h.example include/secrets.h

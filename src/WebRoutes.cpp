@@ -129,8 +129,11 @@ static bool isValidMd5Hex(const char* s) {
 }
 
 void setup(Dependencies& deps) {
-    // Copy all pointers to static storage
     _deps = deps;
+
+    DefaultHeaders::Instance().addHeader("X-Frame-Options", "DENY");
+    DefaultHeaders::Instance().addHeader("X-Content-Type-Options", "nosniff");
+    DefaultHeaders::Instance().addHeader("Referrer-Policy", "no-referrer");
 
     DBG("WEB", "Setting up web routes...");
 
@@ -1031,6 +1034,33 @@ void setupSecurityRoutes() {
             }
         }
         request->send(200, "text/plain", "Security config saved");
+    });
+
+    // MQTT alarm PIN — required prefix for ARM_*/DISARM commands via MQTT
+    // Empty pin = no PIN check (backwards compat). Set to 4+ chars to enable.
+    _deps.server->on("/api/security/mqtt-pin", HTTP_GET, [](AsyncWebServerRequest *request) {
+        if (!checkAuth(request)) return;
+        JsonDocument doc;
+        String pin = _deps.preferences->getString("sec_mqtt_pin", "");
+        doc["pin_set"] = pin.length() > 0;
+        doc["pin_length"] = (int)pin.length();
+        AsyncResponseStream* response = request->beginResponseStream("application/json");
+        serializeJson(doc, *response);
+        request->send(response);
+    });
+    _deps.server->on("/api/security/mqtt-pin", HTTP_POST, [](AsyncWebServerRequest *request) {
+        if (!checkAuth(request)) return;
+        if (!request->hasParam("pin")) {
+            request->send(400, "text/plain", "Missing 'pin' param (empty string to disable)");
+            return;
+        }
+        String pin = request->getParam("pin")->value();
+        if (pin.length() > 0 && pin.length() < 4) {
+            request->send(400, "text/plain", "PIN must be empty (disable) or at least 4 characters");
+            return;
+        }
+        _deps.preferences->putString("sec_mqtt_pin", pin);
+        request->send(200, "text/plain", pin.length() > 0 ? "MQTT PIN set" : "MQTT PIN disabled");
     });
 }
 
