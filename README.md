@@ -19,6 +19,7 @@ WiFi CSI detection algorithms based on [ESPectre](https://github.com/francescopa
 - [In 3 Points](#in-3-points)
 - [What You Need](#what-you-need)
 - [Quick Start](#quick-start) (~10 min)
+- [First Boot & Sensor Verification](docs/FIRST_BOOT.md)
 - [Why Dual Sensor?](#why-dual-sensor)
 - [Who Is This For](#who-is-this-for)
 - [How It Works](#how-it-works)
@@ -175,6 +176,8 @@ These are compile-time defaults baked into the firmware on the **first** flash. 
 After flashing, the device connects via Ethernet (DHCP) and starts radar + CSI capture. Open the web dashboard at the device's IP address (check your router's DHCP table or serial console).
 
 Default credentials: `admin` / `admin` — **change immediately** in the Network & Cloud tab.
+
+Then confirm each sensor is actually producing data (radar UART, CSI link/packets, MQTT) with the [First-Boot & Sensor Verification guide](docs/FIRST_BOOT.md) — it also explains how to apply the prebuilt OTA release binary vs. a fresh USB build.
 
 ---
 
