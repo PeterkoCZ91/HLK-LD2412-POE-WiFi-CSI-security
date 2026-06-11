@@ -3,24 +3,24 @@
 [![PlatformIO](https://img.shields.io/badge/PlatformIO-ESP32-orange?logo=platformio)](https://platformio.org/)
 [![ESP32](https://img.shields.io/badge/MCU-ESP32--WROOM--32-blue?logo=espressif)](https://www.espressif.com/)
 [![License](https://img.shields.io/badge/License-GPL--3.0-blue)](LICENSE)
-[![Version](https://img.shields.io/badge/Version-5.0.4--poe--wifi-blue)]()
+[![Version](https://img.shields.io/badge/Version-5.0.6--poe--wifi-blue)]()
 
 **Dual-sensor intrusion detection system** — ESP32 + HLK-LD2412 24 GHz mmWave radar + **WiFi CSI (Channel State Information) passive motion detection** over **wired Ethernet with Power over Ethernet**. Full alarm state machine, zone management, Home Assistant integration, Telegram bot, and a dark-mode web dashboard. No cloud required.
 
 WiFi CSI detection algorithms based on [ESPectre](https://github.com/francescopace/espectre) by Francesco Pace (GPLv3).
 
 > [!TIP]
-> **v5.0.4** — Security hardening: MQTT alarm PIN guard (`security/{id}/alarm/set` requires `CMD:pin` when PIN is set in NVS), ARM blocked in dashboard when default credentials are active, HTTP security headers (`X-Frame-Options`, `X-Content-Type-Options`, `Referrer-Policy`). See [CHANGELOG.md](CHANGELOG.md) for the full history.
+> **v5.0.6** — OTA field-service hardening: guarded Pull OTA with **enforced** MD5 integrity (fixes a call-order bug where the hash was never actually verified), redirects no longer followed (SSRF/token-leak guard), shared OTA runtime owner/watchdog cleanup, espota maintenance window status, and a safe deploy helper with target identity checks. See [docs/OTA_OPERATIONS.md](docs/OTA_OPERATIONS.md) before flashing unattended devices.
 
 ---
 
 ## Table of Contents
 
 - [In 3 Points](#in-3-points)
-- [Why Dual Sensor?](#why-dual-sensor)
-- [Who Is This For](#who-is-this-for)
 - [What You Need](#what-you-need)
 - [Quick Start](#quick-start) (~10 min)
+- [Why Dual Sensor?](#why-dual-sensor)
+- [Who Is This For](#who-is-this-for)
 - [How It Works](#how-it-works)
 - [Features](#features)
 - [System Architecture](#system-architecture)
@@ -31,6 +31,7 @@ WiFi CSI detection algorithms based on [ESPectre](https://github.com/francescopa
 - [Sensor Firmware Quirks](#sensor-firmware-quirks)
 - [Known Issues & Limitations](#known-issues--limitations)
 - [Troubleshooting](#troubleshooting)
+- [OTA Operations](docs/OTA_OPERATIONS.md)
 - [Roadmap](#roadmap)
 - [FAQ](#faq)
 - [Development History](#development-history)
@@ -45,29 +46,6 @@ WiFi CSI detection algorithms based on [ESPectre](https://github.com/francescopa
 1. **It's a security system with dual-sensor fusion, not a smart home gadget.** mmWave radar for active detection, WiFi CSI for passive environmental sensing. Two independent physics principles — harder to defeat than either alone.
 2. **It runs over Ethernet.** WiFi is used purely as a CSI sensor (passive signal analysis). Network connectivity, MQTT, OTA — all wired via PoE. No wireless attack surface on the network path.
 3. **It's battle-tested.** Forked from the WiFi variant (50+ versions, 13 security bugs found and fixed through formal audit). CSI algorithms ported from ESPectre with production-grade filtering.
-
----
-
-## Why Dual Sensor?
-
-| | Radar Only | CSI Only | **Radar + CSI (this project)** |
-|---|---|---|---|
-| **Moving person** | Excellent | Good | Excellent (confirmed by both) |
-| **Stationary person** | Weak (static energy decays) | Moderate (breathing detection) | **Strong (CSI compensates radar blind spot)** |
-| **Through-wall** | Yes (24 GHz penetrates thin walls) | Yes (WiFi penetrates walls) | Yes |
-| **Tamper resistance** | Radar can be shielded | WiFi can be jammed | **Harder — need to defeat both** |
-| **False positives** | HVAC, curtains, reflections | AGC fluctuations, traffic | **Lower — cross-validation** |
-| **Power** | ~80 mA | ~20 mA (WiFi STA) | ~100 mA total (PoE powered) |
-
----
-
-## Who Is This For
-
-- **DIY security enthusiasts** who want dual-sensor detection without cloud subscriptions
-- **Home Assistant users** looking for a hardwired radar + CSI node with proper alarm state management
-- **Vacation home / garage / warehouse owners** who need unattended PoE-powered monitoring
-- **CSI researchers** who want a production-ready WiFi CSI implementation on ESP32 with real-world filtering
-- **PoE infrastructure users** who already have a PoE switch and want to add security nodes with zero extra wiring
 
 ---
 
@@ -197,6 +175,29 @@ These are compile-time defaults baked into the firmware on the **first** flash. 
 After flashing, the device connects via Ethernet (DHCP) and starts radar + CSI capture. Open the web dashboard at the device's IP address (check your router's DHCP table or serial console).
 
 Default credentials: `admin` / `admin` — **change immediately** in the Network & Cloud tab.
+
+---
+
+## Why Dual Sensor?
+
+| | Radar Only | CSI Only | **Radar + CSI (this project)** |
+|---|---|---|---|
+| **Moving person** | Excellent | Good | Excellent (confirmed by both) |
+| **Stationary person** | Weak (static energy decays) | Moderate (breathing detection) | **Strong (CSI compensates radar blind spot)** |
+| **Through-wall** | Yes (24 GHz penetrates thin walls) | Yes (WiFi penetrates walls) | Yes |
+| **Tamper resistance** | Radar can be shielded | WiFi can be jammed | **Harder — need to defeat both** |
+| **False positives** | HVAC, curtains, reflections | AGC fluctuations, traffic | **Lower — cross-validation** |
+| **Power** | ~80 mA | ~20 mA (WiFi STA) | ~100 mA total (PoE powered) |
+
+---
+
+## Who Is This For
+
+- **DIY security enthusiasts** who want dual-sensor detection without cloud subscriptions
+- **Home Assistant users** looking for a hardwired radar + CSI node with proper alarm state management
+- **Vacation home / garage / warehouse owners** who need unattended PoE-powered monitoring
+- **CSI researchers** who want a production-ready WiFi CSI implementation on ESP32 with real-world filtering
+- **PoE infrastructure users** who already have a PoE switch and want to add security nodes with zero extra wiring
 
 ---
 
@@ -385,7 +386,7 @@ After the timed run completes, the firmware **continues to refresh the baseline 
 
 | Feature | Description |
 |---------|-------------|
-| OTA | Firmware update with automatic rollback on failure |
+| OTA | Pull OTA with enforced MD5 integrity, redirects rejected (SSRF guard), target-safe deploy helper, espota maintenance window, runtime cleanup watchdog |
 | Config snapshot | NVS backup before OTA flash |
 | Web dashboard | Dark-mode GUI with SSE real-time telemetry, CZ/EN toggle |
 | LittleFS assets | Hot-swap web UI without reflash |
@@ -424,7 +425,10 @@ HLK-LD2412-POE-WiFi-CSI-security/
 ├── lib/LD2412_Extended/           # Radar protocol library
 ├── platformio.ini                 # Build environments
 ├── partitions_16mb.csv            # 16 MB flash partition table
-├── tools/upload_www.sh            # LittleFS web asset uploader
+├── tools/
+│   ├── upload_www.sh              # LittleFS web asset uploader
+│   └── pull_ota_deploy.sh        # Guarded Pull OTA deploy helper (identity + MD5)
+├── docs/OTA_OPERATIONS.md         # OTA field-service guide
 ├── LICENSE                        # GPL-3.0
 └── CHANGELOG.md                   # Version history
 ```
@@ -547,9 +551,11 @@ All endpoints require Digest auth except where noted.
 | GET | `/api/config/snapshots` | List NVS config snapshots |
 | POST | `/api/config/restore` | Restore a named snapshot |
 | POST | `/api/preset` | Apply a named preset |
-| POST | `/api/update` | OTA firmware upload (multipart) |
-| POST | `/api/update/pull` | Pull-based OTA — fetch firmware from a URL (JSON body: `{"url":"...","auth":"Bearer ..."}`) |
-| GET | `/api/update/pull/status` | Last pull-OTA phase + error (NVS-backed, survives reboot) |
+| POST | `/api/update` | Multipart OTA firmware upload; fallback only, prefer Pull OTA for field devices |
+| POST | `/api/update/pull` | Pull-based OTA — fetch firmware from LAN URL (JSON body: `{"url":"...","md5":"32hex","auth":"Bearer ..."}`); MD5 required |
+| GET | `/api/update/pull/status` | Last pull-OTA phase + error + runtime owner info (NVS-backed, survives reboot) |
+| GET | `/api/ota/status` | OTA runtime owner, espota maintenance window, timeout/progress diagnostics |
+| POST | `/api/ota/espota/prepare` | Open bounded espota maintenance window (`?seconds=120`) |
 | POST | `/api/restart` | Soft reboot |
 | POST | `/api/bluetooth/start` | Enable BLE config mode |
 | DELETE/POST | `/api/www` | Manage LittleFS web assets (delete / upload) |
@@ -623,7 +629,7 @@ The HLK-LD2412 sensor has several known firmware issues:
 - [x] Auto-recalibration after quiet period — **v5.0.0**
 - [x] Stuck-in-motion detection (auto threshold raise after 24h) — **v5.0.0**
 - [x] Site learning (long-term quiet baseline + EMA refresh) — **v5.0.0**
-- [x] Pull-based OTA from URL (HTTPS + redirects, NVS phase tracking) — **v5.0.0**
+- [x] Pull-based OTA from URL (HTTPS, enforced MD5, NVS phase tracking; redirects rejected since v5.0.6) — **v5.0.0**
 - [ ] Sonoff/door corroboration window for low-confidence alarms (v5.1.x)
 - [ ] Platform/library bump to ESP32Async/platform-espressif32 (v5.1.x)
 
@@ -669,12 +675,25 @@ A: HA auto-discovery publishes a device with the following entities (names prefi
 A: Yes. Hold the **GPIO 0 / BOOT** button for ≥ 5 seconds — NVS credentials are wiped and the device reverts to the `WEB_ADMIN_*_DEFAULT` from `secrets.h` (defaults to `admin` / `admin`). Other config (zones, MQTT, schedule) is preserved.
 
 **Q: How do I update the firmware over the network?**
-A: Three options:
-1. **Multipart upload from the GUI** (easiest) — *WiFi CSI tab → Aktualizace FW / Update FW* → pick a local `.bin`. Tick **"Cold reboot before OTA"** (default on) — the device reboots first to clear AsyncTCP/heap state, then accepts the upload on a clean stack. This was the fix for the OTA stalls reported in 4.5.x.
-2. **Pull-OTA** (API-only in v5.0.0 — GUI control coming in v5.0.x) — `POST /api/update/pull` with JSON body `{"url": "https://example.com/firmware.bin", "auth": "Bearer ..."}`. The device fetches and flashes itself; HTTPS + redirects are supported. Last phase + error persist in NVS, readable via `GET /api/update/pull/status` after reboot.
-3. **espota (PlatformIO)** — `pio run -e ota_poe_csi --target upload` after setting `upload_port` in `platformio.ini`.
+A: Prefer **Pull OTA with MD5 and target identity checks**. Read [docs/OTA_OPERATIONS.md](docs/OTA_OPERATIONS.md) first. The safe flow is:
 
-The alarm stays armed during OTA upload; the state machine is restored from NVS after reboot.
+```bash
+tools/pull_ota_deploy.sh \
+  --host DEVICE_IP \
+  --firmware firmware-vX.Y.Z-poe-wifi-csi.bin \
+  --expect-mac EXPECTED_MAC \
+  --expect-id EXPECTED_MQTT_ID
+```
+
+That is a dry-run. Add `--flash` only after the target identity and artifact hash are correct. The script serves the firmware over LAN, sends `POST /api/update/pull` with required MD5, polls status, and verifies the device comes back.
+
+Other paths:
+1. **espota maintenance window** — use `POST /api/ota/espota/prepare?seconds=120`, then run `espota.py` from the same LAN. This is mainly a recovery/test path.
+2. **Multipart `/api/update`** — fallback only. It has historically been the most fragile path on ESP32 + LAN8720A under runtime load, so do not use it for sealed field devices unless the operator accepts the risk.
+
+**If the unit has been running a long time, reboot it first** — add `--cold-reboot` to the helper (it reboots and waits for the device before pulling), or do it by hand via `POST /api/restart` / the GUI "Reboot before OTA" toggle and wait until `/api/version` answers again. Long uptime fragments the heap and loads AsyncTCP, which is the usual reason an OTA that works fresh fails on an in-service device — see [docs/OTA_OPERATIONS.md](docs/OTA_OPERATIONS.md) → "Why OTA Gets Harder the Longer a Device Has Been Running".
+
+Rollback helps with a bad new image, but it is not enough if multiple consecutive releases contain the same OTA bug. Keep at least one independent recovery path working.
 
 **Q: What's the difference between Auto-arm and Schedule?**
 A: **Auto-arm** triggers after a configurable idle period of no presence (e.g., "arm 15 min after the last detection"). **Schedule** is wall-clock-based ("arm at 22:00, disarm at 07:00"). They can coexist — schedule sets the global window, auto-arm fills the gaps within disarmed time.
@@ -709,6 +728,7 @@ A: Yes. Each device gets a unique `device_id` (auto-derived from MAC) so HA disc
 | v5.0.2-poe-wifi | **OTA reliability:** MQTT heap fragmentation during upload fixed; pull-OTA endpoint shadow bug fixed (`AsyncURIMatcher::exact`); write-buffer crash on large JSON responses fixed (Basic auth for heavy endpoints). **New:** ARM_HOME mode, pre-trigger event ring buffer, RTC crash-uptime tracker, `/healthz` unauthenticated liveness probe, `xTaskCreatePinnedToCore` failure handler. |
 | v5.0.3-poe-wifi | i18n fix: `gate_legend` Czech translation; gate tab corrupted HTML repaired. |
 | v5.0.4-poe-wifi | **Security hardening:** MQTT alarm PIN guard (`CMD:pin` format, `/api/security/mqtt-pin` endpoint); ARM blocked in dashboard on default credentials; HTTP security headers (`X-Frame-Options`, `X-Content-Type-Options`, `Referrer-Policy`). Default dashboard language changed to English. OTA password moved out of committed `platformio.ini`. |
+| v5.0.6-poe-wifi | **OTA field-service hardening:** enforced Pull OTA MD5 integrity (fixed a `setMD5`/`begin` call-order bug that silently skipped hash verification — any binary used to flash); redirects no longer followed (SSRF / auth-token-leak guard); unified OTA runtime owner + main-loop watchdog cleanup; `/api/ota/status` and espota maintenance window; guarded `tools/pull_ota_deploy.sh` deploy helper with target identity checks and `--cold-reboot` for long-uptime units. See [docs/OTA_OPERATIONS.md](docs/OTA_OPERATIONS.md). |
 
 ---
 

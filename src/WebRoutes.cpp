@@ -40,6 +40,27 @@ extern TaskHandle_t radarTaskHandle;
 #include <atomic>
 extern std::atomic<bool> g_rebootInhibit;
 extern std::atomic<bool> g_otaRebootForce;
+extern std::atomic<bool> g_espotaPrepareRequested;
+extern std::atomic<bool> g_espotaMaintenance;
+extern std::atomic<bool> g_otaTransferActive;
+extern std::atomic<uint32_t> g_espotaMaintenanceSeconds;
+extern std::atomic<unsigned long> g_espotaMaintenanceUntilMs;
+extern std::atomic<uint8_t> g_otaRuntimeOwner;
+extern std::atomic<unsigned long> g_otaRuntimeLastProgressMs;
+extern std::atomic<uint32_t> g_otaRuntimeLastBytes;
+extern std::atomic<uint32_t> g_otaRuntimeTimeoutMs;
+extern const char* otaRuntimeOwnerName(uint8_t owner);
+extern uint8_t otaRuntimeOwner();
+extern bool otaRuntimeTryBegin(uint8_t owner, uint32_t timeoutMs);
+extern void otaRuntimeMarkProgress(uint32_t bytes);
+extern void otaRuntimeEnd(uint8_t owner);
+extern void otaRuntimeRestoreServices(const char* reason, bool restartRadar);
+
+static constexpr uint8_t OTA_OWNER_NONE = 0;
+static constexpr uint8_t OTA_OWNER_HTTP = 1;
+static constexpr uint8_t OTA_OWNER_PULL = 2;
+static constexpr uint8_t OTA_OWNER_ESPOTA_PREPARE = 3;
+static constexpr uint8_t OTA_OWNER_ESPOTA = 4;
 
 namespace WebRoutes {
 
@@ -89,7 +110,7 @@ bool checkAuthBasic(AsyncWebServerRequest *request) {
 }
 
 // Pull-OTA URL whitelist: only private RFC1918 ranges and mDNS .local/.lan.
-// Trust anchor for OTA integrity is the optional MD5 hash; the URL check
+// Trust anchor for OTA integrity is the required MD5 hash; the URL check
 // prevents accidental fetches from external mirrors and limits the blast
 // radius of a stolen admin password to the local network.
 static bool isPrivateLanUrl(const String& url) {
@@ -1095,8 +1116,16 @@ void setupSystemRoutes() {
     // Exact match required — default BackwardCompatible matcher would shadow
     // /api/update/pull and /api/update/pull/status (matched as prefix), routing
     // their POSTs into the multipart upload handler below.
+    static volatile bool otaHttpRejected = false;
     _deps.server->on(AsyncURIMatcher::exact("/api/update"), HTTP_POST, [](AsyncWebServerRequest *request) {
         if (!checkAuth(request)) return;
+        if (otaHttpRejected) {
+            otaHttpRejected = false;
+            AsyncWebServerResponse *response = request->beginResponse(409, "text/plain", "OTA already in progress");
+            response->addHeader("Connection", "close");
+            request->send(response);
+            return;
+        }
         bool success = !Update.hasError();
         AsyncWebServerResponse *response = request->beginResponse(200, "text/plain", success ? "OK" : "FAIL");
         response->addHeader("Connection", "close");
@@ -1113,9 +1142,18 @@ void setupSystemRoutes() {
         static bool otaAuthorized = false;
         if (!index) {
             otaAuthorized = false;
+            otaHttpRejected = false;
             if (!request->authenticate(_deps.config->auth_user, _deps.config->auth_pass)) {
                 DBG("OTA", "Upload auth failed");
                 request->requestAuthentication(nullptr, false);  // false = Basic
+                return;
+            }
+            if (!otaRuntimeTryBegin(OTA_OWNER_HTTP, 45000)) {
+                otaHttpRejected = true;
+                DBG("OTA", "Rejecting HTTP OTA; owner=%s", otaRuntimeOwnerName(otaRuntimeOwner()));
+                if (_deps.systemLog) {
+                    _deps.systemLog->warn(String("HTTP OTA rejected; owner=") + otaRuntimeOwnerName(otaRuntimeOwner()));
+                }
                 return;
             }
             otaAuthorized = true;
@@ -1176,6 +1214,7 @@ void setupSystemRoutes() {
                         String((unsigned)(index + len)) + " B: " + werr);
                 }
             }
+            otaRuntimeMarkProgress((uint32_t)(index + len));
             esp_task_wdt_reset();
             // rc7-fix1 (2026-05-02): heap-aware yield. Bench reproducer with
             // base 1 ms delay dropped at 70% with min_heap=72 KB and "Empty
@@ -1193,16 +1232,14 @@ void setupSystemRoutes() {
                 DBG("OTA", "Update success: %u B — reboot scheduled", index + len);
                 // OTA success bypasses reboot inhibit so the slot swap completes.
                 g_otaRebootForce.store(true);
+                otaRuntimeEnd(OTA_OWNER_HTTP);
                 *_deps.shouldReboot = true;
             } else {
                 Update.printError(Serial);
                 String err = Update.errorString();
                 Update.abort();
-                if (radarTaskHandle) vTaskResume(radarTaskHandle);
-#ifdef USE_CSI
-                CSIService::setOtaInProgress(false);
-#endif
-                MQTTService::setOtaInProgress(false);
+                otaRuntimeRestoreServices("http_ota_failed", false);
+                otaRuntimeEnd(OTA_OWNER_HTTP);
                 // Surface the failure outside the serial console so an operator
                 // pushing to a sealed unit notices instead of seeing only the
                 // generic 200 response from AsyncWebServer.
@@ -1237,15 +1274,15 @@ void setupSystemRoutes() {
     //   Body (JSON): {"url":"...","auth":"Bearer <token>","md5":"<32 hex>"}
     //   - url: REQUIRED, must resolve to a private LAN host (RFC1918 or .local/.lan)
     //   - auth: optional Authorization header forwarded to the source server
-    //   - md5: optional 32-char hex; if present, Update verifies and rejects mismatch
-    // Response: 200 (accepted) | 400 (bad body / non-LAN URL / bad md5) | 409 (in flight)
+    //   - md5: REQUIRED 32-char hex; Update verifies and rejects mismatch
+    // Response: 200 (accepted) | 400 (bad body / non-LAN URL / missing/bad md5) | 409 (in flight)
     static volatile bool otaPullInFlight = false;
 
     _deps.server->on("/api/update/pull", HTTP_POST,
     [](AsyncWebServerRequest *request) {
         if (!checkAuth(request)) return;
-        if (otaPullInFlight) {
-            request->send(409, "text/plain", "Pull already in progress");
+        if (otaPullInFlight || otaRuntimeOwner() != OTA_OWNER_NONE) {
+            request->send(409, "text/plain", String("OTA already in progress: ") + otaRuntimeOwnerName(otaRuntimeOwner()));
             return;
         }
         if (!request->_tempObject) {
@@ -1272,8 +1309,8 @@ void setupSystemRoutes() {
                 "or *.local/*.lan");
             return;
         }
-        if (strlen(md5) > 0 && !isValidMd5Hex(md5)) {
-            request->send(400, "text/plain", "'md5' must be 32 hex characters");
+        if (!isValidMd5Hex(md5)) {
+            request->send(400, "text/plain", "'md5' is required and must be 32 hex characters");
             return;
         }
 
@@ -1284,6 +1321,11 @@ void setupSystemRoutes() {
             return;
         }
 
+        if (!otaRuntimeTryBegin(OTA_OWNER_PULL, 300000)) {
+            delete p;
+            request->send(409, "text/plain", String("OTA already in progress: ") + otaRuntimeOwnerName(otaRuntimeOwner()));
+            return;
+        }
         otaPullInFlight = true;
         DBG("OTA-PULL", "Scheduling pull from '%s' (auth=%s)", p->url.c_str(),
             p->auth.length() > 0 ? "yes" : "no");
@@ -1339,6 +1381,7 @@ void setupSystemRoutes() {
                 DBG("OTA-PULL", "client alloc failed");
                 setPhase("failed", "client alloc failed", -1);
                 delete p;
+                otaRuntimeEnd(OTA_OWNER_PULL);
                 otaPullInFlight = false;
                 vTaskDelete(NULL);
                 return;
@@ -1348,7 +1391,11 @@ void setupSystemRoutes() {
             HTTPClient http;
             http.setReuse(false);
             http.setTimeout(30000);
-            http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+            // Do NOT follow redirects. isPrivateLanUrl() only gates the initial
+            // URL; auto-following a 30x to an off-LAN host would defeat the
+            // whitelist (SSRF) and leak the forwarded Authorization header to
+            // the redirect target. Point the URL directly at the firmware.
+            http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
 
             bool ok = http.begin(*client, p->url);
             if (!ok) {
@@ -1356,6 +1403,7 @@ void setupSystemRoutes() {
                 setPhase("failed", "http.begin() refused URL", -2);
                 delete client;
                 delete p;
+                otaRuntimeEnd(OTA_OWNER_PULL);
                 otaPullInFlight = false;
                 vTaskDelete(NULL);
                 return;
@@ -1372,15 +1420,21 @@ void setupSystemRoutes() {
 #endif
             MQTTService::setOtaInProgress(true);
             setPhase("fetching");
+            otaRuntimeMarkProgress(0);
 
             // Manual streaming flash: the HTTPUpdate variant in this
             // arduino-esp32 build doesn't expose an MD5 setter, so we drive
-            // Update directly. setMD5() before begin() makes Update.end()
-            // validate the digest of all bytes written and fail-close on
-            // mismatch — primary integrity defense for pulled binaries.
+            // Update directly. setMD5() must be called AFTER begin() (begin()
+            // resets the expected hash), so Update.end() validates the digest
+            // of all bytes written and fails closed on mismatch — primary
+            // integrity defense for pulled binaries.
             bool doReboot = false;
             int httpCode = http.GET();
-            if (httpCode != HTTP_CODE_OK) {
+            if (httpCode == 301 || httpCode == 302 || httpCode == 303 ||
+                httpCode == 307 || httpCode == 308) {
+                DBG("OTA-PULL", "redirect rejected: HTTP %d", httpCode);
+                setPhase("failed", "redirect not allowed; point URL directly at firmware", httpCode);
+            } else if (httpCode != HTTP_CODE_OK) {
                 DBG("OTA-PULL", "GET failed: HTTP %d", httpCode);
                 setPhase("failed", (String("HTTP ") + httpCode).c_str(), httpCode);
             } else {
@@ -1388,13 +1442,17 @@ void setupSystemRoutes() {
                 if (contentLength <= 0) {
                     DBG("OTA-PULL", "Server didn't report size");
                     setPhase("failed", "Missing Content-Length", -3);
-                } else if (p->md5.length() > 0 && !Update.setMD5(p->md5.c_str())) {
-                    DBG("OTA-PULL", "Update.setMD5 rejected '%s'", p->md5.c_str());
-                    setPhase("failed", "setMD5 rejected", -4);
                 } else if (!Update.begin((size_t)contentLength)) {
                     String err = Update.errorString();
                     DBG("OTA-PULL", "Update.begin failed: %s", err.c_str());
                     setPhase("failed", err.c_str(), Update.getError());
+                } else if (!Update.setMD5(p->md5.c_str())) {
+                    // setMD5 MUST come after begin(): begin() resets _target_md5
+                    // to empty, so setting it before begin() silently disables
+                    // the integrity check and any firmware would be accepted.
+                    DBG("OTA-PULL", "Update.setMD5 rejected '%s'", p->md5.c_str());
+                    Update.abort();
+                    setPhase("failed", "setMD5 rejected", -4);
                 } else {
                     Stream& stream = http.getStream();
                     size_t written = Update.writeStream(stream);
@@ -1420,16 +1478,13 @@ void setupSystemRoutes() {
             delete client;
             delete p;
 
-            if (radarTaskHandle) vTaskResume(radarTaskHandle);
-#ifdef USE_CSI
-            CSIService::setOtaInProgress(false);
-#endif
-            MQTTService::setOtaInProgress(false);
+            otaRuntimeRestoreServices(doReboot ? "pull_ota_complete" : "pull_ota_finished", false);
+            otaRuntimeEnd(OTA_OWNER_PULL);
             otaPullInFlight = false;
 
             if (doReboot) {
-                vTaskDelay(pdMS_TO_TICKS(500));  // let response flush, NVS sync
-                ESP.restart();
+                g_otaRebootForce.store(true);
+                if (_deps.shouldReboot) *_deps.shouldReboot = true;
             }
             vTaskDelete(NULL);
         }, "ota_pull", 16384, p, 5, nullptr, 1);  // 16 KB stack for HTTPS+HTTPUpdate
@@ -1444,11 +1499,8 @@ void setupSystemRoutes() {
                 _deps.preferences->putString("ota_msg", "task create failed");
                 _deps.preferences->putInt("ota_err", -5);
             }
-            if (radarTaskHandle) vTaskResume(radarTaskHandle);
-#ifdef USE_CSI
-            CSIService::setOtaInProgress(false);
-#endif
-            MQTTService::setOtaInProgress(false);
+            otaRuntimeRestoreServices("pull_task_create_failed", false);
+            otaRuntimeEnd(OTA_OWNER_PULL);
             otaPullInFlight = false;
             delete p;
         }
@@ -1456,12 +1508,16 @@ void setupSystemRoutes() {
     NULL,
     [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
         if (index == 0) {
-            if (total > 2048) return;
+            if (total > 2048) {
+                request->_tempObject = nullptr;
+                return;
+            }
             request->_tempObject = malloc(total + 1);
             if (!request->_tempObject) return;
-            ((char*)request->_tempObject)[total] = '\0';
+            ((char*)request->_tempObject)[total] = 0;
         }
         if (!request->_tempObject) return;
+        if (index + len > total) return;
         memcpy((char*)request->_tempObject + index, data, len);
     });
 
@@ -1477,7 +1533,9 @@ void setupSystemRoutes() {
         doc["last_err"] = prefs ? prefs->getInt   ("ota_err",   0)        : 0;
         doc["url"]      = prefs ? prefs->getString("ota_url",   "")       : "";
         doc["ts_s"]     = prefs ? prefs->getUInt  ("ota_ts",    0)        : 0;
-        doc["in_flight"]= otaPullInFlight;
+        doc["in_flight"]= otaPullInFlight || otaRuntimeOwner() == OTA_OWNER_PULL;
+        doc["runtime_owner"] = otaRuntimeOwnerName(otaRuntimeOwner());
+        doc["runtime_last_bytes"] = g_otaRuntimeLastBytes.load();
         AsyncResponseStream* response = request->beginResponseStream("application/json");
         serializeJson(doc, *response);
         request->send(response);
@@ -1492,6 +1550,64 @@ void setupSystemRoutes() {
         if (!checkAuth(request)) return;
         DebugLog::instance().clear();
         request->send(200, "text/plain", "cleared");
+    });
+
+    _deps.server->on("/api/ota/status", HTTP_GET, [](AsyncWebServerRequest *request) {
+        if (!checkAuth(request)) return;
+        JsonDocument doc;
+        unsigned long now = millis();
+        unsigned long until = g_espotaMaintenanceUntilMs.load();
+        doc["fw"] = _deps.fwVersion;
+        doc["ip"] = ETH.localIP().toString();
+        doc["hostname"] = _deps.config ? _deps.config->hostname : "";
+        doc["espota_port"] = 3232;
+        doc["espota_prepare_requested"] = g_espotaPrepareRequested.load();
+        doc["espota_maintenance"] = g_espotaMaintenance.load();
+        uint8_t owner = otaRuntimeOwner();
+        doc["ota_transfer_active"] = g_otaTransferActive.load();
+        doc["ota_owner"] = otaRuntimeOwnerName(owner);
+        doc["ota_owner_id"] = owner;
+        doc["ota_last_progress_age_s"] = g_otaRuntimeLastProgressMs.load() == 0 ? -1 : (long)((now - g_otaRuntimeLastProgressMs.load()) / 1000);
+        doc["ota_last_bytes"] = g_otaRuntimeLastBytes.load();
+        doc["ota_timeout_ms"] = g_otaRuntimeTimeoutMs.load();
+        doc["maintenance_until_ms"] = until;
+        doc["maintenance_remaining_s"] = (g_espotaMaintenance.load() && until != 0 && (long)(until - now) > 0) ? (uint32_t)((until - now) / 1000UL) : 0;
+        doc["heap_free"] = ESP.getFreeHeap();
+        doc["heap_largest"] = ESP.getMaxAllocHeap();
+        doc["reboot_inhibit"] = g_rebootInhibit.load();
+        AsyncResponseStream* response = request->beginResponseStream("application/json");
+        serializeJson(doc, *response);
+        request->send(response);
+    });
+
+    _deps.server->on("/api/ota/espota/prepare", HTTP_POST, [](AsyncWebServerRequest *request) {
+        if (!checkAuth(request)) return;
+        if (otaRuntimeOwner() != OTA_OWNER_NONE) {
+            request->send(409, "text/plain", String("OTA already in progress: ") + otaRuntimeOwnerName(otaRuntimeOwner()));
+            return;
+        }
+        uint32_t seconds = 120;
+        if (request->hasParam("seconds")) {
+            seconds = request->getParam("seconds")->value().toInt();
+        }
+        if (seconds < 30) seconds = 30;
+        if (seconds > 600) seconds = 600;
+        if (!otaRuntimeTryBegin(OTA_OWNER_ESPOTA_PREPARE, (seconds + 5) * 1000UL)) {
+            request->send(409, "text/plain", String("OTA already in progress: ") + otaRuntimeOwnerName(otaRuntimeOwner()));
+            return;
+        }
+        g_espotaMaintenanceSeconds.store(seconds);
+        g_espotaPrepareRequested.store(true);
+
+        JsonDocument doc;
+        doc["accepted"] = true;
+        doc["seconds"] = seconds;
+        doc["ip"] = ETH.localIP().toString();
+        doc["espota_port"] = 3232;
+        doc["message"] = "ESPOTA maintenance window requested";
+        AsyncResponseStream* response = request->beginResponseStream("application/json");
+        serializeJson(doc, *response);
+        request->send(response);
     });
 
     _deps.server->on("/api/restart", HTTP_POST, [](AsyncWebServerRequest *request) {

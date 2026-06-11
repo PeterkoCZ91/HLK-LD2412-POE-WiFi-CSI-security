@@ -2,6 +2,28 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.0.6-poe-wifi] - 2026-06-11
+
+OTA field-service hardening release. Motivated by a long-standing problem: OTA that works right after a flash but fails on units with long uptime (heap fragmentation, AsyncTCP backpressure under radar+CSI+MQTT load, and `ArduinoOTA` CPU starvation). See [docs/OTA_OPERATIONS.md](docs/OTA_OPERATIONS.md) → "Why OTA Gets Harder the Longer a Device Has Been Running".
+
+### Added
+
+- **Guarded Pull OTA deploy helper** — `tools/pull_ota_deploy.sh` performs dry-run target identity checks, computes MD5, starts a temporary LAN server, and only flashes when `--flash` is explicitly passed. `--cold-reboot` reboots a long-uptime unit and waits for it to return before pulling (defragments heap / clears AsyncTCP).
+- **OTA operations guide** — `docs/OTA_OPERATIONS.md` documents safe OTA prerequisites, Pull OTA flow, espota maintenance use, rollback limits, and AI-agent rules.
+- **ESPOTA maintenance diagnostics** — `/api/ota/status` reports OTA owner/progress/timeout state and `/api/ota/espota/prepare` opens a bounded maintenance window.
+
+### Changed
+
+- **Pull OTA MD5 is mandatory** — backend now rejects Pull OTA requests without a valid 32-character MD5. The web UI marks MD5 as required.
+- **Pull OTA no longer follows HTTP redirects** — the `isPrivateLanUrl()` whitelist only gated the initial URL, so a `30x` to an off-LAN host could defeat it (SSRF) and leak the forwarded `Authorization` header to the redirect target. Redirects now fail with a clear message; point the URL directly at the firmware `.bin`.
+- **Pull OTA success reboots through `safeRestart("ota_complete")`** — reset history and heap diagnostics are preserved instead of calling `ESP.restart()` directly.
+- **README OTA guidance** — network update docs now prefer guarded Pull OTA with MD5 and mark multipart upload as fallback only.
+
+### Fixed
+
+- **Pull OTA MD5 integrity was never enforced** — `Update.setMD5()` was called *before* `Update.begin()`, which resets the expected hash to empty, so the firmware digest was never actually checked and any binary with a valid-hex MD5 would flash. `setMD5()` now runs after `begin()`; a deliberately wrong MD5 is now correctly rejected (`UPDATE_ERROR_MD5`). Verified live on bench.
+- **OTA runtime overlap and stale cleanup risk** — multipart, Pull OTA, and espota now share an OTA runtime owner/progress state. A main-loop watchdog aborts stale update state, clears CSI/MQTT OTA flags, resumes radar, and records timeout status if an OTA path stops making progress.
+
 ## [5.0.4-poe-wifi] - 2026-06-05
 
 Security hardening release — MQTT alarm PIN guard, dashboard ARM block on default credentials, and HTTP security headers.

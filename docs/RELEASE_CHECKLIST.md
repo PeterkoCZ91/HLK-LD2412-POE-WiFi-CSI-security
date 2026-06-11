@@ -4,9 +4,10 @@ Use this checklist to keep the repository up to date with minimal overhead.
 
 ## Before Build
 
-1. Bump `FW_VERSION` in `src/main.cpp`.
-2. Confirm `include/secrets.h` and `include/known_devices.h` are still untracked.
-3. Decide whether the change is:
+1. Bump `FW_VERSION` in `src/main.cpp` and any build flag override in `platformio.ini`. Never reuse a version string for different source code.
+2. Read [OTA Operations Guide](OTA_OPERATIONS.md) if the release may be deployed over the network.
+3. Confirm `include/secrets.h` and `include/known_devices.h` are still untracked.
+4. Decide whether the change is:
    - internal-only
    - user-visible
    - release-worthy
@@ -37,6 +38,16 @@ pio run -e esp32_poe
 ```
 
 3. Verify the version string in the firmware output and serial boot log.
+
+## OTA Deployment Gate
+
+Before flashing any device over the network:
+
+1. Run a dry-run identity check with `tools/pull_ota_deploy.sh`.
+2. Verify at least one hardware identity value, preferably MAC plus MQTT id or hostname.
+3. Record current firmware, target identity, artifact size, and MD5.
+4. Prefer Pull OTA with MD5. Use multipart `/api/update` only as an accepted-risk fallback.
+5. After flashing, verify `/api/version`, `/api/health`, and `/api/ota/status` when supported.
 
 ## Local Artifact Handling
 

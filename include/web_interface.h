@@ -146,19 +146,23 @@ const char index_html[] PROGMEM = R"rawliteral(
       save_config: "Uložit konfiguraci", upload_fw: "Nahrát Firmware", saved: "Uloženo",
       fw_update_title: "Aktualizace FW",
       pull_ota_title: "Pull OTA z URL",
-      pull_ota_help: "ESP si stáhne firmware sám z dané URL. Funguje s HTTPS i přesměrováním. Auth header je volitelný (např. <code>Bearer &lt;token&gt;</code>).",
+      pull_ota_help: "ESP si stáhne firmware sám z dané URL. Funguje s HTTPS. Přesměrování (redirect) se z bezpečnostních důvodů nenásleduje — zadej přímou URL na .bin. MD5 je povinné a slouží jako hlavní kontrola integrity firmware.",
       pull_ota_btn: "⤓ Stáhnout a flashnout",
       pull_ota_running: "Stahuji & flashuji…",
       pull_ota_phase_idle: "—",
+      pull_ota_phase_connecting: "Připojuji se…",
       pull_ota_phase_downloading: "Stahuji…",
       pull_ota_phase_writing: "Zapisuji firmware…",
       pull_ota_phase_success: "✅ Hotovo, restartuji",
       pull_ota_phase_error: "❌ Chyba",
       pull_ota_no_url: "Zadej URL k firmware .bin",
+      pull_ota_bad_md5: "MD5 musí mít 32 hex znaků",
       ota_cold_label: "Před OTA restartovat (doporučeno pro 100% úspěšnost)",
       ota_cold_restart: "Restartuji zařízení...", ota_waiting_reboot: "Čekám na zařízení",
       ota_ready_uploading: "Zařízení naběhlo, nahrávám...", ota_uploading: "Nahrávám firmware...",
       ota_cold_failed: "Zařízení nenaběhlo do 25 s — zkontroluj napájení a zkus znovu",
+      ota_espota_prepare: "Připravit espota okno",
+      ota_espota_ready: "ESPOTA okno otevřeno na 120 s",
       yes: "ANO", no: "NE", no_collecting: "NE — sbírá vzorky", motion: "POHYB", idle: "KLID",
       coverage: "Pokrytí", resolution: "Rozlišení", gate: "hradlo",
       hold_state: "DRŽENÍ", tamper_state: "SABOTÁŽ!",
@@ -288,19 +292,23 @@ const char index_html[] PROGMEM = R"rawliteral(
       save_config: "Save Configuration", upload_fw: "Upload Firmware", saved: "Saved",
       fw_update_title: "Firmware Update",
       pull_ota_title: "Pull OTA from URL",
-      pull_ota_help: "Device fetches the firmware itself from the given URL. HTTPS + redirects supported. Auth header optional (e.g. <code>Bearer &lt;token&gt;</code>).",
+      pull_ota_help: "Device fetches the firmware itself from the given URL. HTTPS supported; redirects are not followed (point the URL directly at the .bin). MD5 is required and is the primary firmware integrity check.",
       pull_ota_btn: "⤓ Fetch & flash",
       pull_ota_running: "Fetching & flashing…",
       pull_ota_phase_idle: "—",
+      pull_ota_phase_connecting: "Connecting…",
       pull_ota_phase_downloading: "Downloading…",
       pull_ota_phase_writing: "Writing firmware…",
       pull_ota_phase_success: "✅ Done, rebooting",
       pull_ota_phase_error: "❌ Error",
       pull_ota_no_url: "Enter URL to firmware .bin",
+      pull_ota_bad_md5: "MD5 must be 32 hex characters",
       ota_cold_label: "Reboot device before OTA (recommended for 100% success)",
       ota_cold_restart: "Rebooting device...", ota_waiting_reboot: "Waiting for device",
       ota_ready_uploading: "Device up, uploading...", ota_uploading: "Uploading firmware...",
       ota_cold_failed: "Device did not come back within 25 s — check power and retry",
+      ota_espota_prepare: "Prepare espota window",
+      ota_espota_ready: "ESPOTA window open for 120 s",
       yes: "YES", no: "NO", no_collecting: "NO — collecting samples", motion: "MOTION", idle: "IDLE",
       coverage: "Coverage", resolution: "Resolution", gate: "gate",
       hold_state: "HOLD", tamper_state: "TAMPER!",
@@ -987,14 +995,16 @@ const char index_html[] PROGMEM = R"rawliteral(
         <div id="ota_status" style="margin-top:4px; font-size:0.85em; color:#aaa; min-height:1.1em"></div>
         <div id="ota_bar" style="height:5px; background:#333; margin-top:5px; width:0%; transition:width 0.2s; background:var(--accent)"></div>
         <button id="btn_ota" onclick="uploadFW()" data-i18n="upload_fw">Nahrát Firmware</button>
+        <button id="btn_espota" onclick="prepareEspota()" class="sec" data-i18n="ota_espota_prepare">Připravit espota okno</button>
 
         <hr style="border:none; border-top:1px solid #333; margin:14px 0 10px">
         <div class="stat-row"><span data-i18n="pull_ota_title">Pull OTA z URL</span></div>
         <div style="font-size:0.75rem; color:#777; margin-bottom:6px">
-            <span data-i18n="pull_ota_help">ESP si stáhne firmware sám z dané URL. Funguje s HTTPS i přesměrováním. Auth header je volitelný (např. <code>Bearer &lt;token&gt;</code>).</span>
+            <span data-i18n="pull_ota_help">ESP si stáhne firmware sám z dané URL. Funguje s HTTPS. Přesměrování (redirect) se z bezpečnostních důvodů nenásleduje — zadej přímou URL na .bin. MD5 je povinné a slouží jako hlavní kontrola integrity firmware.</span>
         </div>
         <input type="text" id="pull_url" placeholder="https://example.com/firmware.bin" style="width:100%; box-sizing:border-box; margin-bottom:6px">
         <input type="text" id="pull_auth" placeholder="Bearer …" style="width:100%; box-sizing:border-box; margin-bottom:6px">
+        <input type="text" id="pull_md5" maxlength="32" placeholder="MD5 checksum (required)" style="width:100%; box-sizing:border-box; margin-bottom:6px">
         <div id="pull_status" style="margin-top:4px; font-size:0.85em; color:#aaa; min-height:1.1em"></div>
         <button id="btn_pull" onclick="pullFW()" class="sec" data-i18n="pull_ota_btn">⤓ Stáhnout a flashnout</button>
     </div>
@@ -2216,14 +2226,31 @@ function uploadFW() {
     }
 }
 
+function prepareEspota() {
+    const btn = document.getElementById("btn_espota");
+    if (btn) btn.disabled = true;
+    _otaStatus(t("ota_cold_restart"));
+    fetch("/api/ota/espota/prepare?seconds=120", {method:"POST", credentials:"include"})
+        .then(r => r.text().then(txt => {
+            let d = {};
+            try { d = txt ? JSON.parse(txt) : {}; } catch(e) { d = {message: txt}; }
+            if (!r.ok) throw new Error(d.error || d.message || ("HTTP " + r.status));
+            return d;
+        }))
+        .then(() => _otaStatus(t("ota_espota_ready")))
+        .catch(e => _otaStatus("❌ " + e.message))
+        .finally(() => { if (btn) btn.disabled = false; });
+}
+
 // --- PULL OTA ---
 function _pullStatus(msg) { $('pull_status').innerText = msg || ''; }
 function _pullPhaseLabel(phase) {
-    if (phase === 'downloading' || phase === 'fetching') return t('pull_ota_phase_downloading');
-    if (phase === 'writing' || phase === 'flashing')     return t('pull_ota_phase_writing');
-    if (phase === 'success')                              return t('pull_ota_phase_success');
-    if (phase === 'error')                                return t('pull_ota_phase_error');
-    return t('pull_ota_phase_idle');
+    if (phase === "accepted" || phase === "connecting") return t("pull_ota_phase_connecting");
+    if (phase === "downloading" || phase === "fetching") return t("pull_ota_phase_downloading");
+    if (phase === "writing" || phase === "flashing") return t("pull_ota_phase_writing");
+    if (phase === "success" || phase === "success_rebooting") return t("pull_ota_phase_success");
+    if (phase === "error" || phase === "failed") return t("pull_ota_phase_error");
+    return t("pull_ota_phase_idle");
 }
 function _pullPoll(tries) {
     if (tries > 60) { $('btn_pull').disabled = false; return; }
@@ -2232,13 +2259,14 @@ function _pullPoll(tries) {
         .then(d => {
             const phase = (d.phase || 'idle').toLowerCase();
             const lbl = _pullPhaseLabel(phase);
-            const err = d.last_error ? (' — ' + d.last_error) : '';
+            const msg = d.message || d.last_error || "";
+            const err = msg ? (" — " + msg) : "";
             _pullStatus(lbl + err);
-            if (phase === 'success') {
+            if (phase === "success" || phase === "success_rebooting") {
                 setTimeout(() => location.reload(), 4000);
                 return;
             }
-            if (phase === 'error') {
+            if (phase === "error" || phase === "failed") {
                 $('btn_pull').disabled = false;
                 return;
             }
@@ -2249,8 +2277,12 @@ function _pullPoll(tries) {
 function pullFW() {
     const url = ($('pull_url').value || '').trim();
     if (!url) { _pullStatus(t('pull_ota_no_url')); return; }
-    const auth = ($('pull_auth').value || '').trim();
-    const body = auth ? {url, auth} : {url};
+    const auth = (document.getElementById("pull_auth").value || "").trim();
+    const md5 = (document.getElementById("pull_md5").value || "").trim();
+    if (!/^[0-9a-fA-F]{32}$/.test(md5)) { _pullStatus(t("pull_ota_bad_md5")); return; }
+    const body = {url};
+    if (auth) body.auth = auth;
+    body.md5 = md5;
     $('btn_pull').disabled = true;
     _pullStatus(t('pull_ota_running'));
     fetch('/api/update/pull', {
@@ -2259,7 +2291,12 @@ function pullFW() {
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify(body)
     })
-    .then(r => r.json().catch(() => ({})))
+    .then(r => r.text().then(txt => {
+        let d = {};
+        try { d = txt ? JSON.parse(txt) : {}; } catch(e) { d = {message: txt}; }
+        if (!r.ok) throw new Error(d.error || d.message || ("HTTP " + r.status));
+        return d;
+    }))
     .then(d => {
         if (d && d.error) {
             _pullStatus(t('pull_ota_phase_error') + ' — ' + d.error);

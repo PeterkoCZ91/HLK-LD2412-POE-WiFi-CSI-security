@@ -44,7 +44,7 @@
 // -------------------------------------------------------------------------
 #include <Update.h>
 #ifndef FW_VERSION
-#define FW_VERSION "v5.0.4"
+#define FW_VERSION "v5.0.6"
 #endif
 #define WDT_TIMEOUT_SECONDS 60
 
@@ -190,6 +190,28 @@ bool bootValidated = false;
 // "reboot_inhibit" persists the choice across reboots.
 std::atomic<bool> g_rebootInhibit{false};
 std::atomic<bool> g_otaRebootForce{false};
+#ifndef LITE_BUILD
+std::atomic<bool> g_espotaPrepareRequested{false};
+std::atomic<bool> g_espotaMaintenance{false};
+std::atomic<bool> g_otaTransferActive{false};
+std::atomic<uint32_t> g_espotaMaintenanceSeconds{120};
+std::atomic<unsigned long> g_espotaMaintenanceUntilMs{0};
+std::atomic<uint8_t> g_otaRuntimeOwner{0};
+std::atomic<unsigned long> g_otaRuntimeLastProgressMs{0};
+std::atomic<uint32_t> g_otaRuntimeLastBytes{0};
+std::atomic<uint32_t> g_otaRuntimeTimeoutMs{0};
+static constexpr uint8_t OTA_OWNER_NONE = 0;
+static constexpr uint8_t OTA_OWNER_HTTP = 1;
+static constexpr uint8_t OTA_OWNER_PULL = 2;
+static constexpr uint8_t OTA_OWNER_ESPOTA_PREPARE = 3;
+static constexpr uint8_t OTA_OWNER_ESPOTA = 4;
+const char* otaRuntimeOwnerName(uint8_t owner);
+uint8_t otaRuntimeOwner();
+bool otaRuntimeTryBegin(uint8_t owner, uint32_t timeoutMs);
+void otaRuntimeMarkProgress(uint32_t bytes);
+void otaRuntimeEnd(uint8_t owner);
+void otaRuntimeRestoreServices(const char* reason, bool restartRadar);
+#endif
 
 static String pendingZonesJson = "";
 static volatile bool pendingZonesUpdate = false;
@@ -916,6 +938,12 @@ void setup() {
 
 #ifndef LITE_BUILD
     ArduinoOTA.onStart([]() {
+        otaRuntimeEnd(OTA_OWNER_ESPOTA_PREPARE);
+        if (!otaRuntimeTryBegin(OTA_OWNER_ESPOTA, 180000)) {
+            systemLog.warn(String("ArduinoOTA started while OTA owner is ") + otaRuntimeOwnerName(otaRuntimeOwner()));
+        }
+        otaRuntimeMarkProgress(0);
+        g_espotaMaintenance.store(true);
 #ifdef USE_CSI
         CSIService::setOtaInProgress(true);
 #endif
@@ -928,7 +956,7 @@ void setup() {
         Serial.println("Start updating " + type);
         // Save config snapshot before OTA overwrites flash
         configSnapshot.saveSnapshot(&preferences, FW_VERSION, "ota_arduino");
-        if (radarTaskHandle) vTaskSuspend(radarTaskHandle);
+        if (radarTaskHandle && eTaskGetState(radarTaskHandle) != eSuspended) vTaskSuspend(radarTaskHandle);
         radar.stop();
         if (telegramBot.isEnabled()) {
             Serial.println("[OTA] Attempting Telegram notification...");
@@ -940,12 +968,21 @@ void setup() {
         CSIService::setOtaInProgress(false);
 #endif
         MQTTService::setOtaInProgress(false);
+        g_espotaMaintenance.store(false);
+        g_espotaMaintenanceUntilMs.store(0);
+        otaRuntimeEnd(OTA_OWNER_ESPOTA);
+    });
+    ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+        otaRuntimeMarkProgress(total > 0 ? progress : 0);
     });
     ArduinoOTA.onError([](ota_error_t) {
 #ifdef USE_CSI
         CSIService::setOtaInProgress(false);
 #endif
         MQTTService::setOtaInProgress(false);
+        otaRuntimeRestoreServices("arduino_ota_error", true);
+        otaRuntimeEnd(OTA_OWNER_ESPOTA);
+        systemLog.error("ArduinoOTA failed; runtime services restored");
     });
 
     ArduinoOTA.setPassword(configManager.getConfig().auth_pass);
@@ -1009,6 +1046,127 @@ void setup() {
 #endif
 }
 
+#ifndef LITE_BUILD
+const char* otaRuntimeOwnerName(uint8_t owner) {
+    switch (owner) {
+        case OTA_OWNER_HTTP: return "http_multipart";
+        case OTA_OWNER_PULL: return "pull";
+        case OTA_OWNER_ESPOTA_PREPARE: return "espota_prepare";
+        case OTA_OWNER_ESPOTA: return "espota";
+        default: return "none";
+    }
+}
+
+uint8_t otaRuntimeOwner() {
+    return g_otaRuntimeOwner.load();
+}
+
+bool otaRuntimeTryBegin(uint8_t owner, uint32_t timeoutMs) {
+    uint8_t expected = OTA_OWNER_NONE;
+    if (!g_otaRuntimeOwner.compare_exchange_strong(expected, owner)) {
+        return false;
+    }
+    unsigned long now = millis();
+    g_otaRuntimeLastProgressMs.store(now);
+    g_otaRuntimeLastBytes.store(0);
+    g_otaRuntimeTimeoutMs.store(timeoutMs);
+    g_otaTransferActive.store(owner != OTA_OWNER_ESPOTA_PREPARE);
+    return true;
+}
+
+void otaRuntimeMarkProgress(uint32_t bytes) {
+    g_otaRuntimeLastProgressMs.store(millis());
+    g_otaRuntimeLastBytes.store(bytes);
+}
+
+void otaRuntimeEnd(uint8_t owner) {
+    uint8_t current = g_otaRuntimeOwner.load();
+    if (owner != OTA_OWNER_NONE && current != owner) return;
+    g_otaRuntimeOwner.store(OTA_OWNER_NONE);
+    g_otaRuntimeLastProgressMs.store(0);
+    g_otaRuntimeLastBytes.store(0);
+    g_otaRuntimeTimeoutMs.store(0);
+    g_otaTransferActive.store(false);
+}
+
+void otaRuntimeRestoreServices(const char* reason, bool restartRadar) {
+    if (Update.isRunning()) {
+        Update.abort();
+    }
+#ifdef USE_CSI
+    CSIService::setOtaInProgress(false);
+#endif
+    MQTTService::setOtaInProgress(false);
+    if (restartRadar) {
+        uint8_t minGate = preferences.getUInt("radar_min", 0);
+        uint8_t maxGate = preferences.getUInt("radar_max", 13);
+        radar.begin(Serial2, minGate, maxGate);
+    }
+    if (radarTaskHandle && eTaskGetState(radarTaskHandle) == eSuspended) {
+        vTaskResume(radarTaskHandle);
+    }
+    g_espotaMaintenance.store(false);
+    g_espotaMaintenanceUntilMs.store(0);
+    systemLog.warn(String("OTA runtime services restored: ") + (reason ? reason : "unknown"));
+}
+
+static void handleOtaRuntimeWatchdog(unsigned long now) {
+    uint8_t owner = g_otaRuntimeOwner.load();
+    if (owner == OTA_OWNER_NONE) return;
+
+    uint32_t timeoutMs = g_otaRuntimeTimeoutMs.load();
+    unsigned long last = g_otaRuntimeLastProgressMs.load();
+    if (timeoutMs == 0 || last == 0 || (long)(now - last) <= (long)timeoutMs) return;
+
+    const char* ownerName = otaRuntimeOwnerName(owner);
+    DBG("OTA", "Runtime watchdog timeout for %s after %lu ms", ownerName, now - last);
+    systemLog.error(String("OTA timeout: ") + ownerName);
+    preferences.putString("ota_phase", "failed");
+    preferences.putString("ota_msg", String("runtime timeout: ") + ownerName);
+    preferences.putInt("ota_err", -6);
+    otaRuntimeRestoreServices("watchdog_timeout", owner == OTA_OWNER_ESPOTA);
+    otaRuntimeEnd(owner);
+}
+
+static void clearEspotaMaintenanceMode() {
+    otaRuntimeRestoreServices("espota_window_closed", false);
+    otaRuntimeEnd(OTA_OWNER_ESPOTA_PREPARE);
+    systemLog.info("ESPOTA maintenance window closed");
+}
+
+static void handleEspotaMaintenance(unsigned long now) {
+    if (g_espotaPrepareRequested.exchange(false)) {
+        uint32_t seconds = g_espotaMaintenanceSeconds.load();
+        if (seconds < 30) seconds = 30;
+        if (seconds > 600) seconds = 600;
+
+        ArduinoOTA.end();
+        delay(20);
+        ArduinoOTA.begin();
+
+#ifdef USE_CSI
+        CSIService::setOtaInProgress(true);
+#endif
+        MQTTService::setOtaInProgress(true);
+        if (radarTaskHandle && eTaskGetState(radarTaskHandle) != eSuspended) {
+            vTaskSuspend(radarTaskHandle);
+        }
+
+        g_espotaMaintenance.store(true);
+        g_espotaMaintenanceUntilMs.store(now + seconds * 1000UL);
+        systemLog.warn("ESPOTA maintenance window opened for " + String(seconds) + "s");
+        DBG("OTA", "ESPOTA maintenance window opened for %us", (unsigned)seconds);
+    }
+
+    if (g_espotaMaintenance.load() && !g_otaTransferActive.load()) {
+        unsigned long until = g_espotaMaintenanceUntilMs.load();
+        if (until != 0 && (long)(now - until) >= 0) {
+            clearEspotaMaintenanceMode();
+        }
+    }
+}
+#endif
+
 // -------------------------------------------------------------------------
 // Loop
 // -------------------------------------------------------------------------
@@ -1021,6 +1179,8 @@ void loop() {
     rtc_last_uptime_s = now / 1000;
 
 #ifndef LITE_BUILD
+    handleOtaRuntimeWatchdog(now);
+    handleEspotaMaintenance(now);
     ArduinoOTA.handle();
 #endif
 
