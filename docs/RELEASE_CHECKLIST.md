@@ -25,19 +25,26 @@ Use this checklist to keep the repository up to date with minimal overhead.
 
 ## Build And Verify
 
-1. Build the CSI firmware:
+1. Run native unit tests and static analysis:
+
+```bash
+pio test -e native
+bash tools/run_cppcheck.sh
+```
+
+2. Build the CSI firmware:
 
 ```bash
 pio run -e esp32_poe_csi
 ```
 
-2. If needed, also build the radar-only variant:
+3. If needed, also build the radar-only variant:
 
 ```bash
 pio run -e esp32_poe
 ```
 
-3. Verify the version string in the firmware output and serial boot log.
+4. Verify the version string in the firmware output and serial boot log.
 
 ## OTA Deployment Gate
 

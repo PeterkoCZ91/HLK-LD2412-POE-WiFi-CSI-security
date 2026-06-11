@@ -7,6 +7,7 @@
 MQTTService* MQTTService::_instance = nullptr;
 std::atomic<bool> MQTTService::_otaInProgress{false};
 
+// cppcheck-suppress uninitMemberVar ; globální singleton (zero-init), membery nastavuje begin()
 MQTTService::MQTTService() : _mqttClient(_espClient) {
     _instance = this;
 }

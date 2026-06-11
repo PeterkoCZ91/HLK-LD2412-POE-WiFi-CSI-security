@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.0.7-poe-wifi] - 2026-06-11
+
+Quick-wins release — IMPROVEMENTS T1/T2/T3/T4. First release with automated unit tests.
+
+### Added
+
+- **`/metrics` endpoint (T1)** — Prometheus text exposition (heap, chip temp, radar health, ETH/MQTT state, alarm state, fusion confidence, CSI packet stats). Basic auth; scrape with `basic_auth` in `prometheus.yml`.
+- **Per-IP auth lockout (T3)** — 5 failed login attempts (with credentials) within 60 s lock the source IP out with `429 Retry-After`, exponential backoff 30 s → 15 min. Successful login clears the record. Pure-logic core in `include/services/AuthLockout.h`.
+- **Native unit tests (seed of T5)** — new `[env:native]` + Unity; `pio test -e native` covers AuthLockout and the metrics builder. Runs in CI.
+- **cppcheck in CI (T2)** — `tools/run_cppcheck.sh` (same invocation locally and in CI), `--error-exitcode=2`. Existing findings triaged: printf format casts fixed, copy ctors deleted on buffer-owning services, documented inline suppressions elsewhere.
+
+### Fixed
+
+- **Dashboard `<html lang>` (T4)** — was hardcoded `cs` although the default UI language is EN since v5.0.4; now defaults to `en` and follows the i18n language switch.
+
 ## [5.0.6-poe-wifi] - 2026-06-11
 
 OTA field-service hardening release. Motivated by a long-standing problem: OTA that works right after a flash but fails on units with long uptime (heap fragmentation, AsyncTCP backpressure under radar+CSI+MQTT load, and `ArduinoOTA` CPU starvation). See [docs/OTA_OPERATIONS.md](docs/OTA_OPERATIONS.md) → "Why OTA Gets Harder the Longer a Device Has Been Running".

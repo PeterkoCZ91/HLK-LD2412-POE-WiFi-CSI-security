@@ -15,6 +15,8 @@ class LogService {
 public:
     LogService(size_t maxEntries = 20);
     ~LogService();
+    LogService(const LogService&) = delete;         // vlastní _buffer (new[])
+    LogService& operator=(const LogService&) = delete;
 
     void log(const String& type, const String& message);
     void info(const String& message) { log("INFO", message); }

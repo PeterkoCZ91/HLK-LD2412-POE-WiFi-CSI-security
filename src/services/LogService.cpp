@@ -2,6 +2,7 @@
 
 LogService::LogService(size_t maxEntries) : _maxEntries(maxEntries), _head(0), _count(0) {
     _buffer = new LogEntry[_maxEntries];
+    // cppcheck-suppress useInitializationList ; jednorázová inicializace při startu
     _mutex = xSemaphoreCreateMutex();
 }
 

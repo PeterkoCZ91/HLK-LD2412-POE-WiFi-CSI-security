@@ -43,6 +43,8 @@ class EventLog {
 public:
     EventLog(size_t ramCapacity = RAM_CAPACITY);
     ~EventLog();
+    EventLog(const EventLog&) = delete;             // vlastní _buffer (new[])
+    EventLog& operator=(const EventLog&) = delete;
 
     // begin() expects LittleFS already mounted externally
     void begin(bool fsAvailable = true);

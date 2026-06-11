@@ -44,7 +44,7 @@
 // -------------------------------------------------------------------------
 #include <Update.h>
 #ifndef FW_VERSION
-#define FW_VERSION "v5.0.6"
+#define FW_VERSION "v5.0.7"
 #endif
 #define WDT_TIMEOUT_SECONDS 60
 
@@ -366,7 +366,7 @@ void updateZonesFromJSON() {
         zones.push_back(z);
     }
     securityMonitor.setZones(zones);
-    DBG("CONFIG", "Updated %d zones", zones.size());
+    DBG("CONFIG", "Updated %d zones", (int)zones.size());
 }
 
 void saveZonesToNVS() {

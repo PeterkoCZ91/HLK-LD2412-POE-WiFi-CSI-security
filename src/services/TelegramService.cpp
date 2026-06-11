@@ -9,9 +9,11 @@
 #include <ETH.h>
 #include <inttypes.h>
 
+// cppcheck-suppress uninitMemberVar ; globální singleton (zero-init), membery nastavuje begin()
 TelegramService::TelegramService() : _bot(nullptr), _enabled(false), _connected(false),
                                       _lastCheck(0), _checkInterval(5000), _radar(nullptr), _muteStartTime(0), _muteDuration(0) {
     _chatId[0] = '\0';
+    // cppcheck-suppress useInitializationList ; jednorázová inicializace při startu
     _sendMutex = xSemaphoreCreateMutex();
 }
 

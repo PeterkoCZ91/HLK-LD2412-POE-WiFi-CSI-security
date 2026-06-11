@@ -55,3 +55,46 @@ jobs:
       - name: Firmware size report
         if: always()
         run: pio run -e ${{ matrix.env }} --target size 2>&1 | tail -40 || true
+
+  native-tests:
+    name: native unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install PlatformIO
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install platformio
+
+      - name: Provision placeholder secrets
+        run: |
+          [ -f include/secrets.h ] || cp include/secrets.h.example include/secrets.h
+          [ -f include/known_devices.h ] || cp include/known_devices.h.example include/known_devices.h
+
+      - name: Run native unit tests
+        run: pio test -e native
+
+  cppcheck:
+    name: cppcheck static analysis
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install cppcheck
+        run: sudo apt-get update && sudo apt-get install -y cppcheck
+
+      - name: Provision placeholder secrets
+        run: |
+          [ -f include/secrets.h ] || cp include/secrets.h.example include/secrets.h
+          [ -f include/known_devices.h ] || cp include/known_devices.h.example include/known_devices.h
+
+      - name: Run cppcheck
+        run: bash tools/run_cppcheck.sh

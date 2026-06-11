@@ -135,7 +135,7 @@ bool ConfigSnapshot::saveSnapshot(Preferences* prefs, const char* fwVersion, con
     if (_snapshotCount < SNAPSHOT_SLOTS) _snapshotCount++;
     saveMeta();
 
-    DBG("ConfigSnapshot", "Saved slot %d (%u bytes, fw=%s, reason=%s)", slot, written, fwVersion, reason);
+    DBG("ConfigSnapshot", "Saved slot %d (%u bytes, fw=%s, reason=%s)", slot, (unsigned)written, fwVersion, reason);
     return true;
 }
 

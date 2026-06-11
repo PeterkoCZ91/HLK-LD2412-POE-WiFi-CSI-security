@@ -3,13 +3,15 @@
 [![PlatformIO](https://img.shields.io/badge/PlatformIO-ESP32-orange?logo=platformio)](https://platformio.org/)
 [![ESP32](https://img.shields.io/badge/MCU-ESP32--WROOM--32-blue?logo=espressif)](https://www.espressif.com/)
 [![License](https://img.shields.io/badge/License-GPL--3.0-blue)](LICENSE)
-[![Version](https://img.shields.io/badge/Version-5.0.6--poe--wifi-blue)]()
+[![Version](https://img.shields.io/badge/Version-5.0.7--poe--wifi-blue)]()
 
 **Dual-sensor intrusion detection system** — ESP32 + HLK-LD2412 24 GHz mmWave radar + **WiFi CSI (Channel State Information) passive motion detection** over **wired Ethernet with Power over Ethernet**. Full alarm state machine, zone management, Home Assistant integration, Telegram bot, and a dark-mode web dashboard. No cloud required.
 
 WiFi CSI detection algorithms based on [ESPectre](https://github.com/francescopace/espectre) by Francesco Pace (GPLv3).
 
 > [!TIP]
+> **v5.0.7** — quick wins: new [`/metrics` Prometheus endpoint](#prometheus-metrics) for Grafana dashboards, per-IP brute-force lockout on web auth (`429` + exponential backoff), first automated unit tests (`pio test -e native`) and cppcheck static analysis in CI. See [CHANGELOG](CHANGELOG.md).
+>
 > **v5.0.6** — OTA field-service hardening: guarded Pull OTA with **enforced** MD5 integrity (fixes a call-order bug where the hash was never actually verified), redirects no longer followed (SSRF/token-leak guard), shared OTA runtime owner/watchdog cleanup, espota maintenance window status, and a safe deploy helper with target identity checks. See [docs/OTA_OPERATIONS.md](docs/OTA_OPERATIONS.md) before flashing unattended devices.
 
 ---
@@ -28,6 +30,7 @@ WiFi CSI detection algorithms based on [ESPectre](https://github.com/francescopa
 - [Web Dashboard](#web-dashboard)
 - [Telegram Bot](#telegram-bot)
 - [API Reference](#api-reference)
+- [Prometheus Metrics](#prometheus-metrics)
 - [Differences from WiFi / POE Variants](#differences-from-wifi--poe-variants)
 - [Sensor Firmware Quirks](#sensor-firmware-quirks)
 - [Known Issues & Limitations](#known-issues--limitations)
@@ -37,6 +40,7 @@ WiFi CSI detection algorithms based on [ESPectre](https://github.com/francescopa
 - [FAQ](#faq)
 - [Development History](#development-history)
 - [Acknowledgments](#acknowledgments)
+- [Development & Testing](#development--testing)
 - [Contributing](#contributing)
 - [License](#license)
 
@@ -383,6 +387,7 @@ After the timed run completes, the firmware **continues to refresh the baseline 
 | Mesh verification | Cross-node alarm confirmation via MQTT (5s window) |
 | Fusion alarm | CSI-only can trigger alarm; radar FP suppressed by CSI |
 | MQTT alarm PIN | `security/{id}/alarm/set` requires `CMD:pin` format when PIN is configured in NVS |
+| Brute-force lockout | Per-IP HTTP auth lockout — 5 failed attempts/60 s → `429` with exponential backoff (30 s → 15 min) |
 | Offline buffer | MQTT messages queued to LittleFS during network outage |
 
 ### System
@@ -392,6 +397,7 @@ After the timed run completes, the firmware **continues to refresh the baseline 
 | OTA | Pull OTA with enforced MD5 integrity, redirects rejected (SSRF guard), target-safe deploy helper, espota maintenance window, runtime cleanup watchdog |
 | Config snapshot | NVS backup before OTA flash |
 | Web dashboard | Dark-mode GUI with SSE real-time telemetry, CZ/EN toggle |
+| Prometheus metrics | `/metrics` endpoint for Grafana / Prometheus scraping (Basic auth) |
 | LittleFS assets | Hot-swap web UI without reflash |
 | Static IP | Optional fixed IP configuration |
 | Chip temperature | MQTT + Telegram alerts on thermal events |
@@ -425,11 +431,13 @@ HLK-LD2412-POE-WiFi-CSI-security/
 │       ├── LogService.h           # Structured logging
 │       └── BluetoothService.h     # BLE config (optional)
 ├── src/                           # Implementation files
+├── test/                          # Native unit tests (pio test -e native)
 ├── lib/LD2412_Extended/           # Radar protocol library
 ├── platformio.ini                 # Build environments
 ├── partitions_16mb.csv            # 16 MB flash partition table
 ├── tools/
 │   ├── upload_www.sh              # LittleFS web asset uploader
+│   ├── run_cppcheck.sh            # Static analysis (same invocation as CI)
 │   └── pull_ota_deploy.sh        # Guarded Pull OTA deploy helper (identity + MD5)
 ├── docs/OTA_OPERATIONS.md         # OTA field-service guide
 ├── LICENSE                        # GPL-3.0
@@ -478,11 +486,14 @@ The CSI tab shows live turbulence / composite score / packet rate / RSSI, runtim
 
 All endpoints require Digest auth except where noted.
 
+**Brute-force protection (v5.0.7+):** after 5 failed login attempts carrying credentials from one IP within 60 s, that IP gets `429 Too Many Requests` with a `Retry-After` header. The lockout backs off exponentially (30 s → 15 min) and clears immediately on a successful login. Other IPs are unaffected; the browser's initial credential-less request does not count.
+
 ### Status & Telemetry
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | GET | `/api/health` | Uptime, Ethernet info, MQTT, heap, CSI status, reset history |
+| GET | `/metrics` | Prometheus text exposition — heap, chip temp, radar health, ETH/MQTT state, alarm state, fusion confidence, CSI stats. **Basic auth**. See [Prometheus Metrics](#prometheus-metrics) |
 | GET | `/healthz` | Unauthenticated liveness probe — heap + uptime. Use for external monitoring when auth may be degraded. |
 | GET | `/api/telemetry` | Radar state, distance, energy, UART stats |
 | GET | `/api/version` | Firmware version string (no auth — used by GUI before login) |
@@ -562,6 +573,38 @@ All endpoints require Digest auth except where noted.
 | POST | `/api/restart` | Soft reboot |
 | POST | `/api/bluetooth/start` | Enable BLE config mode |
 | DELETE/POST | `/api/www` | Manage LittleFS web assets (delete / upload) |
+
+---
+
+## Prometheus Metrics
+
+Since v5.0.7 the firmware exposes `/metrics` in Prometheus text exposition format, so you can build Grafana dashboards and alerting outside Home Assistant. The endpoint uses **Basic auth** (same credentials as the dashboard) because Prometheus `scrape_config` does not support Digest.
+
+Exported metric families (`poe2412_` prefix):
+
+| Group | Metrics |
+|-------|---------|
+| System | `uptime_seconds`, `heap_free_bytes`, `heap_min_free_bytes`, `heap_largest_block_bytes`, `chip_temp_celsius`, `info{fw=...}` |
+| Radar | `radar_connected`, `radar_frame_rate`, `radar_errors_total`, `radar_health_score` |
+| Network | `eth_link_up`, `eth_speed_mbps`, `mqtt_connected`, `mqtt_publish_fails_total`, `mqtt_reconnects_total` |
+| Security | `alarm_state` (0=DISARMED … 4=TRIGGERED), `alarm_armed`, `http_auth_ok_total`, `http_auth_fail_total` |
+| Fusion / CSI | `fusion_enabled`, `fusion_presence`, `fusion_confidence`, `csi_active`, `csi_packets_total`, `csi_packet_rate`, `csi_wifi_rssi_dbm`, `csi_effective_threshold`, `csi_motion`, `csi_ml_probability` |
+
+CSI metrics are omitted on radar-only builds. Example `prometheus.yml` scrape config:
+
+```yaml
+scrape_configs:
+  - job_name: poe2412
+    scrape_interval: 30s
+    metrics_path: /metrics
+    basic_auth:
+      username: admin
+      password: <your-dashboard-password>
+    static_configs:
+      - targets: ["<device-ip>:80"]
+```
+
+Useful starting points for alerts: `poe2412_heap_free_bytes` trending down (slow leak), `poe2412_csi_packet_rate` dropping below ~50 (degraded CSI), `poe2412_mqtt_connected == 0`, and `poe2412_alarm_state == 4` (TRIGGERED).
 
 ---
 
@@ -752,6 +795,28 @@ A: Yes. Each device gets a unique `device_id` (auto-derived from MAC) so HA disc
 - **[ESP32Async](https://github.com/ESP32Async)** — Community fork of AsyncTCP and ESPAsyncWebServer.
 - **[HLK-LD2412](https://www.hlktech.net/)** — Hi-Link 24 GHz FMCW mmWave radar module.
 - **[Tasmota/Staars](https://github.com/Staars)** — LD2412 community protocol research.
+
+---
+
+## Development & Testing
+
+Since v5.0.7 the project has native unit tests and static analysis — both run locally and in CI on every push/PR.
+
+```bash
+# Native unit tests (no hardware needed — pure-logic headers tested on the host)
+pio test -e native
+
+# Static analysis (same invocation as CI)
+bash tools/run_cppcheck.sh
+```
+
+| Check | What it covers |
+|-------|----------------|
+| `test/test_auth_lockout` | Per-IP lockout state machine — thresholds, exponential backoff, window reset, `millis()` wraparound, LRU eviction |
+| `test/test_metrics_text` | Prometheus text builder — format, type annotations, conditional CSI block, truncation safety |
+| `tools/run_cppcheck.sh` | cppcheck (`warning,performance,portability`) over `src/` and `include/services/`; false positives are suppressed inline with a documented reason |
+
+New pure logic should go into Arduino-free headers under `include/services/` (see `AuthLockout.h`, `metrics_text.h`) so it can be unit-tested in `[env:native]`. CI builds both firmware variants (`esp32_poe`, `esp32_poe_csi`) plus the two checks above.
 
 ---
 

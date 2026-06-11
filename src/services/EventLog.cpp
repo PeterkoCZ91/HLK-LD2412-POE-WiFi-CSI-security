@@ -7,6 +7,7 @@ EventLog::EventLog(size_t ramCapacity)
     : _ramCapacity(ramCapacity), _head(0), _count(0)
 {
     _buffer = new LogEvent[_ramCapacity];
+    // cppcheck-suppress useInitializationList ; jednorázová inicializace při startu
     _mutex = xSemaphoreCreateMutex();
 }
 
@@ -20,7 +21,7 @@ void EventLog::begin(bool fsAvailable) {
         loadFromDisk();
     }
     DBG("EventLog", "Ready — disk: %u/%u events, RAM buffer: %u, fs=%d",
-        _diskCount, DISK_CAPACITY, _ramCapacity, _fsAvailable);
+        _diskCount, (unsigned)DISK_CAPACITY, (unsigned)_ramCapacity, _fsAvailable);
 }
 
 // -------------------------------------------------------------------------
@@ -129,7 +130,7 @@ void EventLog::flushToDisk() {
         xSemaphoreGive(_mutex);
     }
 
-    DBG("EventLog", "Flushed %u events to disk (total: %u/%u)", newEvents, _diskCount, DISK_CAPACITY);
+    DBG("EventLog", "Flushed %u events to disk (total: %u/%u)", newEvents, _diskCount, (unsigned)DISK_CAPACITY);
 }
 
 // -------------------------------------------------------------------------
@@ -210,7 +211,7 @@ void EventLog::initDiskFile() {
     _diskCount = 0;
     _diskSequence = 0;
 
-    DBG("EventLog", "Disk file created: %u slots (%u bytes)", DISK_CAPACITY, HEADER_SIZE + DISK_CAPACITY * EVENT_SIZE);
+    DBG("EventLog", "Disk file created: %u slots (%u bytes)", (unsigned)DISK_CAPACITY, (unsigned)(HEADER_SIZE + DISK_CAPACITY * EVENT_SIZE));
 }
 
 // -------------------------------------------------------------------------
@@ -279,7 +280,7 @@ void EventLog::loadFromDisk() {
     _count = loadCount;
     _lastFlushedSeq = _ramSequence; // don't re-flush loaded events
 
-    DBG("EventLog", "Loaded %u disk events (showing last %u in RAM)", _diskCount, loadCount);
+    DBG("EventLog", "Loaded %u disk events (showing last %u in RAM)", _diskCount, (unsigned)loadCount);
 }
 
 // -------------------------------------------------------------------------

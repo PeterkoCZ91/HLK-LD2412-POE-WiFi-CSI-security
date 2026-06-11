@@ -62,7 +62,7 @@ bool MQTTOfflineBuffer::initFile() {
     _head  = 0;
     _count = 0;
     DBG("MQTTBuf", "File created: %u slots (%u bytes)",
-        MQTT_BUF_CAPACITY, MQTT_BUF_HDR_SIZE + MQTT_BUF_CAPACITY * MQTT_BUF_MSG_SIZE);
+        (unsigned)MQTT_BUF_CAPACITY, (unsigned)(MQTT_BUF_HDR_SIZE + MQTT_BUF_CAPACITY * MQTT_BUF_MSG_SIZE));
     return true;
 }
 
@@ -131,7 +131,7 @@ bool MQTTOfflineBuffer::store(const char* topic, const char* payload, bool retai
     f.close();
 
     updateHeader();
-    DBG("MQTTBuf", "Stored [%u/%u]: %s", _count, MQTT_BUF_CAPACITY, topic);
+    DBG("MQTTBuf", "Stored [%u/%u]: %s", _count, (unsigned)MQTT_BUF_CAPACITY, topic);
     return true;
 }
 

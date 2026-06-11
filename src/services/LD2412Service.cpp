@@ -5,6 +5,7 @@
 
 LD2412Service::LD2412Service(int8_t rxPin, int8_t txPin)
     : _rxPin(rxPin), _txPin(txPin) {
+    // cppcheck-suppress useInitializationList ; jednorázová inicializace při startu
     _mutex = xSemaphoreCreateMutex();
 }
 
@@ -330,7 +331,7 @@ void LD2412Service::update() {
         if (_learnActive) {
             if (now - _learnStart > (unsigned long)_learnDuration * 1000) {
                 _learnActive = false;
-                DBG("LEARN", "Done: %lu reflections / %lu total samples", _learnStaticSamples, _learnTotalSamples);
+                DBG("LEARN", "Done: %lu reflections / %lu total samples", (unsigned long)_learnStaticSamples, (unsigned long)_learnTotalSamples);
                 _learnDone = true;  // flag pro main loop → Telegram notifikace
             } else {
                 _learnTotalSamples++;

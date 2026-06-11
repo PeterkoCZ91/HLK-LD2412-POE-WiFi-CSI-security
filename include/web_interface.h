@@ -3,7 +3,7 @@
 
 const char index_html[] PROGMEM = R"rawliteral(
 <!DOCTYPE HTML>
-<html lang="cs">
+<html lang="en">
 <head>
   <title>LD2412 Zabezpečení</title>
   <meta charset="UTF-8">
@@ -392,6 +392,7 @@ const char index_html[] PROGMEM = R"rawliteral(
     });
     document.querySelector('#lang_btn').textContent = LANG === 'cs' ? '🇬🇧 EN' : '🇨🇿 CZ';
     document.title = t('title');
+    document.documentElement.lang = LANG;
   }
   </script>
 </head>

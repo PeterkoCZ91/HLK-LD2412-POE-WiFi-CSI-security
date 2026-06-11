@@ -16,6 +16,8 @@
 #include "services/LogService.h"
 #include "services/EventLog.h"
 #include "services/ConfigSnapshot.h"
+#include "services/AuthLockout.h"
+#include "services/metrics_text.h"
 #ifdef USE_CSI
 #include "services/CSIService.h"
 #endif
@@ -76,17 +78,45 @@ static uint32_t _authFailCount = 0;
 static unsigned long _lastAuthOkMs = 0;
 static unsigned long _lastAuthFailMs = 0;
 
+// T3: per-IP brute-force lockout. Sdílený pro Digest i Basic helper.
+// Handlery běží jen v async_tcp tasku → bez zámků (stejně jako čítače výše).
+static AuthLockout _authLockout;
+
+// 429 brána. Vrací false = request už dostal odpověď, volající musí skončit.
+static bool lockoutGate(AsyncWebServerRequest *request) {
+    uint32_t remainMs = _authLockout.lockedForMs((uint32_t)request->client()->remoteIP(), millis());
+    if (remainMs == 0) return true;
+    AsyncWebServerResponse* r = request->beginResponse(429, "text/plain",
+        "Too many failed login attempts, retry later");
+    r->addHeader("Retry-After", String((remainMs + 999) / 1000));
+    r->addHeader("Connection", "close");
+    request->send(r);
+    return false;
+}
+
+static void noteAuthFailure(AsyncWebServerRequest *request) {
+    _authFailCount++;
+    _lastAuthFailMs = millis();
+    // První request prohlížeče nenese Authorization hlavičku — 401 challenge
+    // je součást normálního Basic/Digest handshaku, ne hádání hesla.
+    // Do lockoutu počítáme jen pokusy, které credentials skutečně poslaly.
+    if (request->hasHeader("Authorization")) {
+        _authLockout.onFailure((uint32_t)request->client()->remoteIP(), millis());
+    }
+}
+
 // Authentication helper implementation
 bool checkAuth(AsyncWebServerRequest *request) {
     if (_deps.config == nullptr) return false;
+    if (!lockoutGate(request)) return false;
     if (!request->authenticate(_deps.config->auth_user, _deps.config->auth_pass)) {
-        _authFailCount++;
-        _lastAuthFailMs = millis();
+        noteAuthFailure(request);
         request->requestAuthentication();
         return false;
     }
     _authOkCount++;
     _lastAuthOkMs = millis();
+    _authLockout.onSuccess((uint32_t)request->client()->remoteIP());
     return true;
 }
 
@@ -97,15 +127,16 @@ bool checkAuth(AsyncWebServerRequest *request) {
 // classic 64 KB OTA stall. Basic is stateless and avoids this.
 bool checkAuthBasic(AsyncWebServerRequest *request) {
     if (_deps.config == nullptr) return false;
+    if (!lockoutGate(request)) return false;
     if (!request->authenticate(_deps.config->auth_user, _deps.config->auth_pass)) {
-        _authFailCount++;
-        _lastAuthFailMs = millis();
+        noteAuthFailure(request);
         // false = Basic challenge (default true would be Digest)
         request->requestAuthentication(nullptr, false);
         return false;
     }
     _authOkCount++;
     _lastAuthOkMs = millis();
+    _authLockout.onSuccess((uint32_t)request->client()->remoteIP());
     return true;
 }
 
@@ -444,6 +475,59 @@ void setupTelemetryRoutes() {
         AsyncResponseStream* response = request->beginResponseStream("application/json");
         serializeJson(respDoc, *response);
         request->send(response);
+    });
+
+    // T1: Prometheus text exposition pro Grafana/Prometheus mimo Home Assistant.
+    // Basic auth (ne Digest) — prometheus scrape_config umí jen basic_auth a
+    // platí stejná AsyncTCP rationale jako u checkAuthBasic.
+    _deps.server->on("/metrics", HTTP_GET, [](AsyncWebServerRequest *request) {
+        if (!checkAuthBasic(request)) return;
+        MetricsSnapshot m;
+        m.fw_version = _deps.fwVersion ? _deps.fwVersion : "";
+        m.uptime_s   = millis() / 1000;
+        m.heap_free  = ESP.getFreeHeap();
+        m.heap_min   = ESP.getMinFreeHeap();
+        m.heap_largest = ESP.getMaxAllocHeap();
+        m.chip_temp_c  = temperatureRead();
+        m.radar_connected    = _deps.radar->isRadarConnected();
+        m.radar_frame_rate   = _deps.radar->getFrameRate();
+        m.radar_error_count  = _deps.radar->getErrorCount();
+        m.radar_health_score = _deps.radar->getHealthScore();
+        m.eth_link_up    = ETH.linkUp();
+        m.eth_speed_mbps = ETH.linkSpeed();
+        m.mqtt_connected = _deps.mqttService->connected();
+        m.mqtt_publish_fail_total = _deps.mqttService->getPublishFailTotal();
+        m.mqtt_reconnect_total    = _deps.mqttService->getReconnectTotal();
+        m.auth_ok_total   = _authOkCount;
+        m.auth_fail_total = _authFailCount;
+        m.alarm_state = (int)_deps.securityMonitor->getAlarmState();
+        m.alarm_armed = _deps.securityMonitor->isArmed();
+        m.fusion_enabled    = _deps.config->fusion_enabled;
+        m.fusion_presence   = _deps.securityMonitor->isFusionPresence();
+        m.fusion_confidence = _deps.securityMonitor->getFusionConfidence();
+        #ifdef USE_CSI
+        if (_deps.csiService != nullptr) {
+            m.csi_present = true;
+            m.csi_active = _deps.csiService->isActive();
+            m.csi_packets_total = _deps.csiService->getPacketCount();
+            m.csi_packet_rate   = _deps.csiService->getPacketRate();
+            m.csi_wifi_rssi_dbm = _deps.csiService->getWifiRSSI();
+            m.csi_effective_threshold = _deps.csiService->getEffectiveThreshold();
+            m.csi_motion = _deps.csiService->getMotionState();
+            m.csi_ml_probability = _deps.csiService->getMlProbability();
+        }
+        #endif
+        // static = BSS, ne stack async_tcp tasku; handlery běží sériově v jednom tasku
+        static char buf[4096];
+        size_t len = buildMetricsText(m, buf, sizeof(buf));
+        if (len == 0) {
+            request->send(500, "text/plain", "metrics buffer overflow");
+            return;
+        }
+        AsyncResponseStream* response2 =
+            request->beginResponseStream("text/plain; version=0.0.4; charset=utf-8");
+        response2->print(buf);
+        request->send(response2);
     });
 }
 
@@ -1229,7 +1313,7 @@ void setupSystemRoutes() {
         }
         if (final) {
             if (!Update.hasError() && Update.end(true)) {
-                DBG("OTA", "Update success: %u B — reboot scheduled", index + len);
+                DBG("OTA", "Update success: %u B — reboot scheduled", (unsigned)(index + len));
                 // OTA success bypasses reboot inhibit so the slot swap completes.
                 g_otaRebootForce.store(true);
                 otaRuntimeEnd(OTA_OWNER_HTTP);
@@ -2334,7 +2418,7 @@ void setupWwwRoutes() {
             }
             if (final) {
                 if (_uploadFile) {
-                    DBG("WWW", "Upload done: %u bytes", index + len);
+                    DBG("WWW", "Upload done: %u bytes", (unsigned)(index + len));
                     _uploadFile.close();
                 } else {
                     DBG("WWW", "Upload final but file not open");

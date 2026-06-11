@@ -90,7 +90,9 @@ static void fillForensicFieldsImpl(AlarmTriggerEvent& evt,
     evt.prev_zone[sizeof(evt.prev_zone) - 1] = '\0';
 }
 
+// cppcheck-suppress uninitMemberVar ; globální singleton (zero-init), membery nastavuje begin()
 SecurityMonitor::SecurityMonitor() {
+    // cppcheck-suppress useInitializationList ; jednorázová inicializace při startu
     _mutex = xSemaphoreCreateMutex();
 }
 

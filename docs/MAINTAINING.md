@@ -32,7 +32,7 @@ After each meaningful firmware change:
    - known issues
    - screenshots
 4. Refresh screenshots in `docs/screenshots/` if the UI changed in a visible way.
-5. Build and verify locally.
+5. Build and verify locally (`pio run -e esp32_poe_csi`, `pio test -e native`, `bash tools/run_cppcheck.sh`).
 6. Push code and docs together so the repo stays self-consistent.
 
 ## What Not To Block On

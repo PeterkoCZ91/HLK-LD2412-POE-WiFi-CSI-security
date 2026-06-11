@@ -15,6 +15,7 @@ static constexpr const char* SNAPSHOT_META = "/cfg_snap_meta.json";
  */
 class ConfigSnapshot {
 public:
+    // cppcheck-suppress uninitMemberVar ; _pathBuf se plní před každým použitím (slotPath)
     ConfigSnapshot() = default;
 
     // Call once LittleFS is mounted

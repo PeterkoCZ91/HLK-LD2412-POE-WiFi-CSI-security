@@ -5,6 +5,7 @@
 #include <ArduinoJson.h>
 #include <ETH.h>
 
+// cppcheck-suppress uninitMemberVar ; globální singleton (zero-init), membery nastavuje begin()
 NotificationService::NotificationService() {}
 
 void NotificationService::begin(Preferences* prefs, const char* deviceName) {
