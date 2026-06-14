@@ -4,6 +4,7 @@
 [![ESP32](https://img.shields.io/badge/MCU-ESP32--WROOM--32-blue?logo=espressif)](https://www.espressif.com/)
 [![License](https://img.shields.io/badge/License-GPL--3.0-blue)](LICENSE)
 [![Version](https://img.shields.io/badge/Version-5.0.7--poe--wifi-blue)]()
+[![Discussions](https://img.shields.io/badge/GitHub-Discussions-purple?logo=github)](https://github.com/PeterkoCZ91/HLK-LD2412-POE-WiFi-CSI-security/discussions)
 
 **Dual-sensor intrusion detection system** — ESP32 + HLK-LD2412 24 GHz mmWave radar + **WiFi CSI (Channel State Information) passive motion detection** over **wired Ethernet with Power over Ethernet**. Full alarm state machine, zone management, Home Assistant integration, Telegram bot, and a dark-mode web dashboard. No cloud required.
 
@@ -831,6 +832,10 @@ Contributions are welcome! Please:
 5. Open a Pull Request
 
 For bug reports, please include: firmware version, serial log output, and steps to reproduce.
+
+### Community
+
+Have a question, an idea, or want to show off your deployment? Join the conversation in [**GitHub Discussions**](https://github.com/PeterkoCZ91/HLK-LD2412-POE-WiFi-CSI-security/discussions) — use **Q&A** for help with builds and configuration, **Ideas** for feature requests, and **Show and tell** to share your setup. Please keep [Issues](https://github.com/PeterkoCZ91/HLK-LD2412-POE-WiFi-CSI-security/issues) for confirmed bugs.
 
 ---
 
