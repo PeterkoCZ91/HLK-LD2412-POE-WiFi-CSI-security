@@ -62,6 +62,7 @@ public:
     // Runtime stats
     float getPacketRate() const { return _packetRate; }
     int   getWifiRSSI() const;
+    uint8_t getLastDisconnectReason() const { return _lastDisconnectReason; }
     String getWifiSSID() const;
     bool  isIdleInitialized() const { return _idleInitialized; }
     bool  isTrafficGenRunning() const { return _trafficGenRunning.load(); }
@@ -299,6 +300,7 @@ private:
     uint32_t _totalPackets = 0;
     uint32_t _windowPackets = 0;
     volatile bool _htLtfSeen = false;  // csi10c: set in _processCSI on first valid HT LTF frame
+    volatile uint8_t _lastDisconnectReason = 0;  // DIAG: last WiFi STA disconnect reason (remote diagnostics)
     uint32_t _lastPublishMs = 0;
     float    _packetRate = 0.0f;
     bool     _reconnectRequested = false;

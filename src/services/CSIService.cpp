@@ -97,6 +97,12 @@ void CSIService::_initWiFiForCSI(const char* ssid, const char* password) {
     // Initialize internal WiFi structures for CSI (required even when false)
     esp_wifi_set_promiscuous(false);
 
+    // DIAG: record the last STA disconnect reason for remote diagnostics. Read-only,
+    // does not influence connect logic. Registered once (this init runs once at startup).
+    WiFi.onEvent([this](WiFiEvent_t, WiFiEventInfo_t info){
+        _lastDisconnectReason = info.wifi_sta_disconnected.reason;
+    }, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
+
     WiFi.begin(ssid, password);
     Serial.printf("[CSI] Connecting WiFi to %s (HT20/11n) for CSI capture...\n", ssid);
 

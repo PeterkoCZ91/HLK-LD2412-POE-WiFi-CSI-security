@@ -1230,6 +1230,10 @@ void setupSystemRoutes() {
             if (!request->authenticate(_deps.config->auth_user, _deps.config->auth_pass)) {
                 DBG("OTA", "Upload auth failed");
                 request->requestAuthentication(nullptr, false);  // false = Basic
+                // Fix A: close the connection immediately so an unauthenticated
+                // client cannot stream the whole multi-MB image before the 401
+                // flushes — that drain is the 180s upload hang seen on lab2.
+                request->client()->close();
                 return;
             }
             if (!otaRuntimeTryBegin(OTA_OWNER_HTTP, 45000)) {
@@ -2530,6 +2534,10 @@ void setupCSIRoutes() {
             doc["pps"]         = _deps.csiService->getPacketRate();
             doc["wifi_rssi"]   = _deps.csiService->getWifiRSSI();
             doc["wifi_ssid"]   = _deps.csiService->getWifiSSID();
+            doc["wifi_status"]     = (int)WiFi.status();                            // DIAG: raw WL_* (3=WL_CONNECTED)
+            doc["wifi_last_reason"]= _deps.csiService->getLastDisconnectReason();   // DIAG: STA disconnect reason code
+            doc["wifi_bssid"]      = WiFi.BSSIDstr();                               // DIAG
+            doc["wifi_channel"]    = (int)WiFi.channel();                           // DIAG
             doc["idle_ready"]  = _deps.csiService->isIdleInitialized();
             doc["ht_ltf_seen"] = _deps.csiService->isHtLtfSeen();
             doc["traffic_gen"]  = _deps.csiService->isTrafficGenRunning();
