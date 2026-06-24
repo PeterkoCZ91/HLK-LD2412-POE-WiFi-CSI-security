@@ -1,0 +1,9 @@
+# Name,   Type, SubType, Offset,   Size,    Flags
+# Partition table for 8MB flash (ESP32-D0WD-V3 board variant — lab unit)
+# app0/app1: 3MB each — OTA safe (app ~1.6MB, plenty headroom)
+nvs,      data, nvs,     0x9000,   0x5000,
+otadata,  data, ota,     0xe000,   0x2000,
+app0,     app,  ota_0,   0x10000,  0x300000,
+app1,     app,  ota_1,   0x310000, 0x300000,
+spiffs,   data, spiffs,  0x610000, 0x1E0000,
+coredump, data, coredump,0x7F0000, 0x10000,
