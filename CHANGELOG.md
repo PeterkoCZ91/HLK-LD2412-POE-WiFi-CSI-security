@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.0.8-poe-wifi] - 2026-06-24
+
+OTA reliability + config-import fixes. Validated end-to-end on a remote, Ethernet-only node.
+
+### Fixed
+
+- **OTA / config-write "empty reply" (root cause)** — in the pinned ESPAsyncWebServer fork, authenticated body-POST handlers ran the auth check *after* the whole request body was streamed. Digest's `401`→retry then lost the buffered body (and its nonce is fragile under LAN8720A write-buffer backpressure), producing empty replies / 180 s upload hangs. `/api/update`, `/api/update/pull` and `/api/config/import` now authenticate with stateless **Basic** (sent preemptively, so the body survives), and the upload callback closes the connection on auth failure instead of letting a multi-MB image drain first. Pull OTA verified end-to-end over the network.
+- **`/api/config/import` silently dropped every string field** — ArduinoJson 7.4.3 `JsonVariant::is<String>()` returns false for JSON strings, so all string keys (`mqtt_*`, `hostname`, `auth_*`, `csi_ssid`/`csi_pass`, `tg_*`, `static_*`, `sched_*`, `zones`) were skipped while numeric fields imported fine. All 19 guards switched to the canonical `is<const char*>()`.
+- **No-response auth paths** — `checkAuth`/`checkAuthBasic` now send `503` instead of a bare `return` when config is unavailable, so a failure can no longer masquerade as a dropped connection.
+
+### Added
+
+- **Out-of-coverage WiFi diagnostics over API** — `/api/csi` always exposes `wifi_status`, `wifi_last_reason`, `wifi_reconnects`, `wifi_rssi`, `wifi_ssid`/`bssid`/`channel`/`ip` (no longer gated on CSI being active). A node that drifts out of WiFi range stays fully observable over Ethernet — no serial needed. Each background reconnect attempt is also logged to serial. Adds the STA disconnect reason code for remote diagnosis.
+- **8 MB flash board variant** — `[env:esp32_poe_csi_8mb]` + `partitions_8mb.csv` for ESP32 boards shipped with 8 MB flash (the 16 MB layout bootloops on them: `spi_flash: Detected size(8192k) smaller than header(16384k)`).
+
 ## [5.0.7-poe-wifi] - 2026-06-11
 
 Quick-wins release — IMPROVEMENTS T1/T2/T3/T4. First release with automated unit tests.

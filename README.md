@@ -11,6 +11,8 @@
 WiFi CSI detection algorithms based on [ESPectre](https://github.com/francescopace/espectre) by Francesco Pace (GPLv3).
 
 > [!TIP]
+> **v5.0.8** — OTA & config reliability: fixes the "empty reply" / 180 s hang on authenticated OTA and config-import (auth-after-body in the AsyncWebServer fork → stateless preemptive Basic + close-on-auth-fail), config-import now actually applies string fields (ArduinoJson `is<String>()` bug), out-of-coverage WiFi diagnostics over `/api/csi` (link state pullable over Ethernet, no serial needed), and an 8 MB flash board variant. Pull OTA validated end-to-end on a remote node. See [CHANGELOG](CHANGELOG.md).
+>
 > **v5.0.7** — quick wins: new [`/metrics` Prometheus endpoint](#prometheus-metrics) for Grafana dashboards, per-IP brute-force lockout on web auth (`429` + exponential backoff), first automated unit tests (`pio test -e native`) and cppcheck static analysis in CI. See [CHANGELOG](CHANGELOG.md).
 >
 > **v5.0.6** — OTA field-service hardening: guarded Pull OTA with **enforced** MD5 integrity (fixes a call-order bug where the hash was never actually verified), redirects no longer followed (SSRF/token-leak guard), shared OTA runtime owner/watchdog cleanup, espota maintenance window status, and a safe deploy helper with target identity checks. See [docs/OTA_OPERATIONS.md](docs/OTA_OPERATIONS.md) before flashing unattended devices.
