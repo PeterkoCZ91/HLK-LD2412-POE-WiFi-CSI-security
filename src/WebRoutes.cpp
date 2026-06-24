@@ -2535,6 +2535,20 @@ void setupCSIRoutes() {
         doc["window"]      = csiActive ? _deps.csiService->getWindowSize() : _deps.config->csi_window;
         doc["publish_ms"]  = csiActive ? _deps.csiService->getPublishInterval() : _deps.config->csi_publish_ms;
 
+        // WiFi link diagnostics — ALWAYS emitted (NOT gated on csiActive) so the
+        // out-of-coverage state is pullable over Ethernet via API, no serial/USB.
+        // The device stays reachable on Ethernet even when the CSI WiFi STA drops.
+        if (_deps.csiService) {
+            doc["wifi_status"]     = (int)WiFi.status();                            // raw WL_* (3=CONNECTED, 6=DISCONNECTED)
+            doc["wifi_last_reason"]= _deps.csiService->getLastDisconnectReason();   // 200=beacon timeout/out-of-range, 201=no AP, 15/205=bad PSK
+            doc["wifi_reconnects"] = _deps.csiService->getReconnectAttempts();      // background reconnect attempts (climbs while out of coverage)
+            doc["wifi_rssi"]       = _deps.csiService->getWifiRSSI();               // 0 when not associated
+            doc["wifi_ssid"]       = _deps.csiService->getWifiSSID();
+            doc["wifi_bssid"]      = WiFi.BSSIDstr();
+            doc["wifi_channel"]    = (int)WiFi.channel();
+            doc["wifi_ip"]         = WiFi.localIP().toString();
+        }
+
         // Live values (only meaningful if active)
         if (csiActive) {
             doc["active"]      = true;
@@ -2549,19 +2563,12 @@ void setupCSIRoutes() {
             doc["variance"]    = _deps.csiService->getVariance();
             doc["packets"]     = (uint32_t)_deps.csiService->getPacketCount();
             doc["pps"]         = _deps.csiService->getPacketRate();
-            doc["wifi_rssi"]   = _deps.csiService->getWifiRSSI();
-            doc["wifi_ssid"]   = _deps.csiService->getWifiSSID();
-            doc["wifi_status"]     = (int)WiFi.status();                            // DIAG: raw WL_* (3=WL_CONNECTED)
-            doc["wifi_last_reason"]= _deps.csiService->getLastDisconnectReason();   // DIAG: STA disconnect reason code
-            doc["wifi_bssid"]      = WiFi.BSSIDstr();                               // DIAG
-            doc["wifi_channel"]    = (int)WiFi.channel();                           // DIAG
             doc["idle_ready"]  = _deps.csiService->isIdleInitialized();
             doc["ht_ltf_seen"] = _deps.csiService->isHtLtfSeen();
             doc["traffic_gen"]  = _deps.csiService->isTrafficGenRunning();
             doc["traffic_port"] = _deps.csiService->getTrafficPort();
             doc["traffic_icmp"] = _deps.csiService->getTrafficICMP();
             doc["traffic_pps"]  = _deps.csiService->getTrafficRate();
-            doc["wifi_ip"]      = WiFi.localIP().toString();
             doc["calibrating"] = _deps.csiService->isCalibrating();
             doc["calib_pct"]   = _deps.csiService->getCalibrationProgress();
             doc["learning_active"] = _deps.csiService->isSiteLearning();

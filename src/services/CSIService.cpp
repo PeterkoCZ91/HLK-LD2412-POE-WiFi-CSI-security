@@ -1062,6 +1062,15 @@ void CSIService::update() {
 
         static uint32_t lastReconnect = 0;
         if (millis() - lastReconnect > 10000) {
+            _reconnectAttempts++;
+            // Out-of-coverage visibility: previously this loop was silent and the
+            // 30s diag below was skipped by the early return, so serial debug went
+            // quiet exactly when WiFi dropped. Log each attempt with the raw WL_*
+            // status and last disconnect reason (200=BEACON_TIMEOUT/out-of-range,
+            // 201=NO_AP_FOUND, 15/205=bad PSK, 2/202=auth).
+            Serial.printf("[CSI] WiFi DOWN (status=%d last_reason=%u) — reconnect attempt #%lu\n",
+                          (int)WiFi.status(), (unsigned)_lastDisconnectReason,
+                          (unsigned long)_reconnectAttempts);
             WiFi.reconnect();
             lastReconnect = millis();
         }
