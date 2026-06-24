@@ -8,19 +8,15 @@
 #include <freertos/semphr.h>
 #include "NotificationService.h"
 #include "EventLog.h"
+#include "AlarmFSM.h"   // T6: pure alarm state machine (AlarmState/ArmResult/TickEvent/MotionEvent)
 
 // Forward declarations
 class MQTTService;
 class TelegramService;
 class CSIService;
 
-enum class AlarmState {
-    DISARMED,
-    ARMING,    // Exit delay active
-    ARMED,
-    PENDING,   // Entry delay active
-    TRIGGERED
-};
+// AlarmState (DISARMED/ARMING/ARMED/PENDING/TRIGGERED) is provided by AlarmFSM.h —
+// SecurityMonitor now delegates all state transitions to an internal AlarmFSM.
 
 // rc2: Pre-trigger ring buffer sample (snapshot of radar+fusion state)
 struct PreTriggerSample {
@@ -200,6 +196,12 @@ private:
     void triggerAlert(NotificationType type, const String& message, const String& details = "", int16_t explicitDist = -1);
     void activateSiren();
     void deactivateSiren();
+    // T6: copy live config (delays/timeout/autoRearm/debounce) into _fsm before each FSM call.
+    void syncFsmConfig();
+    // T6: advance FSM timers and run side-effects for any transition. Called from both
+    // update() (radar-independent, ~500 ms) and processRadarData() (responsive, 20 Hz) so
+    // exit-delay / entry-expiry / trigger-timeout fire even when the radar is silent/absent.
+    void applyTick(unsigned long now);
 
     SemaphoreHandle_t _mutex = nullptr;
     NotificationService* _notifService = nullptr;
@@ -210,18 +212,19 @@ private:
     char _deviceLabel[40] = "";
 
     // Armed/Disarmed state
-    AlarmState _alarmState = AlarmState::DISARMED;
+    AlarmFSM _fsm;                                   // T6: owns state + timers + debounce
+    AlarmState _alarmState = AlarmState::DISARMED;   // mirror of _fsm.state() (read sites unchanged)
     bool _homeMode = false;  // true = armed_home, false = armed_away
+    // _entryDelay/_exitDelay/_triggerTimeout/_autoRearm/_alarmDebounceFrames are the
+    // config source — copied into _fsm via syncFsmConfig() before each transition call.
+    // The matching start-timestamps (exit/entry/trigger) now live inside AlarmFSM.
     unsigned long _entryDelay = 30000;
     unsigned long _exitDelay = 30000;
-    unsigned long _exitDelayStart = 0;
-    unsigned long _entryDelayStart = 0;
-    unsigned long _triggerStartTime = 0;
     unsigned long _triggerTimeout = 900000;  // 15 min default
     bool _autoRearm = true;
     uint8_t _alarmEnergyThreshold = 15;  // Min energy to trigger alarm
     uint8_t _alarmDebounceFrames = 3;    // FIX #4: consecutive frames required before ARMED→PENDING/TRIGGERED
-    uint8_t _armedDebounceCount = 0;     // Current consecutive qualifying frame count
+    uint8_t _armedDebounceCount = 0;     // mirror of _fsm.debounceCount() for diagnostics
 
     // Disarm reminder
     bool _disarmReminderEnabled = false; // Disabled - fusion handles reminders

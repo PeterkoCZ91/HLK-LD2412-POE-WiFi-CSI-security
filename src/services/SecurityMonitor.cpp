@@ -112,6 +112,64 @@ void SecurityMonitor::begin(NotificationService* notifService, MQTTService* mqtt
     DBG("SecMon", "Security Monitor initialized (label: %s)", _deviceLabel);
 }
 
+// T6: push live config into the FSM right before every transition call, so the
+// existing setEntryDelay()/setExitDelay()/setTriggerTimeout()/setAutoRearm()/
+// setAlarmDebounceFrames() API keeps working unchanged.
+void SecurityMonitor::syncFsmConfig() {
+    _fsm.entryDelayMs     = _entryDelay;
+    _fsm.exitDelayMs      = _exitDelay;
+    _fsm.triggerTimeoutMs = _triggerTimeout;
+    _fsm.autoRearm        = _autoRearm;
+    _fsm.debounceFrames   = _alarmDebounceFrames;
+}
+
+// T6: advance FSM timers and run the side-effects for whatever transition fired.
+// Mutually-exclusive states → at most one transition per call. Caller MUST already
+// hold _mutex (matches the pre-refactor update()/processRadarData() side-effects).
+void SecurityMonitor::applyTick(unsigned long now) {
+    syncFsmConfig();
+    TickEvent ev = _fsm.tick(now);
+    _alarmState = _fsm.state();
+    switch (ev) {
+        case TickEvent::EXIT_DELAY_DONE:
+            DBG("SecMon", "ARMED (exit delay expired)");
+            if (_lastDistance > 0) {
+                triggerAlert(NotificationType::ALARM_STATE_CHANGE, "🔒 System ARMED", "⚠️ Presence still detected at activation! Distance: " + String(_lastDistance) + " cm");
+            } else {
+                triggerAlert(NotificationType::ALARM_STATE_CHANGE, "🔒 System ARMED", "Exit delay completed.");
+            }
+            break;
+        case TickEvent::AUTO_REARMED:
+            deactivateSiren();
+            clearApproachLog(); // FIX #7: Clear stale approach history from previous incident
+            DBG("SecMon", "TRIGGERED timeout — auto-rearmed to ARMED");
+            triggerAlert(NotificationType::ALARM_STATE_CHANGE, "🔕 Alarm auto-silenced", "Timeout " + String(_triggerTimeout / 60000) + " min. System re-ARMED.");
+            break;
+        case TickEvent::AUTO_DISARMED:
+            deactivateSiren();
+            DBG("SecMon", "TRIGGERED timeout — disarmed");
+            triggerAlert(NotificationType::ALARM_STATE_CHANGE, "🔕 Alarm auto-silenced", "Timeout " + String(_triggerTimeout / 60000) + " min. System DISARMED.");
+            break;
+        case TickEvent::ENTRY_EXPIRED_TRIGGERED:
+            // Entry delay expired. Now radar-independent: fires from update() even if no
+            // radar frames arrive. Forensic fields refreshed from last-known fusion state;
+            // zone/distance/energy carried over from the PENDING event (unchanged).
+            strncpy(_pendingEvent.reason, "entry_delay_expired", sizeof(_pendingEvent.reason) - 1);
+            _pendingEvent.uptime_s = now / 1000; fillISOTime(_pendingEvent.iso_time, sizeof(_pendingEvent.iso_time));
+            fillForensicFieldsImpl(_pendingEvent, getFusionSourceStr(), _fusionConfidence, _isStaticFiltered,
+                                   _pendingEvent.zone, _prevZoneName.c_str());
+            snapshotRingTo(_pendingEvent, now);
+            enqueueAlarmEvent();
+            DBG("SecMon", "ALARM TRIGGERED!");
+            triggerAlert(NotificationType::ALARM_TRIGGERED, "🚨 ALARM TRIGGERED!", "Entry delay expired!\n" + formatApproachLog(), _pendingEvent.distance_cm);
+            activateSiren();
+            break;
+        case TickEvent::NONE:
+        default:
+            break;
+    }
+}
+
 void SecurityMonitor::update() {
     // 500 ms — critical state transitions (PENDING→TRIGGERED, ARMING→ARMED)
     // must not be silently skipped due to mutex contention. The previous
@@ -129,31 +187,10 @@ void SecurityMonitor::update() {
         checkSystemHealth();
     }
 
-    // Exit delay: ARMING -> ARMED (A4: presence warning at transition)
-    if (_alarmState == AlarmState::ARMING && now - _exitDelayStart >= _exitDelay) {
-        _alarmState = AlarmState::ARMED;
-        DBG("SecMon", "ARMED (exit delay expired)");
-        if (_lastDistance > 0) {
-            triggerAlert(NotificationType::ALARM_STATE_CHANGE, "🔒 System ARMED", "⚠️ Presence still detected at activation! Distance: " + String(_lastDistance) + " cm");
-        } else {
-            triggerAlert(NotificationType::ALARM_STATE_CHANGE, "🔒 System ARMED", "Exit delay completed.");
-        }
-    }
-
-    // A1: TRIGGERED timeout — auto-silence after configurable period
-    if (_alarmState == AlarmState::TRIGGERED && _triggerTimeout > 0 && now - _triggerStartTime >= _triggerTimeout) {
-        deactivateSiren();
-        if (_autoRearm) {
-            _alarmState = AlarmState::ARMED;
-            clearApproachLog(); // FIX #7: Clear stale approach history from previous incident
-            DBG("SecMon", "TRIGGERED timeout — auto-rearmed to ARMED");
-            triggerAlert(NotificationType::ALARM_STATE_CHANGE, "🔕 Alarm auto-silenced", "Timeout " + String(_triggerTimeout / 60000) + " min. System re-ARMED.");
-        } else {
-            _alarmState = AlarmState::DISARMED;
-            DBG("SecMon", "TRIGGERED timeout — disarmed");
-            triggerAlert(NotificationType::ALARM_STATE_CHANGE, "🔕 Alarm auto-silenced", "Timeout " + String(_triggerTimeout / 60000) + " min. System DISARMED.");
-        }
-    }
+    // Exit delay (ARMING→ARMED), trigger timeout (TRIGGERED→ARMED/DISARMED) and now
+    // entry-delay expiry (PENDING→TRIGGERED) all advance here via the FSM — independent
+    // of the radar subsystem, so the alarm keeps working even if the radar is silent.
+    applyTick(now);
 
     // Disarm reminder: presence detected while DISARMED
     if (_alarmState == AlarmState::DISARMED && _disarmReminderEnabled && _lastPresenceWhileDisarmed > 0) {
@@ -171,14 +208,16 @@ void SecurityMonitor::setArmed(bool armed, bool immediate, bool homeMode) {
     if (_mutex && xSemaphoreTake(_mutex, pdMS_TO_TICKS(500)) != pdTRUE) return;
     unsigned long now = millis();
     if (armed) {
+        syncFsmConfig();
+        ArmResult r = _fsm.arm(immediate, now);
         // FIX #1: Guard against re-arming while active — reject if PENDING or TRIGGERED
-        if (_alarmState == AlarmState::PENDING || _alarmState == AlarmState::TRIGGERED) {
+        if (r == ArmResult::REJECTED) {
             DBG("SecMon", "setArmed(true) REJECTED — state is %s", getAlarmStateStr());
             if (_mutex) xSemaphoreGive(_mutex);
             return;
         }
         // Already arming/armed — idempotent, but allow upgrade/flip of homeMode flag
-        if (_alarmState == AlarmState::ARMING || _alarmState == AlarmState::ARMED) {
+        if (r == ArmResult::IDEMPOTENT) {
             if (_homeMode != homeMode) {
                 _homeMode = homeMode;
                 DBG("SecMon", "setArmed(true) flip homeMode=%d (state=%s)", (int)homeMode, getAlarmStateStr());
@@ -189,19 +228,18 @@ void SecurityMonitor::setArmed(bool armed, bool immediate, bool homeMode) {
             if (_mutex) xSemaphoreGive(_mutex);
             return;
         }
+        // r == ARMING_STARTED or ARMED_IMMEDIATE — FSM has set state + exit-delay timer.
+        _alarmState = _fsm.state();
         _homeMode = homeMode;
-        if (immediate) {
-            _alarmState = AlarmState::ARMED;
+        if (r == ArmResult::ARMED_IMMEDIATE) {
             DBG("SecMon", "ARMED (immediate, home=%d)", (int)homeMode);
             triggerAlert(NotificationType::ALARM_STATE_CHANGE, "🔒 System ARMED", homeMode ? "Immediate activation (home)." : "Immediate activation.");
         } else {
-            _alarmState = AlarmState::ARMING;
-            _exitDelayStart = now;
             DBG("SecMon", "ARMING (exit delay %lu s, home=%d)", _exitDelay / 1000, (int)homeMode);
             triggerAlert(NotificationType::ALARM_STATE_CHANGE, "⏳ ARMING...", "Exit delay: " + String(_exitDelay / 1000) + "s" + (homeMode ? " (home)" : ""));
         }
         clearApproachLog();
-        _armedDebounceCount = 0;
+        _armedDebounceCount = 0;  // FSM owns debounce; kept zeroed for parity
         _lastPresenceWhileDisarmed = 0;
         _presenceWhileDisarmedStart = 0;
         _lastDisarmReminder = 0;
@@ -212,18 +250,16 @@ void SecurityMonitor::setArmed(bool armed, bool immediate, bool homeMode) {
         _isStaticFiltered = false;
         _staticFilterMoveFrames = 0;
     } else {
-        AlarmState prev = _alarmState;
         // FIX #1: Always deactivate siren on disarm (covers TRIGGERED + any corrupted state)
         deactivateSiren();
-        _alarmState = AlarmState::DISARMED;
+        bool changed = _fsm.disarm(now);  // resets FSM state + all timers
+        _alarmState = _fsm.state();
         _homeMode = false;
-        _entryDelayStart = 0;
-        _exitDelayStart = 0;
         _lastPresenceWhileDisarmed = 0;
         _presenceWhileDisarmedStart = 0;
         _lastDisarmReminder = 0;
         DBG("SecMon", "DISARMED");
-        if (prev != AlarmState::DISARMED) {
+        if (changed) {
             triggerAlert(NotificationType::ALARM_STATE_CHANGE, "🔓 System DISARMED", "");
             strncpy(_pendingEvent.reason, "disarmed", sizeof(_pendingEvent.reason) - 1);
             strncpy(_pendingEvent.zone, _currentZoneName.c_str(), sizeof(_pendingEvent.zone) - 1);
@@ -648,111 +684,71 @@ void SecurityMonitor::processRadarData(uint16_t distance, uint8_t move_energy, u
     bool radarQualifies = (distance > 0 && !_isStaticFiltered &&
         (move_energy >= _alarmEnergyThreshold || static_energy >= _alarmEnergyThreshold));
     bool csiOnlyQualifies = (!radarQualifies && _fusionPresence && _fusionSource == 2);
-    bool armedQualifies = (_alarmState == AlarmState::ARMED &&
+    bool armedQualifies = (_fsm.state() == AlarmState::ARMED &&
         _fusionPresence && (radarQualifies || csiOnlyQualifies));
 
-    if (armedQualifies) {
-        _armedDebounceCount++;
-    } else if (_alarmState == AlarmState::ARMED) {
-        _armedDebounceCount = 0;
-    }
+    // Resolve per-frame behavior (0=entry delay, 1=immediate, 2=ignore, 3=static-zone).
+    // Computed every frame but only consumed when the FSM debounce actually fires.
+    uint8_t behavior = 0;
+    if (_currentZoneIndex >= 0 && (size_t)_currentZoneIndex < _zones.size()) {
+        behavior = _zones[_currentZoneIndex].alarm_behavior;
 
-    if (armedQualifies && _armedDebounceCount >= _alarmDebounceFrames) {
-        _armedDebounceCount = 0; // Reset for next detection
-
-        uint8_t behavior = 0; // default = entry delay
-        if (_currentZoneIndex >= 0 && (size_t)_currentZoneIndex < _zones.size()) {
-            behavior = _zones[_currentZoneIndex].alarm_behavior;
-
-            // Entry path validation: if zone requires a specific previous zone,
-            // and the intruder came from a different path → force immediate trigger
-            const char* reqPrev = _zones[_currentZoneIndex].valid_prev_zone;
-            if (reqPrev[0] != '\0' && behavior == 0) {
-                if (_prevZoneName != String(reqPrev)) {
-                    DBG("SecMon", "INVALID PATH: zone '%s' requires prev '%s' but got '%s' → immediate",
-                        _currentZoneName.c_str(), reqPrev, _prevZoneName.c_str());
-                    behavior = 1; // Override to immediate trigger
-                }
+        // Entry path validation: if zone requires a specific previous zone,
+        // and the intruder came from a different path → force immediate trigger
+        const char* reqPrev = _zones[_currentZoneIndex].valid_prev_zone;
+        if (reqPrev[0] != '\0' && behavior == 0) {
+            if (_prevZoneName != String(reqPrev)) {
+                DBG("SecMon", "INVALID PATH: zone '%s' requires prev '%s' but got '%s' → immediate",
+                    _currentZoneName.c_str(), reqPrev, _prevZoneName.c_str());
+                behavior = 1; // Override to immediate trigger
             }
         }
+    }
+    // CSI-only detection: no zone info, always use entry delay
+    if (csiOnlyQualifies) behavior = 0;
 
-        // CSI-only detection: no zone info, always use entry delay
-        if (csiOnlyQualifies) {
-            behavior = 0;
-            DBG("SecMon", "CSI-only alarm trigger (conf=%.2f, no radar distance)", _fusionConfidence);
-        }
+    // FSM owns debounce (N consecutive qualifying frames) + the ARMED→PENDING/TRIGGERED
+    // transition. We hang the existing side-effects (event, alert, siren) off the result.
+    syncFsmConfig();
+    MotionEvent mev = _fsm.reportMotion(armedQualifies, behavior, now);
+    _armedDebounceCount = _fsm.debounceCount();  // mirror for diagnostics
+    _alarmState = _fsm.state();
 
+    if (mev == MotionEvent::PENDING_STARTED || mev == MotionEvent::TRIGGERED_IMMEDIATE) {
         const char* motionType = csiOnlyQualifies ? "csi" : motionTypeStr(move_energy, static_energy);
         const char* zoneName = csiOnlyQualifies ? "csi_only" : _currentZoneName.c_str();
         uint16_t evtDistance = csiOnlyQualifies ? 0 : distance;
+        if (csiOnlyQualifies) DBG("SecMon", "CSI-only alarm trigger (conf=%.2f, no radar distance)", _fusionConfidence);
 
-        if (behavior == 2) {
-            DBG("SecMon", "Detection in ignore-zone '%s', skipping alarm", _currentZoneName.c_str());
-        } else if (behavior == 3) {
-            // ignore_static_only: fixed reflectors (e.g. metal ladder) generate only static without movement
-            if (move_energy < _alarmEnergyThreshold) {
-                // _isStaticFiltered already set above
-                DBG("SecMon", "Static-only in zone '%s' (move=%d < thr=%d), skip",
-                    _currentZoneName.c_str(), move_energy, _alarmEnergyThreshold);
-            } else {
-                // Movement present → entry delay (real intruder)
-                _alarmState = AlarmState::PENDING;
-                _entryDelayStart = now;
-                strncpy(_pendingEvent.reason, "entry_delay", sizeof(_pendingEvent.reason) - 1);
-                strncpy(_pendingEvent.zone, zoneName, sizeof(_pendingEvent.zone) - 1);
-                _pendingEvent.distance_cm = evtDistance; _pendingEvent.energy_mov = move_energy; _pendingEvent.energy_stat = static_energy;
-                strncpy(_pendingEvent.motion_type, motionType, sizeof(_pendingEvent.motion_type) - 1);
-                _pendingEvent.uptime_s = now / 1000; fillISOTime(_pendingEvent.iso_time, sizeof(_pendingEvent.iso_time));
-                fillForensicFieldsImpl(_pendingEvent, getFusionSourceStr(), _fusionConfidence, _isStaticFiltered, zoneName, _prevZoneName.c_str());
-                snapshotRingTo(_pendingEvent, now);
-                enqueueAlarmEvent();
-                DBG("SecMon", "PENDING — move in static-filter zone '%s'", _currentZoneName.c_str());
-                triggerAlert(NotificationType::ENTRY_DETECTED, "⏳ ENTRY DETECTED!",
-                    "Entry delay: " + String(_entryDelay / 1000) + "s\nZone: " + _currentZoneName + "\n" + formatApproachLog(), distance);
-            }
-        } else if (behavior == 1) {
-            _alarmState = AlarmState::TRIGGERED;
-            _triggerStartTime = now;
-            strncpy(_pendingEvent.reason, "immediate", sizeof(_pendingEvent.reason) - 1);
-            strncpy(_pendingEvent.zone, zoneName, sizeof(_pendingEvent.zone) - 1);
-            _pendingEvent.distance_cm = evtDistance; _pendingEvent.energy_mov = move_energy; _pendingEvent.energy_stat = static_energy;
-            strncpy(_pendingEvent.motion_type, motionType, sizeof(_pendingEvent.motion_type) - 1);
-            _pendingEvent.uptime_s = now / 1000; fillISOTime(_pendingEvent.iso_time, sizeof(_pendingEvent.iso_time));
-            fillForensicFieldsImpl(_pendingEvent, getFusionSourceStr(), _fusionConfidence, _isStaticFiltered, zoneName, _prevZoneName.c_str());
-            snapshotRingTo(_pendingEvent, now);
-            enqueueAlarmEvent();
+        const bool immediate = (mev == MotionEvent::TRIGGERED_IMMEDIATE);
+        strncpy(_pendingEvent.reason, immediate ? "immediate" : "entry_delay", sizeof(_pendingEvent.reason) - 1);
+        strncpy(_pendingEvent.zone, zoneName, sizeof(_pendingEvent.zone) - 1);
+        _pendingEvent.distance_cm = evtDistance; _pendingEvent.energy_mov = move_energy; _pendingEvent.energy_stat = static_energy;
+        strncpy(_pendingEvent.motion_type, motionType, sizeof(_pendingEvent.motion_type) - 1);
+        _pendingEvent.uptime_s = now / 1000; fillISOTime(_pendingEvent.iso_time, sizeof(_pendingEvent.iso_time));
+        fillForensicFieldsImpl(_pendingEvent, getFusionSourceStr(), _fusionConfidence, _isStaticFiltered, zoneName, _prevZoneName.c_str());
+        snapshotRingTo(_pendingEvent, now);
+        enqueueAlarmEvent();
+
+        if (immediate) {
             DBG("SecMon", "IMMEDIATE TRIGGER in zone '%s'!", zoneName);
             triggerAlert(NotificationType::ALARM_TRIGGERED, "🚨 ALARM TRIGGERED!", "Immediate trigger in zone: " + String(zoneName) + "\n" + formatApproachLog(), evtDistance);
             activateSiren();
+        } else if (behavior == 3) {
+            DBG("SecMon", "PENDING — move in static-filter zone '%s'", _currentZoneName.c_str());
+            triggerAlert(NotificationType::ENTRY_DETECTED, "⏳ ENTRY DETECTED!",
+                "Entry delay: " + String(_entryDelay / 1000) + "s\nZone: " + _currentZoneName + "\n" + formatApproachLog(), distance);
         } else {
-            _alarmState = AlarmState::PENDING;
-            _entryDelayStart = now;
-            strncpy(_pendingEvent.reason, "entry_delay", sizeof(_pendingEvent.reason) - 1);
-            strncpy(_pendingEvent.zone, zoneName, sizeof(_pendingEvent.zone) - 1);
-            _pendingEvent.distance_cm = evtDistance; _pendingEvent.energy_mov = move_energy; _pendingEvent.energy_stat = static_energy;
-            strncpy(_pendingEvent.motion_type, motionType, sizeof(_pendingEvent.motion_type) - 1);
-            _pendingEvent.uptime_s = now / 1000; fillISOTime(_pendingEvent.iso_time, sizeof(_pendingEvent.iso_time));
-            fillForensicFieldsImpl(_pendingEvent, getFusionSourceStr(), _fusionConfidence, _isStaticFiltered, zoneName, _prevZoneName.c_str());
-            snapshotRingTo(_pendingEvent, now);
-            enqueueAlarmEvent();
             DBG("SecMon", "PENDING (entry delay %lu s, source=%s)", _entryDelay / 1000, getFusionSourceStr());
             triggerAlert(NotificationType::ENTRY_DETECTED, "⏳ ENTRY DETECTED!", "Entry delay: " + String(_entryDelay / 1000) + "s\nSource: " + String(getFusionSourceStr()) + "\n" + formatApproachLog() + "Use /disarm to deactivate.", evtDistance);
         }
+    } else if (mev == MotionEvent::IGNORED) {
+        DBG("SecMon", "Detection in ignore-zone '%s', skipping alarm", _currentZoneName.c_str());
     }
-    else if (_alarmState == AlarmState::PENDING && now - _entryDelayStart >= _entryDelay) {
-        _alarmState = AlarmState::TRIGGERED;
-        _triggerStartTime = now;
-        strncpy(_pendingEvent.reason, "entry_delay_expired", sizeof(_pendingEvent.reason) - 1);
-        // zone/distance/energy from last PENDING event preserved — update uptime + refresh forensic snapshot
-        _pendingEvent.uptime_s = now / 1000; fillISOTime(_pendingEvent.iso_time, sizeof(_pendingEvent.iso_time));
-        fillForensicFieldsImpl(_pendingEvent, getFusionSourceStr(), _fusionConfidence, _isStaticFiltered,
-                               _pendingEvent.zone, _prevZoneName.c_str());
-        snapshotRingTo(_pendingEvent, now);
-        enqueueAlarmEvent();
-        DBG("SecMon", "ALARM TRIGGERED!");
-        triggerAlert(NotificationType::ALARM_TRIGGERED, "🚨 ALARM TRIGGERED!", "Entry delay expired!\n" + formatApproachLog(), _pendingEvent.distance_cm);
-        activateSiren();
-    }
+
+    // Entry-delay expiry (PENDING→TRIGGERED) runs through applyTick() here too, for 20 Hz
+    // responsiveness; update() also calls it so it fires even if the radar goes silent.
+    applyTick(now);
 
     // Track sustained presence while disarmed (for reminder) — use fusion result
     if (_alarmState == AlarmState::DISARMED && _fusionPresence) {

@@ -44,7 +44,7 @@
 // -------------------------------------------------------------------------
 #include <Update.h>
 #ifndef FW_VERSION
-#define FW_VERSION "v5.0.8"
+#define FW_VERSION "v5.0.8-fsm2"
 #endif
 #define WDT_TIMEOUT_SECONDS 60
 
@@ -516,6 +516,12 @@ void setup() {
     Serial.println("   POE-2412 SECURITY NODE - BOOT SEQUENCE");
     Serial.println("=============================================");
     Serial.print(">> FW Version: "); Serial.println(FW_VERSION);
+    // Configured flash size (from build header) — makes the flashed variant
+    // visible in the boot log. NOTE: this is the BUILD's flash_size, not the
+    // physical chip (a 16MB build on an 8MB chip bootloops in the bootloader
+    // before reaching here). Verify the chip with `esptool flash_id` (4017=8MB,
+    // 4018=16MB) before flashing — see platformio.ini env warning.
+    Serial.printf(">> Flash size (build cfg): %u MB\n", ESP.getFlashChipSize() / (1024U * 1024U));
 
     configManager.begin();
 
@@ -1852,6 +1858,18 @@ void loop() {
                 memset(lastPub.uart_state, 0, sizeof(lastPub.uart_state));
                 lastPub.free_heap_kb = 0;
                 lastPub.max_alloc_kb = 0;
+                // TIER 1 (state) + TIER 2 (primary sensor) caches were NOT
+                // refreshed by the heartbeat, so HA last_updated froze at boot
+                // for alarm/presence/distance/motion_type/energy while the node
+                // was healthy (see REPORT_ESP_HA_*_CHECK). Invalidate them too so
+                // the next TIER 1/TIER 2 pass republishes the current value.
+                lastPub.presence_state[0] = '\xFF'; lastPub.presence_state[1] = '\0';
+                lastPub.alarm_state[0]    = '\xFF'; lastPub.alarm_state[1]    = '\0';
+                lastPub.motion_type[0]    = '\xFF'; lastPub.motion_type[1]    = '\0';
+                lastPub.direction[0]      = '\xFF'; lastPub.direction[1]      = '\0';
+                lastPub.distance_cm = 0xFFFF;
+                lastPub.energy_mov  = 0xFF;
+                lastPub.energy_stat = 0xFF;
                 // Dedicated heartbeat topic with unique-per-tick uptime —
                 // HA cannot dedup this because value monotonically grows.
                 char hbBuf[16];

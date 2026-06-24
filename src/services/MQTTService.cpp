@@ -370,9 +370,11 @@ void MQTTService::publishDiscoveryStep() {
             break;
         }
         case 20: {
-            char alarmExtra[256];
+            char alarmExtra[320];
             snprintf(alarmExtra, sizeof(alarmExtra),
-                "{\"cmd_t\":\"%s\",\"stat_t\":\"%s\",\"sup_feat\":[\"arm_away\",\"arm_home\"]}",
+                "{\"cmd_t\":\"%s\",\"stat_t\":\"%s\",\"sup_feat\":[\"arm_away\",\"arm_home\"],"
+                "\"code_arm_required\":false,\"code_disarm_required\":false,"
+                "\"code_trigger_required\":false}",
                 _topics.alarm_set, _topics.alarm_state);
             publishOneDiscovery("alarm_control_panel", "alarm", "Security Alarm", _topics.alarm_state, "", "mdi:shield-home", "", alarmExtra);
             break;

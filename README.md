@@ -70,7 +70,7 @@ WiFi CSI detection algorithms based on [ESPectre](https://github.com/francescopa
 | WiFi access point | 2.4 GHz **802.11n** AP in range (for CSI capture — **see [AP requirements](#wifi-access-point-requirements-for-csi) below**) | Existing |
 | **Total** | | **~$35--65** |
 
-> Any ESP32 board with LAN8720A RMII Ethernet should work with pin adjustments in `platformio.ini`. The Prokyber ESP32-STICK-PoE-P is the tested reference board.
+> Any ESP32 board with LAN8720A RMII Ethernet should work with pin adjustments in `platformio.ini`. The Prokyber ESP32-STICK-PoE-P is the tested reference board. **Note:** some units have been seen with 8 MB flash instead of the listed 16 MB — verify before flashing (see [Build and flash](#-quick-start) / the `esp32_poe_csi_8mb` build variant).
 
 ### Software (All Free)
 
@@ -139,10 +139,27 @@ cp include/known_devices.h.example include/known_devices.h
 # 4. Wire the radar (see pin table below) and connect ESP32 via USB
 
 # 5. Build and flash
-pio run -e esp32_poe_csi --target upload    # With WiFi CSI
+pio run -e esp32_poe_csi --target upload    # With WiFi CSI (16 MB flash — default)
+# or
+pio run -e esp32_poe_csi_8mb --target upload # With WiFi CSI on an 8 MB flash board
 # or
 pio run -e esp32_poe --target upload        # Radar only (no CSI)
 ```
+
+> **⚠️ Check your flash size first.** The default build targets **16 MB** flash (the
+> reference board's spec). We have observed ESP32-STICK-PoE units that actually ship
+> with only **8 MB** flash (and even from different flash vendors within the same
+> order), despite a 16 MB listing. A 16 MB build **bootloops** on an 8 MB chip — the
+> bootloader aborts with `Detected size(8192k) smaller than the size in the binary
+> image header(16384k). Probe failed.` before the app ever runs.
+>
+> Verify the **physical** chip before flashing (the on-device `flash_size` API field
+> reflects the *build header*, not the real chip, so it can't be trusted for this):
+> ```bash
+> esptool --port /dev/ttyUSB0 flash_id
+> #   Device: 4018  → 16 MB → use  esp32_poe_csi
+> #   Device: 4017  →  8 MB → use  esp32_poe_csi_8mb
+> ```
 
 ### What Goes in `secrets.h`
 
