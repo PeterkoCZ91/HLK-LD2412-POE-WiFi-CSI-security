@@ -107,7 +107,12 @@ static void noteAuthFailure(AsyncWebServerRequest *request) {
 
 // Authentication helper implementation
 bool checkAuth(AsyncWebServerRequest *request) {
-    if (_deps.config == nullptr) return false;
+    if (_deps.config == nullptr) {
+        // Hardening: never leave a request unanswered (bare return = empty reply,
+        // indistinguishable from an AsyncTCP drop). Send an explicit status.
+        request->send(503, "text/plain", "Config not ready");
+        return false;
+    }
     if (!lockoutGate(request)) return false;
     if (!request->authenticate(_deps.config->auth_user, _deps.config->auth_pass)) {
         noteAuthFailure(request);
@@ -126,7 +131,12 @@ bool checkAuth(AsyncWebServerRequest *request) {
 // RemoteDisconnected on large JSON payloads — the same root cause as the
 // classic 64 KB OTA stall. Basic is stateless and avoids this.
 bool checkAuthBasic(AsyncWebServerRequest *request) {
-    if (_deps.config == nullptr) return false;
+    if (_deps.config == nullptr) {
+        // Hardening: never leave a request unanswered (bare return = empty reply,
+        // indistinguishable from an AsyncTCP drop). Send an explicit status.
+        request->send(503, "text/plain", "Config not ready");
+        return false;
+    }
     if (!lockoutGate(request)) return false;
     if (!request->authenticate(_deps.config->auth_user, _deps.config->auth_pass)) {
         noteAuthFailure(request);
@@ -953,7 +963,10 @@ void setupConfigRoutes() {
     });
 
     _deps.server->on("/api/config/import", HTTP_POST, [](AsyncWebServerRequest *request) {
-        if (!checkAuth(request)) return;
+        // Fix A: Basic (not Digest) — see /api/update/pull rationale. Digest's
+        // 401->retry drops the buffered import JSON over LAN8720A backpressure
+        // ("empty reply"). Basic is preemptive so the body survives.
+        if (!checkAuthBasic(request)) return;
 
         // Layout written by the upload callback: byte[0] = status flag
         //   (0 = ok, 1 = oversize), byte[1..] = null-terminated JSON when ok.
@@ -1368,7 +1381,11 @@ void setupSystemRoutes() {
 
     _deps.server->on("/api/update/pull", HTTP_POST,
     [](AsyncWebServerRequest *request) {
-        if (!checkAuth(request)) return;
+        // Fix A: Basic (not Digest) — Digest's 401->retry round-trip loses the
+        // buffered JSON body / its nonce is fragile over LAN8720A backpressure,
+        // which produced the "empty reply, phase=idle" pull-OTA failure. Basic
+        // is preemptive (sent on first request), so the body survives.
+        if (!checkAuthBasic(request)) return;
         if (otaPullInFlight || otaRuntimeOwner() != OTA_OWNER_NONE) {
             request->send(409, "text/plain", String("OTA already in progress: ") + otaRuntimeOwnerName(otaRuntimeOwner()));
             return;
