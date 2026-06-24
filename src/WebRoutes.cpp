@@ -995,15 +995,15 @@ void setupConfigRoutes() {
                     return;
                 }
 
-                if (doc["mqtt_server"].is<String>()) _deps.preferences->putString("mqtt_server", doc["mqtt_server"].as<String>());
-                if (doc["mqtt_port"].is<String>()) _deps.preferences->putString("mqtt_port", doc["mqtt_port"].as<String>());
-                if (doc["mqtt_user"].is<String>() && doc["mqtt_user"].as<String>() != "***") _deps.preferences->putString("mqtt_user", doc["mqtt_user"].as<String>());
-                if (doc["mqtt_pass"].is<String>() && doc["mqtt_pass"].as<String>() != "***") _deps.preferences->putString("mqtt_pass", doc["mqtt_pass"].as<String>());
-                if (doc["mqtt_id"].is<String>()) _deps.preferences->putString("mqtt_id", doc["mqtt_id"].as<String>());
+                if (doc["mqtt_server"].is<const char*>()) _deps.preferences->putString("mqtt_server", doc["mqtt_server"].as<String>());
+                if (doc["mqtt_port"].is<const char*>()) _deps.preferences->putString("mqtt_port", doc["mqtt_port"].as<String>());
+                if (doc["mqtt_user"].is<const char*>() && doc["mqtt_user"].as<String>() != "***") _deps.preferences->putString("mqtt_user", doc["mqtt_user"].as<String>());
+                if (doc["mqtt_pass"].is<const char*>() && doc["mqtt_pass"].as<String>() != "***") _deps.preferences->putString("mqtt_pass", doc["mqtt_pass"].as<String>());
+                if (doc["mqtt_id"].is<const char*>()) _deps.preferences->putString("mqtt_id", doc["mqtt_id"].as<String>());
                 if (doc["mqtt_en"].is<bool>()) _deps.preferences->putBool("mqtt_en", doc["mqtt_en"].as<bool>());
-                if (doc["hostname"].is<String>()) _deps.preferences->putString("hostname", doc["hostname"].as<String>());
-                if (doc["auth_user"].is<String>() && doc["auth_user"].as<String>() != "***") _deps.preferences->putString("auth_user", doc["auth_user"].as<String>());
-                if (doc["auth_pass"].is<String>() && doc["auth_pass"].as<String>() != "***") _deps.preferences->putString("auth_pass", doc["auth_pass"].as<String>());
+                if (doc["hostname"].is<const char*>()) _deps.preferences->putString("hostname", doc["hostname"].as<String>());
+                if (doc["auth_user"].is<const char*>() && doc["auth_user"].as<String>() != "***") _deps.preferences->putString("auth_user", doc["auth_user"].as<String>());
+                if (doc["auth_pass"].is<const char*>() && doc["auth_pass"].as<String>() != "***") _deps.preferences->putString("auth_pass", doc["auth_pass"].as<String>());
                 // bk_ssid/bk_pass removed — POE board has no WiFi
                 if (doc["radar_res"].is<float>()) _deps.preferences->putFloat("radar_res", doc["radar_res"].as<float>());
                 if (doc["radar_min"].is<unsigned int>()) _deps.preferences->putUInt("radar_min", doc["radar_min"].as<unsigned int>());
@@ -1016,22 +1016,22 @@ void setupConfigRoutes() {
 
                 // Telegram — skip redacted token
                 if (doc["tg_enabled"].is<bool>()) _deps.preferences->putBool("tg_direct_en", doc["tg_enabled"].as<bool>());
-                if (doc["tg_token"].is<String>() && doc["tg_token"].as<String>() != "***") _deps.preferences->putString("tg_token", doc["tg_token"].as<String>());
-                if (doc["tg_chat"].is<String>()) _deps.preferences->putString("tg_chat", doc["tg_chat"].as<String>());
+                if (doc["tg_token"].is<const char*>() && doc["tg_token"].as<String>() != "***") _deps.preferences->putString("tg_token", doc["tg_token"].as<String>());
+                if (doc["tg_chat"].is<const char*>()) _deps.preferences->putString("tg_chat", doc["tg_chat"].as<String>());
 
                 // Timezone
                 if (doc["tz_offset"].is<int32_t>()) _deps.preferences->putInt("tz_offset", doc["tz_offset"].as<int32_t>());
                 if (doc["dst_offset"].is<int32_t>()) _deps.preferences->putInt("dst_offset", doc["dst_offset"].as<int32_t>());
 
                 // Static network
-                if (doc["static_ip"].is<String>()) _deps.preferences->putString("static_ip", doc["static_ip"].as<String>());
-                if (doc["static_mask"].is<String>()) _deps.preferences->putString("static_mask", doc["static_mask"].as<String>());
-                if (doc["static_gw"].is<String>()) _deps.preferences->putString("static_gw", doc["static_gw"].as<String>());
-                if (doc["static_dns"].is<String>()) _deps.preferences->putString("static_dns", doc["static_dns"].as<String>());
+                if (doc["static_ip"].is<const char*>()) _deps.preferences->putString("static_ip", doc["static_ip"].as<String>());
+                if (doc["static_mask"].is<const char*>()) _deps.preferences->putString("static_mask", doc["static_mask"].as<String>());
+                if (doc["static_gw"].is<const char*>()) _deps.preferences->putString("static_gw", doc["static_gw"].as<String>());
+                if (doc["static_dns"].is<const char*>()) _deps.preferences->putString("static_dns", doc["static_dns"].as<String>());
 
                 // Schedule
-                if (doc["sched_arm"].is<String>()) _deps.preferences->putString("sched_arm", doc["sched_arm"].as<String>());
-                if (doc["sched_disarm"].is<String>()) _deps.preferences->putString("sched_disarm", doc["sched_disarm"].as<String>());
+                if (doc["sched_arm"].is<const char*>()) _deps.preferences->putString("sched_arm", doc["sched_arm"].as<String>());
+                if (doc["sched_disarm"].is<const char*>()) _deps.preferences->putString("sched_disarm", doc["sched_disarm"].as<String>());
                 if (doc["auto_arm_min"].is<uint16_t>()) _deps.preferences->putUShort("auto_arm_min", doc["auto_arm_min"].as<uint16_t>());
 
                 // Security
@@ -1051,8 +1051,8 @@ void setupConfigRoutes() {
                 if (doc["csi_hyst"].is<float>()) _deps.preferences->putFloat("csi_hyst", doc["csi_hyst"].as<float>());
                 if (doc["csi_win"].is<uint16_t>()) _deps.preferences->putUShort("csi_win", doc["csi_win"].as<uint16_t>());
                 if (doc["csi_pubms"].is<uint16_t>()) _deps.preferences->putUShort("csi_pubms", doc["csi_pubms"].as<uint16_t>());
-                if (doc["csi_ssid"].is<String>()) _deps.preferences->putString("csi_ssid", doc["csi_ssid"].as<String>());
-                if (doc["csi_pass"].is<String>() && doc["csi_pass"].as<String>() != "***") _deps.preferences->putString("csi_pass", doc["csi_pass"].as<String>());
+                if (doc["csi_ssid"].is<const char*>()) _deps.preferences->putString("csi_ssid", doc["csi_ssid"].as<String>());
+                if (doc["csi_pass"].is<const char*>() && doc["csi_pass"].as<String>() != "***") _deps.preferences->putString("csi_pass", doc["csi_pass"].as<String>());
                 if (doc["fus_en"].is<bool>()) _deps.preferences->putBool("fus_en", doc["fus_en"].as<bool>());
                 if (doc["csi_tport"].is<uint16_t>()) _deps.preferences->putUShort("csi_tport", doc["csi_tport"].as<uint16_t>());
                 if (doc["csi_ticmp"].is<bool>()) _deps.preferences->putBool("csi_ticmp", doc["csi_ticmp"].as<bool>());
@@ -1060,7 +1060,7 @@ void setupConfigRoutes() {
                 if (doc["csi_ml_en"].is<bool>()) _deps.preferences->putBool("csi_ml_en", doc["csi_ml_en"].as<bool>());
                 if (doc["csi_ml_thr"].is<float>()) _deps.preferences->putFloat("csi_ml_thr", doc["csi_ml_thr"].as<float>());
 
-                if (doc["zones"].is<String>()) _deps.preferences->putString("zones_json", doc["zones"].as<String>());
+                if (doc["zones"].is<const char*>()) _deps.preferences->putString("zones_json", doc["zones"].as<String>());
             } else {
                 free(slab);
                 request->_tempObject = nullptr;
