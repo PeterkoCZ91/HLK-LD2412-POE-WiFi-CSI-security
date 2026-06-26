@@ -44,7 +44,7 @@
 // -------------------------------------------------------------------------
 #include <Update.h>
 #ifndef FW_VERSION
-#define FW_VERSION "v5.0.8-fsm2"
+#define FW_VERSION "v5.0.9-poe-wifi"
 #endif
 #define WDT_TIMEOUT_SECONDS 60
 
@@ -952,6 +952,7 @@ void setup() {
         g_espotaMaintenance.store(true);
 #ifdef USE_CSI
         CSIService::setOtaInProgress(true);
+        csiService.wifiDownForOta();   // single-home: drop CSI WiFi so we're not dual-homed during OTA
 #endif
         MQTTService::setOtaInProgress(true);
         String type;
@@ -1101,6 +1102,7 @@ void otaRuntimeRestoreServices(const char* reason, bool restartRadar) {
     }
 #ifdef USE_CSI
     CSIService::setOtaInProgress(false);
+    csiService.wifiUpAfterOta();   // restore CSI WiFi if the OTA window closed without a reboot
 #endif
     MQTTService::setOtaInProgress(false);
     if (restartRadar) {
@@ -1152,6 +1154,7 @@ static void handleEspotaMaintenance(unsigned long now) {
 
 #ifdef USE_CSI
         CSIService::setOtaInProgress(true);
+        csiService.wifiDownForOta();   // single-home: drop CSI WiFi so we're not dual-homed during OTA
 #endif
         MQTTService::setOtaInProgress(true);
         if (radarTaskHandle && eTaskGetState(radarTaskHandle) != eSuspended) {

@@ -1324,6 +1324,27 @@ void CSIService::forceReconnect() {
     _reconnectRequested = true;
 }
 
+void CSIService::wifiDownForOta() {
+    // Single-home to Ethernet for OTA. A CSI WiFi STA sharing the Ethernet subnet
+    // makes the box dual-homed → ambiguous return path → espota auth/upload stalls.
+    // Stop traffic gen and drop the AP association; keep STA mode + CSI config so a
+    // later wifiUpAfterOta() (or a fresh boot) brings it straight back. update()'s
+    // reconnect loop is gated by _otaInProgress, and we disable auto-reconnect, so
+    // WiFi stays down for the whole OTA window.
+    _stopTrafficGen();
+    WiFi.setAutoReconnect(false);
+    WiFi.disconnect(false);
+    Serial.println("[CSI] WiFi STA dropped for OTA (single-homing to Ethernet)");
+}
+
+void CSIService::wifiUpAfterOta() {
+    // Restore after an OTA window that closed without a reboot (timeout / abort).
+    // A successful flash reboots, so WiFi comes back via begin() on boot instead.
+    WiFi.setAutoReconnect(true);
+    if (WiFi.status() != WL_CONNECTED) WiFi.reconnect();
+    Serial.println("[CSI] WiFi STA restore requested after OTA window");
+}
+
 void CSIService::calibrateThreshold(uint32_t durationMs) {
     if (durationMs < 1000) durationMs = 1000;
     if (durationMs > 60000) durationMs = 60000;

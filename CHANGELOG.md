@@ -2,6 +2,33 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.0.9-poe-wifi] - 2026-06-26
+
+OTA dual-homing fix. The long-standing "espota randomly fails / works on retry" problem is
+finally root-caused and fixed.
+
+### Fixed
+
+- **espota OTA intermittently failed when the CSI WiFi shared the Ethernet subnet (dual-homing).**
+  On a flat home LAN the CSI WiFi sniffer gets a DHCP lease on the *same* IP subnet as the wired
+  Ethernet, so the device is dual-homed: two interfaces, one subnet. espota's UDP auth reply and
+  TCP connect-back can then leave via the wrong interface and get dropped, stalling the handshake
+  or upload (`No Answer to our Authentication` / `Authentication Failed` / `Error Uploading`),
+  intermittently (≈50–75 %). This was repeatedly misdiagnosed as a bad flash chip, heap
+  fragmentation, runtime-load starvation, or the (separate, already-fixed) LAN8720A/Digest issue —
+  none of which it was. Isolated with a controlled subnet swap on a single unit (different subnet
+  or CSI off: **8/8 OK**; same subnet: **6/8 fail**; same flash chip throughout).
+
+  Fix: the device now **single-homes itself for the flash**. `CSIService::wifiDownForOta()` stops
+  the traffic generator, disables WiFi auto-reconnect, and drops the CSI WiFi STA; the reconnect
+  loop is already gated on the OTA-in-progress flag, so WiFi stays down for the whole window.
+  It is called from `ArduinoOTA.onStart` and — crucially, *before* the espota auth exchange — from
+  the `/api/ota/espota/prepare` maintenance window, and reversed centrally in
+  `otaRuntimeRestoreServices()` (covers error/watchdog/window-timeout; a successful flash reboots
+  and WiFi returns on boot). Since the standard espota deploy flow already calls `prepare`, this is
+  automatic — no VLAN, no manual CSI toggle. Validated on hardware: a dual-homed unit that failed
+  6/8 before now flashes **8/8**. See [docs/OTA_OPERATIONS.md](docs/OTA_OPERATIONS.md) → *Dual-Homing*.
+
 ## [5.0.8-poe-wifi] - 2026-06-24
 
 OTA reliability + config-import fixes. Validated end-to-end on a remote, Ethernet-only node.

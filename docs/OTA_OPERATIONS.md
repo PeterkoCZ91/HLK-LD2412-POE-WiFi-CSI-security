@@ -35,23 +35,83 @@ The single most common field complaint is: *"OTA works right after a flash, but 
 
 ## espota Fails When CSI WiFi Shares the Ethernet Subnet (Dual-Homing)
 
-A subtle but **100 %-reproducible** failure mode, separate from the uptime/load issues above.
+This is the single most important OTA failure mode on this board, and the hardest to
+recognise — it masquerades as every *other* OTA problem. If you have ever "fixed" OTA
+several times and it still randomly fails, **this is almost certainly why.** It is
+separate from the uptime/load issues above, and the usual fixes (cold reboot, more heap,
+maintenance window, auth changes) do **not** help because none of them touch the actual
+cause.
 
-**Symptom.** `espota.py` intermittently (≈50–75 %) reports `No Answer to our Authentication`, `Authentication Failed`, or `Error Uploading` — even immediately after a cold reboot, with the correct password, on a healthy unit with plenty of contiguous heap. Retrying eventually succeeds, so it looks "flaky."
+### Symptom
 
-**Root cause — dual-homing on one subnet.** The board is dual-interface: wired **Ethernet** (the OTA path) plus the **CSI WiFi** sniffer. OTA always runs over Ethernet; WiFi is only for CSI. But if your CSI access point hands the WiFi interface a DHCP address on the **same IP subnet** as the Ethernet interface (the normal case on a flat home LAN — e.g. Ethernet `192.168.1.50`, CSI WiFi `192.168.1.73`, both `/24`), the device now has **two interfaces on one subnet**. The ESP's TCP/IP stack then has an ambiguous return path: espota's UDP auth replies and the device's connect-back stream can leave via the *wrong* interface, so packets are lost and the handshake/upload stalls. With the CSI WiFi on a *different* subnet (or disabled), the device is single-homed and espota succeeds **100 %**.
+`espota.py` *intermittently* (≈50–75 % of attempts) reports one of:
+- `No Answer to our Authentication`
+- `Authentication Failed`
+- `Error Uploading`
 
-**Diagnose it.** Compare the two interface IPs:
+…even immediately after a cold reboot, with the correct password, on a healthy unit with
+plenty of contiguous heap. Retrying eventually succeeds, so it reads as "flaky hardware"
+or "bad flash chip" — which is what sends people down the wrong rabbit hole.
+
+### Why it looked like everything else (why earlier fixes didn't stick)
+
+The intermittency lines up with whatever you happened to change, so it gets misattributed:
+- *"It's the flash chip."* No — a unit with a known-bad 8 MB chip flashes **8/8 perfect**
+  when single-homed; a healthy chip flashes 6/8 **fail** when dual-homed. The chip is irrelevant.
+- *"It's heap fragmentation / long uptime."* No — it fails on a unit cold-booted seconds ago.
+- *"It's `ArduinoOTA.handle()` starvation under load."* The radar task is already suspended and
+  CSI/MQTT backed off during OTA; the failure happens in the espota **auth** exchange, *before*
+  those hooks even run.
+- *"It's LAN8720A / Digest auth."* That was a real, separate bug (fixed in 5.0.8), but it
+  produced empty HTTP replies, not espota auth/upload stalls.
+
+### Root cause — two interfaces on one IP subnet
+
+The board is dual-interface: wired **Ethernet** (the OTA path) plus the **CSI WiFi** sniffer.
+OTA always runs over Ethernet; WiFi exists only to capture CSI. But if your CSI access point
+hands the WiFi interface a DHCP lease on the **same IP subnet** as the Ethernet interface — the
+normal case on a flat home LAN (e.g. Ethernet `192.168.1.50`, CSI WiFi `192.168.1.73`, both
+`/24`) — the device is now **dual-homed**: two interfaces, two IPs, one subnet.
+
+`espota` works by sending a UDP invitation to the device, which then replies and opens a
+TCP stream **back** to the host. With two interfaces on the same subnet, the ESP's lwIP stack
+has an ambiguous source/return path for those packets — the auth reply or the connect-back can
+leave via the *wrong* interface, where the host never sees it. Packets are dropped, the
+handshake or upload stalls, and `espota` times out. Because the wrong-interface choice is
+racy, it fails *intermittently*.
+
+**Controlled proof** (same unit, same flash chip, only the CSI WiFi subnet changed):
+
+| CSI WiFi subnet vs. Ethernet | espota result |
+|---|---|
+| **different** subnet (or CSI disabled) | **8/8 success** |
+| **same** subnet (dual-homed) | **6/8 fail** |
+
+### Diagnose it
+
+Compare the two interface IPs — if they share a subnet, you are affected:
 ```bash
 curl -s http://<device>/api/health  | grep -o '"ip":"[^"]*"'   # Ethernet IP
 curl -s -u admin:<pass> http://<device>/api/csi | grep wifi_ip  # CSI WiFi IP
 ```
-If both are in the same subnet (e.g. both `192.168.1.x/24`), you are affected.
 
-**Fix / workaround (no VLAN required).** You do **not** need multiple subnets or VLANs. Make the unit single-homed for the flash:
+### Fix (no VLAN required)
 
-- **Preferred — Pull OTA.** `/api/update/pull` is a single *outbound* fetch over Ethernet and is far less exposed to the connect-back ambiguity than espota. Use it when the running firmware supports it.
-- **espota — disable CSI for the flash.** Turn the WiFi sniffer off so only Ethernet is up, flash, then turn it back on:
+You do **not** need multiple subnets or VLANs. The unit just needs to be **single-homed**
+(Ethernet only) for the duration of the flash.
+
+- **Automatic (firmware ≥ v5.0.9).** The espota maintenance window now single-homes the device
+  for you: `POST /api/ota/espota/prepare` drops the CSI WiFi association (and disables WiFi
+  auto-reconnect) for the window, so when you run `espota.py` the device is Ethernet-only.
+  WiFi/CSI comes back automatically on the post-OTA reboot, or when the window closes. The
+  `tools/pull_ota_deploy.sh` / standard espota flow already calls `prepare`, so on current
+  firmware **no manual step is needed** — validated 8/8 on a dual-homed unit that failed 6/8
+  before the fix.
+- **Preferred regardless — Pull OTA.** `/api/update/pull` is a single *outbound* fetch over
+  Ethernet and is far less exposed to the connect-back ambiguity. Use it when the running
+  firmware supports it.
+- **Manual fallback (older firmware, or if you must).** Turn the CSI sniffer off so only
+  Ethernet is up, flash, then turn it back on:
   ```bash
   curl -u admin:<pass> -X POST 'http://<device>/api/csi?enabled=0'   # CSI off (needs restart)
   curl -u admin:<pass> -X POST  http://<device>/api/restart           # boots Ethernet-only = single-homed
@@ -59,8 +119,6 @@ If both are in the same subnet (e.g. both `192.168.1.x/24`), you are affected.
   curl -u admin:<pass> -X POST 'http://<device>/api/csi?enabled=1'   # CSI back on
   curl -u admin:<pass> -X POST  http://<device>/api/restart
   ```
-
-> **Planned firmware fix:** the espota maintenance window (`/api/ota/espota/prepare`) will additionally drop the CSI WiFi association for the duration of the window, so the device single-homes itself automatically and no manual CSI toggle is needed. Until then, use one of the two options above.
 
 ## What You Need Before Upload
 

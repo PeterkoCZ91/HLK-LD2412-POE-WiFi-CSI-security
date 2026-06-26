@@ -89,6 +89,12 @@ public:
     // Diagnostics actions
     void resetIdleBaseline();
     void forceReconnect();
+    // OTA single-homing: drop / restore the CSI WiFi STA so the device isn't dual-homed
+    // on the Ethernet subnet during a flash (dual-homing intermittently breaks espota).
+    // update()'s reconnect loop is already gated by _otaInProgress, so WiFi stays down
+    // between these calls. See docs/OTA_OPERATIONS.md (dual-homing).
+    void wifiDownForOta();
+    void wifiUpAfterOta();
     void calibrateThreshold(uint32_t durationMs = 10000);
     bool isCalibrating() const { return _calibrating; }
     float getCalibrationProgress() const;

@@ -3,7 +3,7 @@
 [![PlatformIO](https://img.shields.io/badge/PlatformIO-ESP32-orange?logo=platformio)](https://platformio.org/)
 [![ESP32](https://img.shields.io/badge/MCU-ESP32--WROOM--32-blue?logo=espressif)](https://www.espressif.com/)
 [![License](https://img.shields.io/badge/License-GPL--3.0-blue)](LICENSE)
-[![Version](https://img.shields.io/badge/Version-5.0.7--poe--wifi-blue)]()
+[![Version](https://img.shields.io/badge/Version-5.0.9--poe--wifi-blue)]()
 [![Discussions](https://img.shields.io/badge/GitHub-Discussions-purple?logo=github)](https://github.com/PeterkoCZ91/HLK-LD2412-POE-WiFi-CSI-security/discussions)
 
 **Dual-sensor intrusion detection system** — ESP32 + HLK-LD2412 24 GHz mmWave radar + **WiFi CSI (Channel State Information) passive motion detection** over **wired Ethernet with Power over Ethernet**. Full alarm state machine, zone management, Home Assistant integration, Telegram bot, and a dark-mode web dashboard. No cloud required.
@@ -664,7 +664,7 @@ The HLK-LD2412 sensor has several known firmware issues:
 - ESP32 classic doesn't support AGC lock — CV normalization is used as fallback (less sensitive than locked gain)
 - CSI packet rate depends on WiFi channel conditions — DNS traffic generator compensates but may not reach full 100 pps in congested environments
 - STBC doubled packets from some APs are handled but may introduce slight amplitude averaging
-- **espota OTA can be flaky when the CSI WiFi shares the Ethernet subnet** (dual-homing on a flat LAN) — intermittent `No Answer to our Authentication` / `Error Uploading`. No VLAN needed to fix: prefer Pull OTA, or disable CSI for the flash. See [docs/OTA_OPERATIONS.md → Dual-Homing](docs/OTA_OPERATIONS.md#espota-fails-when-csi-wifi-shares-the-ethernet-subnet-dual-homing)
+- **Dual-homing (CSI WiFi on the same subnet as Ethernet) used to make espota OTA flaky** (intermittent `No Answer to our Authentication` / `Error Uploading` on a flat home LAN). **Handled automatically since v5.0.9** — the espota maintenance window single-homes the device for the flash; no VLAN and no manual steps needed. Background, diagnosis, and the manual fallback for older firmware: [docs/OTA_OPERATIONS.md → Dual-Homing](docs/OTA_OPERATIONS.md#espota-fails-when-csi-wifi-shares-the-ethernet-subnet-dual-homing)
 
 ---
 
