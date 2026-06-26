@@ -664,6 +664,7 @@ The HLK-LD2412 sensor has several known firmware issues:
 - ESP32 classic doesn't support AGC lock — CV normalization is used as fallback (less sensitive than locked gain)
 - CSI packet rate depends on WiFi channel conditions — DNS traffic generator compensates but may not reach full 100 pps in congested environments
 - STBC doubled packets from some APs are handled but may introduce slight amplitude averaging
+- **espota OTA can be flaky when the CSI WiFi shares the Ethernet subnet** (dual-homing on a flat LAN) — intermittent `No Answer to our Authentication` / `Error Uploading`. No VLAN needed to fix: prefer Pull OTA, or disable CSI for the flash. See [docs/OTA_OPERATIONS.md → Dual-Homing](docs/OTA_OPERATIONS.md#espota-fails-when-csi-wifi-shares-the-ethernet-subnet-dual-homing)
 
 ---
 
