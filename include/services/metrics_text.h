@@ -20,6 +20,7 @@ struct MetricsSnapshot {
     uint32_t heap_largest = 0;
     float    chip_temp_c = 0;
     bool     radar_connected = false;
+    bool     radar_monitoring_disabled = false;  // latched CSI-only until reboot
     float    radar_frame_rate = 0;
     uint32_t radar_error_count = 0;
     int      radar_health_score = 0;
@@ -37,6 +38,7 @@ struct MetricsSnapshot {
     float    fusion_confidence = 0;
     bool     csi_present = false;   // false → csi_* metriky se vynechají (build bez USE_CSI)
     bool     csi_active = false;
+    bool     csi_data_ok = true;    // false → WiFi associated but CSI frames starved
     uint32_t csi_packets_total = 0;
     float    csi_packet_rate = 0;
     int      csi_wifi_rssi_dbm = 0;
@@ -71,6 +73,7 @@ inline size_t buildMetricsText(const MetricsSnapshot& m, char* buf, size_t cap) 
     METRIC("poe2412_heap_largest_block_bytes","gauge",   "%lu",  (unsigned long)m.heap_largest);
     METRIC("poe2412_chip_temp_celsius",       "gauge",   "%.1f", (double)m.chip_temp_c);
     METRIC("poe2412_radar_connected",         "gauge",   "%d",   m.radar_connected ? 1 : 0);
+    METRIC("poe2412_radar_monitoring_disabled","gauge",  "%d",   m.radar_monitoring_disabled ? 1 : 0);
     METRIC("poe2412_radar_frame_rate",        "gauge",   "%.1f", (double)m.radar_frame_rate);
     METRIC("poe2412_radar_errors_total",      "counter", "%lu",  (unsigned long)m.radar_error_count);
     METRIC("poe2412_radar_health_score",      "gauge",   "%d",   m.radar_health_score);
@@ -90,6 +93,7 @@ inline size_t buildMetricsText(const MetricsSnapshot& m, char* buf, size_t cap) 
     METRIC("poe2412_fusion_confidence",       "gauge",   "%.3f", (double)m.fusion_confidence);
     if (m.csi_present) {
         METRIC("poe2412_csi_active",              "gauge",   "%d",   m.csi_active ? 1 : 0);
+        METRIC("poe2412_csi_data_ok",             "gauge",   "%d",   m.csi_data_ok ? 1 : 0);
         METRIC("poe2412_csi_packets_total",       "counter", "%lu",  (unsigned long)m.csi_packets_total);
         METRIC("poe2412_csi_packet_rate",         "gauge",   "%.1f", (double)m.csi_packet_rate);
         METRIC("poe2412_csi_wifi_rssi_dbm",       "gauge",   "%d",   m.csi_wifi_rssi_dbm);

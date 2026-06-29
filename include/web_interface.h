@@ -163,6 +163,7 @@ const char index_html[] PROGMEM = R"rawliteral(
       ota_cold_failed: "Zařízení nenaběhlo do 25 s — zkontroluj napájení a zkus znovu",
       ota_espota_prepare: "Připravit espota okno",
       ota_espota_ready: "ESPOTA okno otevřeno na 120 s",
+      ota_espota_help: "Pro flash nástrojem espota.py (UDP 3232) místo nahrání souboru. Na ~120 s odpojí CSI WiFi (single-home), odstaví CSI/MQTT a pozastaví radar → uvolní CPU/RAM, aby espota spolehlivě prošlo auth. Otevři okno a hned spusť espota.py ze stejné sítě. Reboot není potřeba.",
       yes: "ANO", no: "NE", no_collecting: "NE — sbírá vzorky", motion: "POHYB", idle: "KLID",
       coverage: "Pokrytí", resolution: "Rozlišení", gate: "hradlo",
       hold_state: "DRŽENÍ", tamper_state: "SABOTÁŽ!",
@@ -218,6 +219,7 @@ const char index_html[] PROGMEM = R"rawliteral(
       ml_threshold_lbl: "ML práh (enter):",
       ml_help: "<b>MLP klasifikátor:</b> 17 featur (statistiky turbulence + fáze + DSER/PLCR) → 18→9→1 sigmoid. Trénováno na espectre datasetu (F1 = 0.852). Enter ≥ threshold, exit = threshold × 0.70, N/M smoothing 4/5 z 6 oken. Výstup jde do fusion jako 3. signál.",
       detection_src: "Zdroj detekce", fusion_enabled: "Fusion povoleno",
+      mw_radar_section: "MW radar", csi_section: "WiFi CSI", csi_offline: "CSI offline", csi_nodata: "Bez dat", radar_disconnected: "Radar odpojen",
       enabled: "Povoleno",
       hysteresis: "Hystereze (exit multiplier):", window_size: "Velikost okna (vzorky):",
       pub_interval: "Interval publikace (ms):",
@@ -232,6 +234,25 @@ const char index_html[] PROGMEM = R"rawliteral(
       sched_auto_arm: "Auto-arm po nečinnosti (min, 0 = vyp)",
       dow_mo: "Po", dow_tu: "Út", dow_we: "St", dow_th: "Čt",
       dow_fr: "Pá", dow_sa: "So", dow_su: "Ne",
+      distance_cm: "VZDÁLENOST (cm)", comm_errors: "Chyby komunikace",
+      restart_radar: "Restart radaru", restart_esp: "Restart ESP",
+      restart_esp_confirm: "Restartovat ESP?", reset_mw: "Reset MW",
+      min_range: "Min. dosah (hradlo)", max_range: "Max. dosah (hradlo)",
+      enable_led: "Povolit LED (indikátor)", calib_noise: "Kalibrovat šum (60s)",
+      interval_h: "Interval (h)", pet_immunity_title: "IMUNITA NA ZVÍŘATA",
+      min_move_energy: "Min. energie pohybu", alarm_delay_title: "ZPOŽDĚNÍ ALARMU",
+      absence_timeout_title: "ČASOVÝ LIMIT NEPŘÍTOMNOSTI",
+      unmanned_duration: "Doba bez obsluhy (sec)", light_sensor_title: "SENZOR SVĚTLA (OUT pin)",
+      light_off: "Vypnuto", enable_mqtt: "Povolit MQTT",
+      telegram_notifications: "Telegram notifikace", enable_bot: "Povolit bota",
+      credentials_title: "PŘIHLAŠOVACÍ ÚDAJE", zone_definitions: "DEFINICE ZÓN (cm)",
+      csi_status_title: "STAV CSI", packets_per_s: "Pakety/s",
+      motion_detection_title: "DETEKCE POHYBU", fusion_state: "Fusion stav",
+      detected_state: "DETEKCE", fusion_on: "Fusion zapnut", fusion_off: "Fusion vypnut",
+      error: "Chyba", comm_error: "Chyba komunikace",
+      zone_from: "Od (cm)", zone_to: "Do (cm)", zone_entry_delay: "⏱ Zpoždění vstupu",
+      zone_ignore: "🔕 Ignorovat", zone_ignore_static: "📡 Ignorovat statiku",
+      preset_error: "Chyba předvolby", min_4_chars: "Min. 4 znaky", learn_complete: "Hotovo!",
     },
     en: {
       title: "LD2412 Security", loading: "LOADING...", arm: "ARM", disarm: "DISARM",
@@ -309,6 +330,7 @@ const char index_html[] PROGMEM = R"rawliteral(
       ota_cold_failed: "Device did not come back within 25 s — check power and retry",
       ota_espota_prepare: "Prepare espota window",
       ota_espota_ready: "ESPOTA window open for 120 s",
+      ota_espota_help: "For flashing with espota.py (UDP 3232) instead of file upload. For ~120 s it drops CSI WiFi (single-home), backs off CSI/MQTT and suspends the radar → frees CPU/RAM so espota reliably passes auth. Open the window, then run espota.py from the same LAN. No reboot needed.",
       yes: "YES", no: "NO", no_collecting: "NO — collecting samples", motion: "MOTION", idle: "IDLE",
       coverage: "Coverage", resolution: "Resolution", gate: "gate",
       hold_state: "HOLD", tamper_state: "TAMPER!",
@@ -364,6 +386,7 @@ const char index_html[] PROGMEM = R"rawliteral(
       ml_threshold_lbl: "ML threshold (enter):",
       ml_help: "<b>MLP classifier:</b> 17 features (turbulence stats + phase + DSER/PLCR) → 18→9→1 sigmoid. Trained on espectre dataset (F1 = 0.852). Enter ≥ threshold, exit = threshold × 0.70, N/M smoothing 4/5 of 6 windows. Output is fed into fusion as 3rd signal.",
       detection_src: "Detection source", fusion_enabled: "Fusion enabled",
+      mw_radar_section: "MW radar", csi_section: "WiFi CSI", csi_offline: "CSI offline", csi_nodata: "No data", radar_disconnected: "Radar disconnected",
       enabled: "Enabled",
       hysteresis: "Hysteresis (exit multiplier):", window_size: "Window size (samples):",
       pub_interval: "Publish interval (ms):",
@@ -378,6 +401,25 @@ const char index_html[] PROGMEM = R"rawliteral(
       sched_auto_arm: "Auto-arm after idle (min, 0 = off)",
       dow_mo: "Mo", dow_tu: "Tu", dow_we: "We", dow_th: "Th",
       dow_fr: "Fr", dow_sa: "Sa", dow_su: "Su",
+      distance_cm: "DISTANCE (cm)", comm_errors: "Comm Errors",
+      restart_radar: "Restart Radar", restart_esp: "Restart ESP",
+      restart_esp_confirm: "Restart ESP?", reset_mw: "Reset MW",
+      min_range: "Min Range (Gate)", max_range: "Max Range (Gate)",
+      enable_led: "Enable LED (Indicator)", calib_noise: "Calibrate Noise (60s)",
+      interval_h: "Interval (h)", pet_immunity_title: "PET IMMUNITY",
+      min_move_energy: "Min Move Energy", alarm_delay_title: "ALARM DELAY",
+      absence_timeout_title: "ABSENCE TIMEOUT",
+      unmanned_duration: "Unmanned Duration (sec)", light_sensor_title: "LIGHT SENSOR (OUT pin)",
+      light_off: "Off", enable_mqtt: "Enable MQTT",
+      telegram_notifications: "Telegram Notifications", enable_bot: "Enable Bot",
+      credentials_title: "CREDENTIALS", zone_definitions: "ZONE DEFINITIONS (cm)",
+      csi_status_title: "CSI STATUS", packets_per_s: "Packets/s",
+      motion_detection_title: "MOTION DETECTION", fusion_state: "Fusion state",
+      detected_state: "DETECTED", fusion_on: "Fusion enabled", fusion_off: "Fusion disabled",
+      error: "Error", comm_error: "Communication error",
+      zone_from: "From (cm)", zone_to: "To (cm)", zone_entry_delay: "⏱ Entry delay",
+      zone_ignore: "🔕 Ignore", zone_ignore_static: "📡 Ignore static",
+      preset_error: "Preset error", min_4_chars: "Min. 4 characters", learn_complete: "Done!",
     }
   };
   let LANG = localStorage.getItem('lang') || 'en';
@@ -417,8 +459,9 @@ const char index_html[] PROGMEM = R"rawliteral(
             <div id="state_text" style="color:#888; font-weight:bold; letter-spacing:2px; margin-bottom:5px" data-i18n="loading">NAČÍTÁM...</div>
             <div id="alarm_badge" style="margin-bottom:8px; font-size:0.9rem; font-weight:bold; color:#888">---</div>
             <button id="btn_arm" onclick="toggleArm()" style="width:auto; padding:8px 20px; margin-bottom:10px; background:#3700b3" data-i18n="arm">STŘEŽIT</button>
+            <div class="section-title" style="text-align:left" data-i18n="mw_radar_section">MW radar</div>
             <div class="big-val" id="dist_val" style="color:var(--accent)">---</div>
-            <div class="unit">DISTANCE (cm)</div>
+            <div class="unit" data-i18n="distance_cm">DISTANCE (cm)</div>
             <svg class="spark" id="graph_dist"></svg>
         </div>
         <div style="display:flex; gap:10px">
@@ -433,6 +476,11 @@ const char index_html[] PROGMEM = R"rawliteral(
                 <svg class="spark" id="graph_stat" style="height:30px; stroke:#bb86fc"></svg>
             </div>
         </div>
+        <div class="section-title" data-i18n="csi_section">WiFi CSI</div>
+        <div style="text-align:center; margin-top:4px">
+            <div id="csi_main_state" style="font-weight:bold; font-size:1.3rem; color:#888">—</div>
+            <div id="csi_main_link" class="unit" style="margin-top:2px">—</div>
+        </div>
     </div>
 
     <!-- HEALTH & STATS -->
@@ -440,14 +488,14 @@ const char index_html[] PROGMEM = R"rawliteral(
         <div class="stat-row"><span data-i18n="sensor_health">Zdraví senzoru</span><span id="h_score" class="stat-val">---%</span></div>
         <div class="stat-row"><span data-i18n="uart_state">UART Stav</span><span id="h_uart">---</span></div>
         <div class="stat-row"><span data-i18n="frame_rate">Snímková frekvence</span><span id="h_fps">--- FPS</span></div>
-        <div class="stat-row"><span>Comm Errors</span><span id="h_err" style="color:var(--warn)">0</span></div>
+        <div class="stat-row"><span data-i18n="comm_errors">Comm Errors</span><span id="h_err" style="color:var(--warn)">0</span></div>
         <div class="stat-row"><span data-i18n="ram">RAM (Volná/Min)</span><span id="h_heap">--- / --- KB</span></div>
         <div class="stat-row"><span data-i18n="chip_temp">Teplota čipu</span><span id="h_temp">--- °C</span></div>
         <div class="stat-row"><span data-i18n="uptime">Doba běhu</span><span id="h_uptime">---</span></div>
         <div style="display:flex; gap:5px; margin-top:10px; flex-wrap: wrap;">
-            <button class="sec" style="flex:1; min-width:80px;" onclick="api('radar/restart', {method:'POST'})">Restart Radar</button>
-            <button class="sec" style="flex:1; min-width:80px;" onclick="if(confirm('Restart ESP?')) api('restart', {method:'POST'})">Restart ESP</button>
-            <button class="warn" style="flex:1; min-width:80px;" onclick="if(confirm(t('factory_reset_confirm'))) api('radar/factory_reset', {method:'POST'})">Reset MW</button>
+            <button class="sec" style="flex:1; min-width:80px;" onclick="api('radar/restart', {method:'POST'})" data-i18n="restart_radar">Restart Radar</button>
+            <button class="sec" style="flex:1; min-width:80px;" onclick="if(confirm(t('restart_esp_confirm'))) api('restart', {method:'POST'})" data-i18n="restart_esp">Restart ESP</button>
+            <button class="warn" style="flex:1; min-width:80px;" onclick="if(confirm(t('factory_reset_confirm'))) api('radar/factory_reset', {method:'POST'})" data-i18n="reset_mw">Reset MW</button>
         </div>
     </div>
 
@@ -472,11 +520,11 @@ const char index_html[] PROGMEM = R"rawliteral(
             </div>
 
             <div class="row-input">
-                <span style="flex:1">Min Range (Gate)</span>
+                <span style="flex:1" data-i18n="min_range">Min Range (Gate)</span>
                 <input type="number" id="i_min" min="0" max="13" style="width:60px" onchange="saveBasic()">
             </div>
             <div class="row-input">
-                <span style="flex:1">Max Range (Gate)</span>
+                <span style="flex:1" data-i18n="max_range">Max Range (Gate)</span>
                 <input type="number" id="i_max" min="1" max="13" style="width:60px" onchange="saveBasic()">
             </div>
             
@@ -488,7 +536,7 @@ const char index_html[] PROGMEM = R"rawliteral(
 
             <div style="display:flex; align-items:center; gap:8px; margin-top:15px; margin-bottom:5px">
                 <input type="checkbox" id="chk_led" style="width:auto" onchange="saveBasic()">
-                <label for="chk_led">Enable LED (Indicator)</label>
+                <label for="chk_led" data-i18n="enable_led">Enable LED (Indicator)</label>
             </div>
             <div style="display:flex; align-items:center; gap:8px; margin-bottom:10px">
                 <input type="checkbox" id="chk_eng" style="width:auto" onchange="toggleEng()">
@@ -504,7 +552,7 @@ const char index_html[] PROGMEM = R"rawliteral(
                 <span data-i18n="radar_bt_warn">⚠️ Zapnout jen na dobu potřebnou pro diagnostiku HLK aplikací. Doporučeno vypnuto.</span>
             </p>
 
-            <button id="btn_calib" onclick="startCalib()" style="margin-top:15px">Calibrate Noise (60s)</button>
+            <button id="btn_calib" onclick="startCalib()" style="margin-top:15px" data-i18n="calib_noise">Calibrate Noise (60s)</button>
         </div>
 
         <!-- TAB 1: SECURITY -->
@@ -538,23 +586,23 @@ const char index_html[] PROGMEM = R"rawliteral(
 
             <div class="section-title"><span data-i18n="hb_title">HEARTBEAT (Pravidelný report)</span></div>
             <div class="row-input">
-                <span>Interval (h)</span>
+                <span data-i18n="interval_h">Interval (h)</span>
                 <input type="number" id="i_hb" placeholder="4" min="0" max="24" style="width:80px" onchange="saveSec()">
             </div>
             <p style="font-size:0.7rem; color:#666; margin:2px 0 15px 0">
                 <span data-i18n="hb_hint">0 = vypnuto, 4 = každé 4 hodiny zpráva "jsem OK".</span>
             </p>
 
-            <div class="section-title">PET IMMUNITY</div>
+            <div class="section-title" data-i18n="pet_immunity_title">PET IMMUNITY</div>
             <div class="row-input">
-                <span>Min Move Energy</span>
+                <span data-i18n="min_move_energy">Min Move Energy</span>
                 <input type="number" id="i_pet" placeholder="10" min="0" max="50" style="width:80px" onchange="saveSec()">
             </div>
             <p style="font-size:0.7rem; color:#666; margin:2px 0">
-                <span data-i18n="pet_hint">Filtruje malé objekty (kočky, psi) s nízkou energií</span &lt;2m.
+                <span data-i18n="pet_hint">Filtruje malé objekty (kočky, psi) s nízkou energií &lt;2m.</span>
             </p>
 
-            <div class="section-title">ALARM DELAY</div>
+            <div class="section-title" data-i18n="alarm_delay_title">ALARM DELAY</div>
             <div class="row-input">
                 <span data-i18n="entry_delay">Zpoždění vstupu (sec)</span>
                 <input type="number" id="i_entry_dl" placeholder="30" min="0" max="300" style="width:80px" onchange="saveAlarmConfig()">
@@ -568,20 +616,20 @@ const char index_html[] PROGMEM = R"rawliteral(
                 <label for="chk_dis_rem"><span data-i18n="disarm_reminder">Připomínka "Stále NESTŘEŽENO"</span></label>
             </div>
 
-            <div class="section-title">ABSENCE TIMEOUT</div>
+            <div class="section-title" data-i18n="absence_timeout_title">ABSENCE TIMEOUT</div>
             <div class="row-input">
-                <span>Unmanned Duration (sec)</span>
+                <span data-i18n="unmanned_duration">Unmanned Duration (sec)</span>
                 <input type="number" id="i_timeout" placeholder="10" min="0" max="255" style="width:80px" onchange="saveTimeout()">
             </div>
             <p style="font-size:0.7rem; color:#666; margin:2px 0 15px 0">
                 <span data-i18n="hold_hint">Doba, po které radar hlásí "nepřítomnost" bez detekce.</span>
             </p>
 
-            <div class="section-title">LIGHT SENSOR (OUT pin)</div>
+            <div class="section-title" data-i18n="light_sensor_title">LIGHT SENSOR (OUT pin)</div>
             <div class="row-input">
                 <span data-i18n="light_func">Funkce světla</span>
                 <select id="sel_light_func" style="width:140px" onchange="saveLightConfig()">
-                    <option value="0">Off</option>
+                    <option value="0" data-i18n="light_off">Off</option>
                     <option value="1"data-i18n="light_night">Noční režim (pod práh)</option>
                     <option value="2"data-i18n="light_day">Denní režim (nad práh)</option>
                 </select>
@@ -700,7 +748,7 @@ const char index_html[] PROGMEM = R"rawliteral(
             <div class="section-title">MQTT Broker</div>
             <div style="display:flex; align-items:center; gap:8px;">
                 <input type="checkbox" id="chk_mqtt_en" style="width:auto">
-                <label for="chk_mqtt_en">Enable MQTT</label>
+                <label for="chk_mqtt_en" data-i18n="enable_mqtt">Enable MQTT</label>
             </div>
             <input type="text" id="txt_mqtt_server" placeholder="Server IP">
             <div style="display:flex; gap:5px">
@@ -710,10 +758,10 @@ const char index_html[] PROGMEM = R"rawliteral(
             <input type="password" id="txt_mqtt_pass" placeholder="Password">
             <button onclick="saveMQTTConfig()" class="sec"data-i18n="save_mqtt">Uložit MQTT</button>
 
-            <div class="section-title">Telegram Notifications</div>
+            <div class="section-title" data-i18n="telegram_notifications">Telegram Notifications</div>
             <div style="display:flex; align-items:center; gap:8px;">
                 <input type="checkbox" id="chk_tg_en" style="width:auto">
-                <label for="chk_tg_en">Enable Bot</label>
+                <label for="chk_tg_en" data-i18n="enable_bot">Enable Bot</label>
             </div>
             <input type="text" id="txt_tg_token" placeholder="Bot Token">
             <input type="text" id="txt_tg_chat" placeholder="Chat ID">
@@ -721,7 +769,7 @@ const char index_html[] PROGMEM = R"rawliteral(
                 <button onclick="saveTelegram()" class="sec"data-i18n="save">Uložit</button>
                 <button onclick="testTelegram()" class="sec">Test</button>
             </div>
-            <div class="section-title">CREDENTIALS</div>
+            <div class="section-title" data-i18n="credentials_title">CREDENTIALS</div>
             <input type="text" id="txt_auth_user" placeholder="Username">
             <input type="password" id="txt_auth_pass" placeholder="New Password">
             <input type="password" id="txt_auth_pass2" placeholder="Confirm Password">
@@ -737,7 +785,7 @@ const char index_html[] PROGMEM = R"rawliteral(
 
         <!-- TAB 4: ZONES -->
         <div id="tab4" class="hidden">
-            <div class="label" style="margin-bottom:10px; font-size:0.8rem; color:#888">ZONE DEFINITIONS (cm)</div>
+            <div class="label" style="margin-bottom:10px; font-size:0.8rem; color:#888" data-i18n="zone_definitions">ZONE DEFINITIONS (cm)</div>
             <!-- SVG Zone Map -->
             <div style="position:relative; margin-bottom:10px">
                 <svg id="zone_map" width="100%" height="48" style="display:block"></svg>
@@ -802,15 +850,15 @@ const char index_html[] PROGMEM = R"rawliteral(
                 ⚠️ <span data-i18n="csi_warn">Tento firmware nebyl zkompilován s podporou WiFi CSI.</span>
             </div>
 
-            <div class="section-title">STAV CSI</div>
+            <div class="section-title" data-i18n="csi_status_title">STAV CSI</div>
             <div class="stat-row"><span data-i18n="csi_active">Aktivní</span><span id="csi_active_val" style="font-weight:bold">—</span></div>
             <div class="stat-row"><span>WiFi SSID</span><span id="csi_ssid_val">—</span></div>
             <div class="stat-row"><span>WiFi RSSI</span><span id="csi_rssi_val">—</span></div>
-            <div class="stat-row"><span>Pakety/s</span><span id="csi_pps_val">—</span></div>
+            <div class="stat-row"><span data-i18n="packets_per_s">Pakety/s</span><span id="csi_pps_val">—</span></div>
             <div class="stat-row"><span data-i18n="csi_idle">Idle baseline připraven</span><span id="csi_idle_val">—</span></div>
             <div class="stat-row"><span data-i18n="ap_compat">AP kompatibilita (HT LTF)</span><span id="csi_ap_compat" style="font-weight:bold">—</span></div>
 
-            <div class="section-title">DETEKCE POHYBU</div>
+            <div class="section-title" data-i18n="motion_detection_title">DETEKCE POHYBU</div>
             <div class="stat-row">
                 <span data-i18n="motion_state">Stav pohybu</span>
                 <span id="csi_motion_val" style="font-weight:bold; font-size:1.2rem">—</span>
@@ -821,7 +869,7 @@ const char index_html[] PROGMEM = R"rawliteral(
 
             <div class="section-title">FUSION (Radar + CSI)</div>
             <div class="stat-row">
-                <span>Fusion stav</span>
+                <span data-i18n="fusion_state">Fusion stav</span>
                 <span id="fus_presence_val" style="font-weight:bold; font-size:1.2rem">—</span>
             </div>
             <div class="stat-row"><span>Confidence</span><span id="fus_conf_val">—</span></div>
@@ -997,6 +1045,7 @@ const char index_html[] PROGMEM = R"rawliteral(
         <div id="ota_bar" style="height:5px; background:#333; margin-top:5px; width:0%; transition:width 0.2s; background:var(--accent)"></div>
         <button id="btn_ota" onclick="uploadFW()" data-i18n="upload_fw">Nahrát Firmware</button>
         <button id="btn_espota" onclick="prepareEspota()" class="sec" data-i18n="ota_espota_prepare">Připravit espota okno</button>
+        <p style="font-size:0.7rem; color:#888; margin:6px 0 0 0" data-i18n="ota_espota_help">Pro flash nástrojem espota.py (UDP 3232) místo nahrání souboru. Otevře dočasné okno (odpojí CSI WiFi, odstaví CSI/MQTT, pozastaví radar), aby espota spolehlivě prošlo. Reboot není potřeba.</p>
 
         <hr style="border:none; border-top:1px solid #333; margin:14px 0 10px">
         <div class="stat-row"><span data-i18n="pull_ota_title">Pull OTA z URL</span></div>
@@ -1024,7 +1073,7 @@ const api = (ep, opts={}) => {
         delete opts.body;
     }
     return fetch('/api/'+ep, opts).then(r => {
-        if(r.ok) showToast("OK"); else showToast("Chyba");
+        if(r.ok) showToast("OK"); else showToast(t('error'));
         return r;
     });
 };
@@ -1053,7 +1102,7 @@ function connectSSE() {
         updateUI(d);
         if(d.alarm_state) { alarmArmed = d.armed; updateAlarmUI(d.alarm_state); }
         if(d.gate_move && !$('tab2').classList.contains('hidden')) updateGatesUI(d);
-        if(d.csi) updateCSIUI(d.csi);
+        if(d.csi) { renderCsiMainPanel(d.csi); updateCSIUI(d.csi); }
     });
 
     evtSource.onerror = () => {
@@ -1123,25 +1172,37 @@ function loadMainConfig() {
 }
 
 function updateUI(d) {
-    // Sparklines
-    histDist.push(d.distance_mm/10); histDist.shift();
-    histMov.push(d.moving_energy); histMov.shift();
-    histStat.push(d.static_energy); histStat.shift();
-    
+    // Radar disconnected (telemetry `connected:false`, or fields missing on mutex
+    // timeout) → don't show stale zeros/NaN; show "—" and flag "Radar odpojen".
+    const connected = (d.connected !== false);
+    const dist = d.distance_mm / 10;
+    const distOk = connected && Number.isFinite(dist);
+    const movOk = connected && (d.moving_energy != null);
+    const statOk = connected && (d.static_energy != null);
+
+    // Sparklines (push 0 instead of NaN/stale so the graph stays valid)
+    histDist.push(distOk ? dist : 0); histDist.shift();
+    histMov.push(movOk ? d.moving_energy : 0); histMov.shift();
+    histStat.push(statOk ? d.static_energy : 0); histStat.shift();
+
     drawSpark('graph_dist', histDist, 400); // max 400cm
     drawSpark('graph_mov', histMov, 100);
     drawSpark('graph_stat', histStat, 100);
-    
-    // Values
-    $('dist_val').innerText = (d.distance_mm/10).toFixed(0);
-    $('mov_val').innerText = d.moving_energy + '%';
-    $('stat_val').innerText = d.static_energy + '%';
-    
-    let st = "KLID";
-    let stColor = "#888";
-    if(d.state === "detected") { st = "DETEKCE"; stColor = "var(--accent)"; }
-    else if(d.state === "hold") { st = t('hold_state'); stColor = "#bb86fc"; }
-    if(d.tamper) { st = t('tamper_state'); stColor = "var(--warn)"; }
+
+    // Values ("—" when radar offline instead of NaN/stale)
+    $('dist_val').innerText = distOk ? dist.toFixed(0) : '—';
+    $('mov_val').innerText = movOk ? d.moving_energy + '%' : '—';
+    $('stat_val').innerText = statOk ? d.static_energy + '%' : '—';
+
+    let st, stColor;
+    if (!connected) {
+        st = t('radar_disconnected'); stColor = "var(--warn)";
+    } else {
+        st = t('idle'); stColor = "#888";
+        if(d.state === "detected") { st = t('detected_state'); stColor = "var(--accent)"; }
+        else if(d.state === "hold") { st = t('hold_state'); stColor = "#bb86fc"; }
+        if(d.tamper) { st = t('tamper_state'); stColor = "var(--warn)"; }
+    }
     $('state_text').innerText = st;
     $('state_text').style.color = stColor;
     drawZoneMap(d.raw_stat_dist, d.raw_mov_dist);
@@ -1276,7 +1337,7 @@ function loadCSIConfig() {
         }
 
         // Live status
-        $('csi_active_val').innerText = d.active ? 'ANO' : 'NE';
+        $('csi_active_val').innerText = d.active ? t('yes') : t('no');
         $('csi_active_val').style.color = d.active ? 'var(--accent)' : '#888';
         $('csi_ssid_val').innerText  = d.wifi_ssid || '—';
         $('csi_rssi_val').innerText  = (d.wifi_rssi !== undefined && d.wifi_rssi !== 0) ? (d.wifi_rssi + ' dBm') : '—';
@@ -1378,6 +1439,39 @@ function updateMLUI(d) {
     }
 }
 
+// Main-panel CSI indicator — renders regardless of active tab so the client sees
+// at a glance that CSI is alive (and whether it detects). Three states:
+// offline (no WiFi assoc / no packets), KLID (alive, idle), POHYB (detecting).
+let csiLastDataMs = 0;   // last time we saw CSI packets (pps>0), for stale-data detection
+function renderCsiMainPanel(csi) {
+    const st = $('csi_main_state'), link = $('csi_main_link');
+    if (!st || !link) return;
+    const now = Date.now();
+    const pps = (csi.pps !== undefined) ? csi.pps : 0;
+    if (pps > 0) csiLastDataMs = now;
+    // rssi==0 = not associated to AP (getWifiRSSI returns 0 when not WL_CONNECTED)
+    const associated = (csi.rssi !== undefined && csi.rssi !== 0);
+    if (!associated) {
+        st.innerText = t('csi_offline');
+        st.style.color = '#666';
+        link.innerText = '—';
+        return;
+    }
+    const linkTxt = pps.toFixed(1) + ' pkt/s · ' + csi.rssi + ' dBm';
+    // Associated but no CSI frames for >5s → detection is starved (weak signal / AP issue).
+    // Don't flicker per-frame on momentary pps=0; debounce on last-packet time.
+    if (now - csiLastDataMs > 5000) {
+        st.innerText = t('csi_nodata');
+        st.style.color = 'var(--warn)';
+        link.innerText = linkTxt;
+        return;
+    }
+    const motion = !!csi.motion;
+    st.innerText = motion ? t('motion') : t('idle');
+    st.style.color = motion ? 'var(--accent)' : '#888';
+    link.innerText = linkTxt;
+}
+
 function updateCSIUI(csi) {
     // Called from SSE telemetry handler with the `csi` sub-object
     if (!csi) return;
@@ -1390,7 +1484,7 @@ function updateCSIUI(csi) {
     drawSpark('csi_graph', histCsiComp, 2.0);
 
     if (csi.motion !== undefined) {
-        $('csi_motion_val').innerText = csi.motion ? 'POHYB' : 'KLID';
+        $('csi_motion_val').innerText = csi.motion ? t('motion') : t('idle');
         $('csi_motion_val').style.color = csi.motion ? 'var(--accent)' : '#888';
     }
     if (csi.composite !== undefined) $('csi_comp_val').innerText = csi.composite.toFixed(4);
@@ -1421,7 +1515,7 @@ function updateCSIUI(csi) {
 function updateFusionUI(f) {
     if (!f) return;
     let srcLabels = {none:'—', radar:'Radar', csi:'CSI', both:'Radar + CSI'};
-    $('fus_presence_val').innerText = f.presence ? 'DETEKCE' : 'KLID';
+    $('fus_presence_val').innerText = f.presence ? t('detected_state') : t('idle');
     $('fus_presence_val').style.color = f.presence ? 'var(--warn)' : '#888';
     $('fus_conf_val').innerText = (f.confidence !== undefined) ? (f.confidence * 100).toFixed(0) + '%' : '—';
     $('fus_source_val').innerText = srcLabels[f.source] || f.source || '—';
@@ -1431,7 +1525,7 @@ function toggleFusion(en) {
     let p = new URLSearchParams();
     p.append('fusion_enabled', en ? '1' : '0');
     api('csi', {method:'POST', body:p}).then(r=>r.json()).then(d => {
-        showToast(en ? 'Fusion zapnut' : 'Fusion vypnut');
+        showToast(en ? t('fusion_on') : t('fusion_off'));
         if (!en) {
             $('fus_presence_val').innerText = '—';
             $('fus_conf_val').innerText = '—';
@@ -1589,7 +1683,7 @@ function renderTimelineBar(events) {
             }
         }
     });
-    if (!hasBins) { $('evt_timeline').innerHTML = '<text x="144" y="20" text-anchor="middle" fill="#444" font-size="10"><tspan data-i18n="no_timeline">Nedostatek dat pro timeline</tspan></text>'; return; }
+    if (!hasBins) { $('evt_timeline').innerHTML = '<text x="144" y="20" text-anchor="middle" fill="#444" font-size="10">' + t('no_timeline') + '</text>'; return; }
     for (let i = 0; i < 288; i++) if (bins[i] > maxBin) maxBin = bins[i];
 
     let svg = '';
@@ -1631,7 +1725,7 @@ function renderEventList(events, append) {
         </div>`;
     });
     if (append) { container.innerHTML += h; }
-    else { container.innerHTML = h || '<div style="text-align:center; padding:20px; color:#555">No events</div>'; }
+    else { container.innerHTML = h || ('<div style="text-align:center; padding:20px; color:#555">' + t('no_events') + '</div>'); }
 }
 
 function loadEvents() {
@@ -1903,7 +1997,7 @@ function testTelegram() {
     .then(d => {
         showToast(d.success ? "Telegram OK!" : t('tg_error') + ": " + (d.error || t('tg_unknown')));
     })
-    .catch(e => showToast("Chyba komunikace"));
+    .catch(e => showToast(t('comm_error')));
 }
 
 // --- Timezone ---
@@ -2006,9 +2100,9 @@ function renderZones() {
         const ab = z.alarm_behavior ?? 0;
         h += `<div style="margin-bottom:5px; background:#222; padding:5px; border-radius:5px; border-left:3px solid ${ZONE_COLORS[ab]||'#444'}">
             <div style="display:flex; gap:5px; margin-bottom:5px">
-                <input type="text" value="${z.name}" id="z_name_${i}" style="flex:2" placeholder="" data-i18n="zone_name">
-                <input type="number" value="${z.min}" id="z_min_${i}" style="flex:1" placeholder="Od (cm)">
-                <input type="number" value="${z.max}" id="z_max_${i}" style="flex:1" placeholder="Do (cm)">
+                <input type="text" value="${z.name}" id="z_name_${i}" style="flex:2" placeholder="${t('zone_name')}">
+                <input type="number" value="${z.min}" id="z_min_${i}" style="flex:1" placeholder="${t('zone_from')}">
+                <input type="number" value="${z.max}" id="z_max_${i}" style="flex:1" placeholder="${t('zone_to')}">
             </div>
             <div style="display:flex; gap:5px; align-items:center">
                 <select id="z_lvl_${i}" style="flex:1">
@@ -2017,13 +2111,13 @@ function renderZones() {
                     <option value="2" ${z.level==2?'selected':''}>Warn</option>
                     <option value="3" ${z.level==3?'selected':''}>ALARM</option>
                 </select>
-                <select id="z_ab_${i}" style="flex:2" title="" data-i18n="zone_behavior">
-                    <option value="0" ${ab==0?'selected':''}>⏱ Entry delay</option>
-                    <option value="1" ${ab==1?'selected':''}data-i18n="zone_immediate">🚨 Okamžité</option>
-                    <option value="2" ${ab==2?'selected':''}>🔕 Ignorovat</option>
-                    <option value="3" ${ab==3?'selected':''}>📡 Ignorovat statiku</option>
+                <select id="z_ab_${i}" style="flex:2" title="${t('zone_behavior')}">
+                    <option value="0" ${ab==0?'selected':''}>${t('zone_entry_delay')}</option>
+                    <option value="1" ${ab==1?'selected':''}>${t('zone_immediate')}</option>
+                    <option value="2" ${ab==2?'selected':''}>${t('zone_ignore')}</option>
+                    <option value="3" ${ab==3?'selected':''}>${t('zone_ignore_static')}</option>
                 </select>
-                <input type="number" value="${z.delay||0}" id="z_del_${i}" style="flex:1" placeholder="" data-i18n="zone_delay">
+                <input type="number" value="${z.delay||0}" id="z_del_${i}" style="flex:1" placeholder="${t('zone_delay')}">
                 <input type="checkbox" id="z_en_${i}" ${z.enabled!==false?'checked':''} style="width:auto">
                 <button onclick="delZone(${i})" class="warn" style="width:auto; margin:0; padding:5px 10px">×</button>
             </div>
@@ -2111,7 +2205,7 @@ function pollLearn() {
         if (!d.active && d.progress === 100) {
             clearInterval(learnPollTimer);
             $('btn_learn').disabled = false;
-            let txt = `✅ Hotovo! Top gate: ${d.top_gate} (~${d.top_cm}cm), confidence: ${d.confidence}%`;
+            let txt = `✅ ${t('learn_complete')} Top gate: ${d.top_gate} (~${d.top_cm}cm), confidence: ${d.confidence}%`;
             if (d.suggest_ready) {
                 txt += ` <button onclick="applyLearnZone(${d.suggest_min_cm},${d.suggest_max_cm})" class="sec" style="padding:2px 8px; margin-left:6px">${t('apply')}</button>`;
             } else {
@@ -2144,10 +2238,10 @@ function saveGates() {
         else showToast(t('gates_error'));
     });
 }
-function setPreset(t) {
-    fetch('/api/preset?name=' + t, {method:'POST'}).then(r => {
-        if(!r.ok) { showToast("Chyba presetu"); return; }
-        showToast(t('preset_applied') + " (" + t + ")");
+function setPreset(pname) {
+    fetch('/api/preset?name=' + pname, {method:'POST'}).then(r => {
+        if(!r.ok) { showToast(t('preset_error')); return; }
+        showToast(t('preset_applied') + " (" + pname + ")");
         // Re-fetch config and update sliders in-place (no reload)
         fetch('/api/config').then(r=>r.json()).then(d => {
             if(d.mov_sens && d.stat_sens) renderGateSliders(d.mov_sens, d.stat_sens);
@@ -2361,13 +2455,13 @@ function saveAuth() {
     let p2 = $('txt_auth_pass2').value;
     if(!u || !p) { showToast(t('enter_creds')); return; }
     if(p !== p2) { showToast(t('pass_mismatch')); return; }
-    if(u.length < 4 || p.length < 4) { showToast("Min. 4 znaky"); return; }
+    if(u.length < 4 || p.length < 4) { showToast(t('min_4_chars')); return; }
 
     fetch(`/api/auth/config?user=${encodeURIComponent(u)}&pass=${encodeURIComponent(p)}`, {
         method: 'POST'
     }).then(r => {
         if(r.ok) { showToast(t('pass_changed')); alert(t('creds_changed')); }
-        else r.text().then(t => showToast(t || "Chyba"));
+        else r.text().then(errTxt => showToast(errTxt || t('error')));
     });
 }
 

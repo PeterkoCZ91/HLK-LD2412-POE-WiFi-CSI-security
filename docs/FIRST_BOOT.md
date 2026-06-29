@@ -85,6 +85,14 @@ goes `motion`, `moving_energy` climbs, `distance_mm` tracks you.
 > An all-zero radar with `uart_state: DISCONNECTED` is almost always wiring or
 > baud — it does **not** affect CSI. The node keeps running CSI-only.
 
+> **Radar-less (CSI-only) units.** If no radar is wired, the node logs the
+> radar status **once** after ~30 s, then latches radar monitoring off and runs
+> on CSI detection alone — it does *not* spam "Radar sensor connection lost".
+> The radar cannot be (re)attached without a reboot, so monitoring stays off
+> until restart. Watch this state via `/api/health` →
+> `radar_monitoring_disabled: true` or the `poe2412_radar_monitoring_disabled`
+> Prometheus metric.
+
 ## Verify WiFi CSI
 
 1. Point the ESP at a **2.4 GHz** AP: CSI tab → *WiFi*, or

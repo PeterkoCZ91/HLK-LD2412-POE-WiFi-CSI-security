@@ -605,10 +605,10 @@ Exported metric families (`poe2412_` prefix):
 | Group | Metrics |
 |-------|---------|
 | System | `uptime_seconds`, `heap_free_bytes`, `heap_min_free_bytes`, `heap_largest_block_bytes`, `chip_temp_celsius`, `info{fw=...}` |
-| Radar | `radar_connected`, `radar_frame_rate`, `radar_errors_total`, `radar_health_score` |
+| Radar | `radar_connected`, `radar_monitoring_disabled` (latched CSI-only until reboot), `radar_frame_rate`, `radar_errors_total`, `radar_health_score` |
 | Network | `eth_link_up`, `eth_speed_mbps`, `mqtt_connected`, `mqtt_publish_fails_total`, `mqtt_reconnects_total` |
 | Security | `alarm_state` (0=DISARMED … 4=TRIGGERED), `alarm_armed`, `http_auth_ok_total`, `http_auth_fail_total` |
-| Fusion / CSI | `fusion_enabled`, `fusion_presence`, `fusion_confidence`, `csi_active`, `csi_packets_total`, `csi_packet_rate`, `csi_wifi_rssi_dbm`, `csi_effective_threshold`, `csi_motion`, `csi_ml_probability` |
+| Fusion / CSI | `fusion_enabled`, `fusion_presence`, `fusion_confidence`, `csi_active`, `csi_data_ok` (0 = associated but no CSI frames), `csi_packets_total`, `csi_packet_rate`, `csi_wifi_rssi_dbm`, `csi_effective_threshold`, `csi_motion`, `csi_ml_probability` |
 
 CSI metrics are omitted on radar-only builds. Example `prometheus.yml` scrape config:
 
@@ -624,7 +624,7 @@ scrape_configs:
       - targets: ["<device-ip>:80"]
 ```
 
-Useful starting points for alerts: `poe2412_heap_free_bytes` trending down (slow leak), `poe2412_csi_packet_rate` dropping below ~50 (degraded CSI), `poe2412_mqtt_connected == 0`, and `poe2412_alarm_state == 4` (TRIGGERED).
+Useful starting points for alerts: `poe2412_heap_free_bytes` trending down (slow leak), `poe2412_csi_data_ok == 0` (CSI associated but starved — weak signal/AP issue), `poe2412_csi_packet_rate` dropping below ~50 (degraded CSI), `poe2412_mqtt_connected == 0`, and `poe2412_alarm_state == 4` (TRIGGERED).
 
 ---
 

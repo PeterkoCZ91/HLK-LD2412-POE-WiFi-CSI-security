@@ -2,6 +2,40 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.0.15-poe-wifi] - 2026-06-29
+
+Sensor visibility release: the main dashboard now shows CSI detection at a glance, both
+sensors report clear offline/no-data states instead of stale zeros, and weak-signal / radar
+loss conditions are logged and exposed for Home Assistant alerting.
+
+### Added
+
+- **Main-dashboard CSI indicator.** The status card is split into an **MW radar** section and a
+  new **WiFi CSI** section, so a client sees CSI liveness without opening the CSI tab. States:
+  `CSI offline` (not associated), `No data` (associated but no CSI frames — weak signal/AP issue),
+  `idle`, `motion`. Especially useful on radar-less CSI-only units, where the panel previously
+  looked dead.
+- **CSI data-starvation detection.** When WiFi is associated but no CSI frames arrive for >15 s,
+  the firmware logs `CSI data lost` (and `CSI data restored` once data flows again for ≥10 s, with
+  hysteresis so a marginal link does not flood the log). Exposed as `csi_data_ok` in `/api/health`
+  and the `poe2412_csi_data_ok` Prometheus metric.
+- **Radar CSI-only latch.** On a unit with no radar wired, the radar status is logged once and then
+  monitoring latches off (CSI-only until reboot) instead of repeatedly logging
+  `Radar sensor connection lost`. Exposed as `radar_monitoring_disabled` in `/api/health` and the
+  `poe2412_radar_monitoring_disabled` metric.
+- **Inline help** for the *Prepare espota window* button explaining what it does.
+
+### Changed
+
+- Radar readout shows `Radar disconnected` and `—` instead of stale zeros / `NaN` when the MW
+  sensor is offline.
+- GUI localization completed: full Czech/English parity, no remaining hardcoded UI strings.
+
+### Fixed
+
+- Main panel no longer renders `NaN` when radar telemetry is momentarily unavailable.
+- CSI main-panel indicator no longer flickers on a weak link (debounced).
+
 ## [5.0.9-poe-wifi] - 2026-06-26
 
 OTA dual-homing fix. The long-standing "espota randomly fails / works on retry" problem is

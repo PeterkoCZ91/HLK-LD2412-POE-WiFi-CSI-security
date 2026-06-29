@@ -44,7 +44,7 @@
 // -------------------------------------------------------------------------
 #include <Update.h>
 #ifndef FW_VERSION
-#define FW_VERSION "v5.0.9-poe-wifi"
+#define FW_VERSION "v5.0.15-poe-wifi"
 #endif
 #define WDT_TIMEOUT_SECONDS 60
 
@@ -190,6 +190,9 @@ bool bootValidated = false;
 // "reboot_inhibit" persists the choice across reboots.
 std::atomic<bool> g_rebootInhibit{false};
 std::atomic<bool> g_otaRebootForce{false};
+// CSI data health: true when WiFi is associated but no CSI frames arrive (weak
+// signal / AP issue) → detection is starved. Surfaced in /api/health + metrics.
+std::atomic<bool> g_csiDataStarved{false};
 #ifndef LITE_BUILD
 std::atomic<bool> g_espotaPrepareRequested{false};
 std::atomic<bool> g_espotaMaintenance{false};
@@ -1468,6 +1471,51 @@ void loop() {
         securityMonitor.checkTamperState(data.tamper_alert);
         securityMonitor.checkRadarHealth(radar.isRadarConnected());
         // RSSI anomaly detection removed — Ethernet doesn't have RSSI
+
+#ifdef USE_CSI
+        // CSI data health: WiFi associated but no CSI frames for >15s = detection
+        // starved (weak signal / AP issue). Log lost/restored transitions to the
+        // web SYS log and surface state for /api/health + metrics. Recovers on its
+        // own when frames resume (unlike the radar latch which needs a reboot).
+        {
+            static bool csiStarved = false;
+            static unsigned long csiLastDataMs = 0;
+            static unsigned long csiRecoverSinceMs = 0;
+            int csiRssi = csiService.getWifiRSSI();
+            bool csiAssociated = (csiRssi != 0);   // getWifiRSSI()==0 → not WL_CONNECTED
+            float csiPps = csiService.getPacketRate();
+            if (!csiAssociated) {
+                csiLastDataMs = 0;                 // restart grace clock for next association
+                csiRecoverSinceMs = 0;
+            } else {
+                if (csiLastDataMs == 0) csiLastDataMs = now;   // grace starts at association
+                if (csiPps > 0.0f) csiLastDataMs = now;
+            }
+            bool starvedNow = csiAssociated && (now - csiLastDataMs > TIMEOUT_CSI_DATA_STARVE_MS);
+            if (starvedNow && !csiStarved) {
+                systemLog.warn("CSI data lost — RSSI " + String(csiRssi) + " dBm (reason " +
+                               String((int)csiService.getLastDisconnectReason()) + ")");
+                csiStarved = true;
+                csiRecoverSinceMs = 0;
+            } else if (csiStarved) {
+                // Recovery needs SUSTAINED data flow, not one stray packet — otherwise a
+                // marginal link flaps lost/restored and floods the log. Require pps>0
+                // continuously for TIMEOUT_CSI_DATA_RECOVER_MS before clearing.
+                if (csiPps > 0.0f) {
+                    if (csiRecoverSinceMs == 0) csiRecoverSinceMs = now;
+                    if (now - csiRecoverSinceMs >= TIMEOUT_CSI_DATA_RECOVER_MS) {
+                        systemLog.info("CSI data restored — RSSI " + String(csiRssi) + " dBm, " +
+                                       String(csiPps, 1) + " pkt/s");
+                        csiStarved = false;
+                        csiRecoverSinceMs = 0;
+                    }
+                } else {
+                    csiRecoverSinceMs = 0;   // gap in data → restart sustained-recovery timer
+                }
+            }
+            g_csiDataStarved.store(csiStarved);
+        }
+#endif
     }
 
     // OTA Rollback Validation

@@ -85,6 +85,8 @@ constexpr unsigned long COOLDOWN_TAMPER_ALERT_MS     = 600000;    // Tamper aler
 constexpr unsigned long COOLDOWN_RADAR_ALERT_MS      = 300000;    // Radar alert cooldown (5 min)
 constexpr unsigned long COOLDOWN_NETWORK_ANOMALY_MS  = 300000;    // ETH anomaly alert cooldown (5 min)
 constexpr unsigned long TIMEOUT_RADAR_DISCONNECT_MS  = 30000;     // Radar disconnect threshold (30s)
+constexpr unsigned long TIMEOUT_CSI_DATA_STARVE_MS   = 15000;     // CSI associated but no frames → starved (15s)
+constexpr unsigned long TIMEOUT_CSI_DATA_RECOVER_MS  = 10000;     // sustained data flow before clearing starved (10s, anti-flap)
 constexpr unsigned long INTERVAL_RSSI_BASELINE_MS    = 30000;     // RSSI baseline establishment (30s)
 
 // CSI WiFi RSSI thresholds (for /api/health warning surface)

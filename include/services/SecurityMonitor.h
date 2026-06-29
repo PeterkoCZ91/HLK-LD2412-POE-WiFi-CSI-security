@@ -96,6 +96,10 @@ public:
     void checkRadarHealth(bool isConnected);
     void checkSystemHealth();
 
+    // True once radar monitoring has latched off (radar lost or never present).
+    // Device runs on CSI-only detection until reboot. See checkRadarHealth().
+    bool isRadarMonitoringDisabled() const { return _radarMonitoringDisabled; }
+
     // Security Pack v2.0
     void processRadarData(uint16_t distance, uint8_t move_energy, uint8_t static_energy);
     String getDirection() const { return _lastDirection; }
@@ -261,6 +265,8 @@ private:
     // Radar health
     bool _lastRadarConnected = true;
     unsigned long _radarDisconnectedTime = 0;
+    bool _radarEverConnected = false;       // true once radar seen connected at least once
+    bool _radarMonitoringDisabled = false;  // latched off after loss/absence — CSI-only until restart
 
     // System health
     bool _systemHealthy = true;

@@ -327,35 +327,52 @@ void SecurityMonitor::checkTamperState(bool isTamper) {
 void SecurityMonitor::checkRadarHealth(bool isConnected) {
     unsigned long now = millis();
 
+    // Monitoring latched off (radar lost or never present). The radar cannot be
+    // (re)attached without a reboot, so stop polling/alerting until restart and
+    // run on CSI-only detection — avoids endless "connection lost" log spam.
+    if (_radarMonitoringDisabled) {
+        return;
+    }
+
+    // Radar seen connected — clears the "never present" case.
+    if (isConnected) {
+        if (!_radarEverConnected) {
+            _radarEverConnected = true;
+            DBG("SecMon", "Radar detected");
+        }
+        if (!_lastRadarConnected) {
+            DBG("SecMon", "Radar reconnected");
+            _lastEvent.radar_disconnected = false;
+        }
+        _lastRadarConnected = true;
+        return;
+    }
+
     // Radar just disconnected
-    if (!isConnected && _lastRadarConnected) {
+    if (_lastRadarConnected) {
         _radarDisconnectedTime = now;
         DBG("SecMon", "Radar disconnected");
     }
+    _lastRadarConnected = false;
 
-    // Radar been disconnected for more than 30 seconds
-    if (!isConnected && (now - _radarDisconnectedTime > TIMEOUT_RADAR_DISCONNECT_MS)) {
-        if (now - _lastRadarAlert > COOLDOWN_RADAR_ALERT_MS) {
-            String msg = "Radar sensor connection lost";
-            String details = "Duration: " + String((now - _radarDisconnectedTime) / 1000) + "s\n";
-            details += "Check UART connection and power supply.";
+    // Radar absent/lost for more than the disconnect timeout: emit ONE alert,
+    // then latch monitoring off until restart.
+    if (now - _radarDisconnectedTime > TIMEOUT_RADAR_DISCONNECT_MS) {
+        String msg = _radarEverConnected
+            ? "Radar sensor connection lost — CSI-only until restart"
+            : "Radar not detected — running CSI-only mode";
+        String details = _radarEverConnected
+            ? "Duration: " + String((now - _radarDisconnectedTime) / 1000) + "s\n"
+              "Check UART connection and power supply. Reboot to re-enable radar."
+            : "No radar on UART at boot. Reboot to re-enable radar.";
 
-            DBG("SecMon", "Radar offline for extended period");
-            triggerAlert(NotificationType::SYSTEM_ERROR, msg, details);
-            _lastRadarAlert = now;
+        DBG("SecMon", "Radar monitoring disabled until restart (CSI-only)");
+        triggerAlert(NotificationType::SYSTEM_ERROR, msg, details);
 
-            _lastEvent.radar_disconnected = true;
-            _lastEvent.last_event_time = now;
-        }
+        _lastEvent.radar_disconnected = true;
+        _lastEvent.last_event_time = now;
+        _radarMonitoringDisabled = true;  // latch — no further checks until reboot
     }
-
-    // Radar reconnected
-    if (isConnected && !_lastRadarConnected) {
-        DBG("SecMon", "Radar reconnected");
-        _lastEvent.radar_disconnected = false;
-    }
-
-    _lastRadarConnected = isConnected;
 }
 
 const char* SecurityMonitor::getFusionSourceStr() const {

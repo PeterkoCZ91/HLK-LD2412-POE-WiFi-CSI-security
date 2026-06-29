@@ -51,6 +51,7 @@ extern std::atomic<uint8_t> g_otaRuntimeOwner;
 extern std::atomic<unsigned long> g_otaRuntimeLastProgressMs;
 extern std::atomic<uint32_t> g_otaRuntimeLastBytes;
 extern std::atomic<uint32_t> g_otaRuntimeTimeoutMs;
+extern std::atomic<bool> g_csiDataStarved;
 extern const char* otaRuntimeOwnerName(uint8_t owner);
 extern uint8_t otaRuntimeOwner();
 extern bool otaRuntimeTryBegin(uint8_t owner, uint32_t timeoutMs);
@@ -260,6 +261,8 @@ void setupTelemetryRoutes() {
         doc["frame_rate"] = _deps.radar->getFrameRate();
         doc["error_count"] = _deps.radar->getErrorCount();
         doc["health_score"] = _deps.radar->getHealthScore();
+        doc["radar_monitoring_disabled"] = _deps.securityMonitor->isRadarMonitoringDisabled();
+        doc["csi_data_ok"] = !g_csiDataStarved.load();
         doc["free_heap"] = ESP.getFreeHeap();
         doc["min_heap"] = ESP.getMinFreeHeap();
         doc["chip_temp"] = temperatureRead();
@@ -500,6 +503,7 @@ void setupTelemetryRoutes() {
         m.heap_largest = ESP.getMaxAllocHeap();
         m.chip_temp_c  = temperatureRead();
         m.radar_connected    = _deps.radar->isRadarConnected();
+        m.radar_monitoring_disabled = _deps.securityMonitor->isRadarMonitoringDisabled();
         m.radar_frame_rate   = _deps.radar->getFrameRate();
         m.radar_error_count  = _deps.radar->getErrorCount();
         m.radar_health_score = _deps.radar->getHealthScore();
@@ -525,6 +529,7 @@ void setupTelemetryRoutes() {
             m.csi_effective_threshold = _deps.csiService->getEffectiveThreshold();
             m.csi_motion = _deps.csiService->getMotionState();
             m.csi_ml_probability = _deps.csiService->getMlProbability();
+            m.csi_data_ok = !g_csiDataStarved.load();
         }
         #endif
         // static = BSS, ne stack async_tcp tasku; handlery běží sériově v jednom tasku
