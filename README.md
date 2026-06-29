@@ -3,7 +3,7 @@
 [![PlatformIO](https://img.shields.io/badge/PlatformIO-ESP32-orange?logo=platformio)](https://platformio.org/)
 [![ESP32](https://img.shields.io/badge/MCU-ESP32--WROOM--32-blue?logo=espressif)](https://www.espressif.com/)
 [![License](https://img.shields.io/badge/License-GPL--3.0-blue)](LICENSE)
-[![Version](https://img.shields.io/badge/Version-5.0.9--poe--wifi-blue)]()
+[![Version](https://img.shields.io/badge/Version-5.0.16--poe--wifi-blue)]()
 [![Discussions](https://img.shields.io/badge/GitHub-Discussions-purple?logo=github)](https://github.com/PeterkoCZ91/HLK-LD2412-POE-WiFi-CSI-security/discussions)
 
 **Dual-sensor intrusion detection system** — ESP32 + HLK-LD2412 24 GHz mmWave radar + **WiFi CSI (Channel State Information) passive motion detection** over **wired Ethernet with Power over Ethernet**. Full alarm state machine, zone management, Home Assistant integration, Telegram bot, and a dark-mode web dashboard. No cloud required.
@@ -11,7 +11,7 @@
 WiFi CSI detection algorithms based on [ESPectre](https://github.com/francescopace/espectre) by Francesco Pace (GPLv3).
 
 > [!TIP]
-> **v5.0.8** — OTA & config reliability: fixes the "empty reply" / 180 s hang on authenticated OTA and config-import (auth-after-body in the AsyncWebServer fork → stateless preemptive Basic + close-on-auth-fail), config-import now actually applies string fields (ArduinoJson `is<String>()` bug), out-of-coverage WiFi diagnostics over `/api/csi` (link state pullable over Ethernet, no serial needed), and an 8 MB flash board variant. Pull OTA validated end-to-end on a remote node. See [CHANGELOG](CHANGELOG.md).
+> **v5.0.16** — dashboard polish: the web UI is now radar-aware and hides all microwave-radar chrome on CSI-only units (distance gauge, radar health rows, Gate sensitivity / Zones tabs, radar-only fields) while promoting WiFi CSI to the main readout, packs cards without empty gaps via a masonry layout, collapses expert detail behind collapsible sections on the CSI tab, and finally renders fully in the selected language on load (`applyLang()` previously never ran at startup; English by default). See [CHANGELOG](CHANGELOG.md).
 >
 > **v5.0.7** — quick wins: new [`/metrics` Prometheus endpoint](#prometheus-metrics) for Grafana dashboards, per-IP brute-force lockout on web auth (`429` + exponential backoff), first automated unit tests (`pio test -e native`) and cppcheck static analysis in CI. See [CHANGELOG](CHANGELOG.md).
 >
@@ -479,6 +479,8 @@ The embedded web dashboard provides real-time telemetry, alarm control, zone man
 | ![Zones](docs/screenshots/zones.png) | ![Events](docs/screenshots/events.png) |
 | ![CSI Fusion](docs/screenshots/csi-fusion.png) | |
 
+Since v5.0.16 the dashboard adapts to the sensors actually present: on a CSI-only unit (no radar wired) it hides all microwave-radar chrome — the distance gauge, radar health rows, the Restart/Reset buttons, and the Gate sensitivity and Zones tabs — promotes WiFi CSI to the main readout, and offers a reveal link for the hidden controls; dual-sensor units are unaffected and radar chrome returns automatically once the radar is reattached. Cards pack vertically with a masonry layout (no large empty gaps), expert CSI detail is collapsed behind collapsible sections by default, and the UI renders fully in the selected language on load (English by default).
+
 The CSI tab shows live turbulence / composite score / packet rate / RSSI, runtime SSID/password switching, site-learning controls (start/stop/progress/elapsed), MLP probability, NBVI mask + best/worst subcarrier, and adaptive-threshold diagnostics. The Network tab covers static IP / DHCP / DNS, MQTT broker config, Telegram bot, schedule (auto-arm/disarm + idle-timeout arm), timezone picker, and full config export/import as JSON. The Security tab adds the cold-reboot-before-OTA checkbox (default on) for the upload flow. The Events tab features a 24h activity heatmap with type filtering and CSV export. CZ/EN language toggle in header.
 
 ---
@@ -796,6 +798,10 @@ A: Yes. Each device gets a unique `device_id` (auto-derived from MAC) so HA disc
 | v5.0.3-poe-wifi | i18n fix: `gate_legend` Czech translation; gate tab corrupted HTML repaired. |
 | v5.0.4-poe-wifi | **Security hardening:** MQTT alarm PIN guard (`CMD:pin` format, `/api/security/mqtt-pin` endpoint); ARM blocked in dashboard on default credentials; HTTP security headers (`X-Frame-Options`, `X-Content-Type-Options`, `Referrer-Policy`). Default dashboard language changed to English. OTA password moved out of committed `platformio.ini`. |
 | v5.0.6-poe-wifi | **OTA field-service hardening:** enforced Pull OTA MD5 integrity (fixed a `setMD5`/`begin` call-order bug that silently skipped hash verification — any binary used to flash); redirects no longer followed (SSRF / auth-token-leak guard); unified OTA runtime owner + main-loop watchdog cleanup; `/api/ota/status` and espota maintenance window; guarded `tools/pull_ota_deploy.sh` deploy helper with target identity checks and `--cold-reboot` for long-uptime units. See [docs/OTA_OPERATIONS.md](docs/OTA_OPERATIONS.md). |
+| v5.0.7-poe-wifi | **Quick wins:** new `/metrics` Prometheus endpoint (heap, chip temp, radar health, ETH/MQTT/alarm state, fusion confidence, CSI stats) for Grafana dashboards; per-IP brute-force lockout on web auth (`429` + `Retry-After`, exponential backoff 30 s → 15 min); first automated native unit tests (`pio test -e native`, Unity) and cppcheck static analysis in CI. |
+| v5.0.8-poe-wifi | **OTA & config reliability:** fixed the "empty reply" / 180 s hang on authenticated OTA and config-import (the AsyncWebServer fork authenticated *after* buffering the body — now stateless preemptive Basic + close-on-auth-fail); config-import now actually applies string fields (ArduinoJson `is<String>()` returned false for JSON strings → switched to `is<const char*>()`); out-of-coverage WiFi diagnostics always exposed over `/api/csi` (link state, reconnects, disconnect reason — pullable over Ethernet, no serial); 8 MB flash board variant (`esp32_poe_csi_8mb` + `partitions_8mb.csv`). Pull OTA validated end-to-end on a remote node. |
+| v5.0.15-poe-wifi | **Sensor visibility:** main dashboard splits the status card into MW radar and WiFi CSI sections with explicit `CSI offline` / `No data` / `idle` / `motion` states; CSI data-starvation detection (logs `CSI data lost`/`restored`, exposed as `csi_data_ok` + Prometheus metric); radar CSI-only latch (`radar_monitoring_disabled`) stops log spam on radar-less units; radar readout shows `Radar disconnected` / `—` instead of stale zeros / `NaN`; full CZ/EN localization parity. |
+| v5.0.16-poe-wifi | **Dashboard polish:** radar-aware UI hides all microwave-radar chrome on CSI-only units (distance gauge, radar health rows, Restart/Reset buttons, Gate sensitivity / Zones tabs, radar-only fields) and promotes WiFi CSI to the main readout, with a reveal link for the hidden controls; masonry card layout packs cards vertically (no large empty areas); collapsible expert sections so the CSI tab opens as a short overview; fixed language not applied on load (`window.onload = init` overrode `<body onload>`, so `applyLang()` never ran — English by default); telemetry-flicker fix on partial frames. |
 
 ---
 
