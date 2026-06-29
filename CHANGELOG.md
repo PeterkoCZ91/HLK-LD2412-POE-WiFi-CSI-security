@@ -2,6 +2,47 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.0.16-poe-wifi] - 2026-06-29
+
+Dashboard polish release: the web UI now adapts to the sensors actually present, packs
+without empty gaps, hides expert detail behind collapsible sections, and finally renders
+fully in the selected language on load.
+
+### Added
+
+- **Radar-aware dashboard.** On a CSI-only unit (no radar wired — `radar_monitoring_disabled`
+  latched in `/api/health`), the UI hides all microwave-radar chrome: the distance gauge,
+  movement/static readouts, radar health rows (Sensor Health / UART / Frame Rate / Comm Errors),
+  the Restart Radar / Reset MW buttons, the **Gate sensitivity** and **Zones** tabs, and the
+  radar-only fields on the **Basic** and **Security** tabs. The WiFi CSI status is promoted to the
+  main readout, and a `Radar not connected — show` link reveals the hidden controls on demand.
+  Dual-sensor units are unaffected; the UI restores radar chrome automatically after a reboot
+  with the radar attached.
+- **Collapsible expert sections.** CSI configuration, traffic generator, WiFi AP, actions,
+  site learning, learned model, ML and the new *CSI metrics (expert)* group are collapsed by
+  default, so the CSI tab opens as a short overview instead of a long scroll.
+
+### Changed
+
+- **Masonry card layout.** The dashboard grid now packs cards vertically (CSS columns) instead
+  of stretching every card to the tallest column — eliminates the large empty areas under the
+  status and health cards.
+- Gate Min/Max range now shows the approximate distance in cm next to the input; Hold Time is
+  edited in seconds instead of milliseconds; the **Gates** tab is renamed **Gate sensitivity**.
+- CSI detection source `ml` is shown as *Machine learning*; composite/variance metrics carry
+  explanatory tooltips.
+
+### Fixed
+
+- **Language not applied on load.** `window.onload = init` overrode the `<body onload>` attribute,
+  so `applyLang()` never ran at startup and static labels stayed on their HTML defaults regardless
+  of the selected language. Both now run on load, so the dashboard renders fully in the chosen
+  language (English by default).
+- **Telemetry flicker.** A partial telemetry frame (`{"error":"mutex_timeout"}`) no longer makes
+  the radar headline blink to `idle` / `Radar disconnected`; the readout keeps its last good state.
+- Re-expanding a collapsed section no longer breaks slider layout (collapse now toggles a class
+  instead of clearing inline `display`).
+
 ## [5.0.15-poe-wifi] - 2026-06-29
 
 Sensor visibility release: the main dashboard now shows CSI detection at a glance, both
