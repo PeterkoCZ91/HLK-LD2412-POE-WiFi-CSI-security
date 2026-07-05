@@ -2,6 +2,29 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.0.17-poe-wifi] - 2026-07-06
+
+Dashboard organization release: the Basic tab opens as a short overview on radar units too,
+input placeholders are localized, and CSI metric labels speak human first, jargon second.
+
+### Changed
+
+- **Basic tab reorganization.** Expert radar fields — gate Min/Max (with cm readout), hold
+  time, diagnostics, Bluetooth warning and calibration — moved into a new collapsed
+  "Advanced radar configuration" section (radar-only, hidden on CSI-only units). Device
+  name, movement sensitivity and LED toggle stay on top. No functional changes; all
+  handlers and save buttons untouched.
+- **CSI metric labels humanized.** "Overall motion score (composite)", "Signal variance
+  (window)", "Motion exit threshold (multiplier)"; DSER/PLCR/turbulence abbreviations
+  expanded in the ML help text. Human description first, technical term in parentheses —
+  i18n values only, keys unchanged.
+
+### Added
+
+- **Placeholder localization.** New `data-i18n-ph` mechanism in `applyLang()` + 12 keys
+  (cs/en). Word placeholders (Server IP, Bot Token, usernames…) now translate with the
+  UI language; technical placeholders (IP examples, ports) intentionally left as-is.
+
 ## [5.0.16-poe-wifi] - 2026-06-29
 
 Dashboard polish release: the web UI now adapts to the sensors actually present, packs

@@ -44,7 +44,7 @@
 // -------------------------------------------------------------------------
 #include <Update.h>
 #ifndef FW_VERSION
-#define FW_VERSION "v5.0.16-poe-wifi"
+#define FW_VERSION "v5.0.17-poe-wifi"
 #endif
 #define WDT_TIMEOUT_SECONDS 60
 

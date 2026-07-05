@@ -151,8 +151,8 @@ const char index_html[] PROGMEM = R"rawliteral(
       wifi_save_failed: "Uložení selhalo",
       wifi_reset_confirm: "Obnovit compile-time default SSID ze secrets.h a rebootovat?",
       wifi_reset_reboot: "Reset. Rebootuji…",
-      motion_state: "Stav pohybu", composite: "Composite skóre",
-      threshold_label: "Práh detekce (variance threshold):",
+      motion_state: "Stav pohybu", composite: "Souhrnné skóre pohybu (composite)",
+      threshold_label: "Práh detekce pohybu (variance threshold):",
       save_config: "Uložit konfiguraci", upload_fw: "Nahrát Firmware", saved: "Uloženo",
       fw_update_title: "Aktualizace FW",
       pull_ota_title: "Pull OTA z URL",
@@ -227,12 +227,12 @@ const char index_html[] PROGMEM = R"rawliteral(
       ml_mlp: "ML (MLP 17→18→9→1)", ml_enabled_lbl: "ML povoleno",
       ml_motion_lbl: "ML stav", ml_prob_lbl: "Pravděpodobnost",
       ml_threshold_lbl: "ML práh (enter):",
-      ml_help: "<b>MLP klasifikátor:</b> 17 featur (statistiky turbulence + fáze + DSER/PLCR) → 18→9→1 sigmoid. Trénováno na espectre datasetu (F1 = 0.852). Enter ≥ threshold, exit = threshold × 0.70, N/M smoothing 4/5 z 6 oken. Výstup jde do fusion jako 3. signál.",
+      ml_help: "<b>MLP klasifikátor:</b> 17 featur (turbulence — chaotičnost signálu, fáze, DSER — poměr Dopplerovy spektrální energie, PLCR — korelace úrovně fáze) → 18→9→1 sigmoid. Trénováno na espectre datasetu (F1 = 0.852). Enter ≥ threshold, exit = threshold × 0.70, N/M smoothing 4/5 z 6 oken. Výstup jde do fusion jako 3. signál.",
       detection_src: "Zdroj detekce", fusion_enabled: "Fusion povoleno",
       mw_radar_section: "MW radar", csi_section: "WiFi CSI", csi_offline: "CSI offline", csi_nodata: "Bez dat", radar_disconnected: "Radar odpojen",
-      radar_show: "▸ Radar nepřipojen — zobrazit", radar_hide: "▾ Skrýt radar", csi_metrics_title: "CSI METRIKY (expert)", variance_window: "Variance (okno)", src_ml: "Strojové učení",
+      radar_show: "▸ Radar nepřipojen — zobrazit", radar_hide: "▾ Skrýt radar", csi_metrics_title: "CSI METRIKY (expert)", variance_window: "Rozptyl signálu (variance, okno)", src_ml: "Strojové učení",
       enabled: "Povoleno",
-      hysteresis: "Hystereze (exit multiplier):", window_size: "Velikost okna (vzorky):",
+      hysteresis: "Práh ukončení pohybu (exit multiplier):", window_size: "Velikost okna (vzorky):",
       pub_interval: "Interval publikace (ms):",
       gate_out_of_range: "mimo rozsah",
       tz_section: "ČAS &amp; ZÓNA", tz_preset: "Předvolba",
@@ -264,6 +264,13 @@ const char index_html[] PROGMEM = R"rawliteral(
       zone_from: "Od (cm)", zone_to: "Do (cm)", zone_entry_delay: "⏱ Zpoždění vstupu",
       zone_ignore: "🔕 Ignorovat", zone_ignore_static: "📡 Ignorovat statiku",
       preset_error: "Chyba předvolby", min_4_chars: "Min. 4 znaky", learn_complete: "Hotovo!",
+      sec_radar_adv: "Pokročilá konfigurace radaru",
+      ph_mqtt_server: "IP adresa serveru", ph_mqtt_port: "Port (1883)", ph_username: "Uživatelské jméno",
+      ph_password: "Heslo", ph_bot_token: "Token bota", ph_chat_id: "ID chatu",
+      ph_new_password: "Nové heslo", ph_confirm_pass: "Potvrdit heslo",
+      ph_tz_std: "Standardní offset (s)", ph_tz_dst: "Letní čas offset (s)",
+      ph_wifi_pass_hint: "(nemění se pokud prázdné při edit)",
+      ph_md5_required: "MD5 kontrolní součet (povinný)",
     },
     en: {
       title: "LD2412 Security", loading: "LOADING...", arm: "ARM", disarm: "DISARM",
@@ -319,8 +326,8 @@ const char index_html[] PROGMEM = R"rawliteral(
       wifi_save_failed: "Save failed",
       wifi_reset_confirm: "Restore compile-time default SSID from secrets.h and reboot?",
       wifi_reset_reboot: "Reset. Rebooting…",
-      motion_state: "Motion State", composite: "Composite Score",
-      threshold_label: "Detection threshold (variance):",
+      motion_state: "Motion State", composite: "Overall motion score (composite)",
+      threshold_label: "Motion detection threshold (variance):",
       save_config: "Save Configuration", upload_fw: "Upload Firmware", saved: "Saved",
       fw_update_title: "Firmware Update",
       pull_ota_title: "Pull OTA from URL",
@@ -395,12 +402,12 @@ const char index_html[] PROGMEM = R"rawliteral(
       ml_mlp: "ML (MLP 17→18→9→1)", ml_enabled_lbl: "ML enabled",
       ml_motion_lbl: "ML state", ml_prob_lbl: "Probability",
       ml_threshold_lbl: "ML threshold (enter):",
-      ml_help: "<b>MLP classifier:</b> 17 features (turbulence stats + phase + DSER/PLCR) → 18→9→1 sigmoid. Trained on espectre dataset (F1 = 0.852). Enter ≥ threshold, exit = threshold × 0.70, N/M smoothing 4/5 of 6 windows. Output is fed into fusion as 3rd signal.",
+      ml_help: "<b>MLP classifier:</b> 17 features (turbulence — signal chaoticness, phase, DSER — Doppler Spectral Energy Ratio, PLCR — Phase-Level Correlation Ratio) → 18→9→1 sigmoid. Trained on espectre dataset (F1 = 0.852). Enter ≥ threshold, exit = threshold × 0.70, N/M smoothing 4/5 of 6 windows. Output is fed into fusion as 3rd signal.",
       detection_src: "Detection source", fusion_enabled: "Fusion enabled",
       mw_radar_section: "MW radar", csi_section: "WiFi CSI", csi_offline: "CSI offline", csi_nodata: "No data", radar_disconnected: "Radar disconnected",
-      radar_show: "▸ Radar not connected — show", radar_hide: "▾ Hide radar", csi_metrics_title: "CSI METRICS (expert)", variance_window: "Variance (window)", src_ml: "Machine learning",
+      radar_show: "▸ Radar not connected — show", radar_hide: "▾ Hide radar", csi_metrics_title: "CSI METRICS (expert)", variance_window: "Signal variance (window)", src_ml: "Machine learning",
       enabled: "Enabled",
-      hysteresis: "Hysteresis (exit multiplier):", window_size: "Window size (samples):",
+      hysteresis: "Motion exit threshold (multiplier):", window_size: "Window size (samples):",
       pub_interval: "Publish interval (ms):",
       gate_out_of_range: "out of range",
       tz_section: "TIME &amp; TIMEZONE", tz_preset: "Preset",
@@ -432,6 +439,13 @@ const char index_html[] PROGMEM = R"rawliteral(
       zone_from: "From (cm)", zone_to: "To (cm)", zone_entry_delay: "⏱ Entry delay",
       zone_ignore: "🔕 Ignore", zone_ignore_static: "📡 Ignore static",
       preset_error: "Preset error", min_4_chars: "Min. 4 characters", learn_complete: "Done!",
+      sec_radar_adv: "Advanced radar configuration",
+      ph_mqtt_server: "Server IP", ph_mqtt_port: "Port (1883)", ph_username: "Username",
+      ph_password: "Password", ph_bot_token: "Bot Token", ph_chat_id: "Chat ID",
+      ph_new_password: "New Password", ph_confirm_pass: "Confirm Password",
+      ph_tz_std: "Standard offset (s)", ph_tz_dst: "DST offset (s)",
+      ph_wifi_pass_hint: "(unchanged if empty when editing)",
+      ph_md5_required: "MD5 checksum (required)",
     }
   };
   let LANG = localStorage.getItem('lang') || 'en';
@@ -443,6 +457,9 @@ const char index_html[] PROGMEM = R"rawliteral(
       if (el.tagName === 'INPUT') el.placeholder = t(k);
       else if (el.tagName === 'OPTION') el.textContent = t(k);
       else el.innerHTML = t(k);
+    });
+    document.querySelectorAll('[data-i18n-ph]').forEach(el => {
+      el.placeholder = t(el.getAttribute('data-i18n-ph'));
     });
     document.querySelector('#lang_btn').textContent = LANG === 'cs' ? '🇬🇧 EN' : '🇨🇿 CZ';
     document.title = t('title');
@@ -539,6 +556,17 @@ const char index_html[] PROGMEM = R"rawliteral(
             </div>
 
             <div class="radar-only">
+            <div class="stat-row" style="margin-top:10px"><span data-i18n="move_sens">Citlivost Pohyb (%)</span></div>
+            <input type="number" id="i_sens" min="0" max="100" onchange="saveBasic()">
+            </div>
+
+            <div style="display:flex; align-items:center; gap:8px; margin-top:15px; margin-bottom:5px">
+                <input type="checkbox" id="chk_led" style="width:auto" onchange="saveBasic()">
+                <label for="chk_led" data-i18n="enable_led">Enable LED (Indicator)</label>
+            </div>
+
+            <div class="section-title radar-only" data-collapsed data-i18n="sec_radar_adv">Pokročilá konfigurace radaru</div>
+            <div class="radar-only">
             <div class="row-input">
                 <span style="flex:1" data-i18n="min_range">Min Range (Gate)</span>
                 <span id="i_min_cm" style="font-size:0.75rem; color:#888; margin-right:6px">—</span>
@@ -549,21 +577,11 @@ const char index_html[] PROGMEM = R"rawliteral(
                 <span id="i_max_cm" style="font-size:0.75rem; color:#888; margin-right:6px">—</span>
                 <input type="number" id="i_max" min="1" max="13" style="width:60px" oninput="updGateCm()" onchange="saveBasic()">
             </div>
-            
+
             <div class="stat-row" style="margin-top:10px"><span data-i18n="hold_time">Doba držení (s)</span></div>
             <input type="number" id="i_hold" step="0.5" min="0" onchange="saveBasic()">
-            
-            <div class="stat-row" style="margin-top:10px"><span data-i18n="move_sens">Citlivost Pohyb (%)</span></div>
-            <input type="number" id="i_sens" min="0" max="100" onchange="saveBasic()">
-            </div>
 
-            <div style="display:flex; align-items:center; gap:8px; margin-top:15px; margin-bottom:5px">
-                <input type="checkbox" id="chk_led" style="width:auto" onchange="saveBasic()">
-                <label for="chk_led" data-i18n="enable_led">Enable LED (Indicator)</label>
-            </div>
-
-            <div class="radar-only">
-            <div style="display:flex; align-items:center; gap:8px; margin-bottom:10px">
+            <div style="display:flex; align-items:center; gap:8px; margin-bottom:10px; margin-top:10px">
                 <input type="checkbox" id="chk_eng" style="width:auto" onchange="toggleEng()">
                 <label for="chk_eng" title="Enable detailed gate data (14 zones) and faster communication"><span data-i18n="enable_diag">Povolit Diagnostiku</span></label>
             </div>
@@ -753,8 +771,8 @@ const char index_html[] PROGMEM = R"rawliteral(
                 <option value="custom">Custom…</option>
             </select>
             <div id="tz_custom_fields" style="display:none">
-                <input type="number" id="tz_std_in" placeholder="Standard offset (s)" oninput="updateTzLabel()">
-                <input type="number" id="tz_dst_in" placeholder="DST offset (s)" oninput="updateTzLabel()">
+                <input type="number" id="tz_std_in" placeholder="Standard offset (s)" data-i18n-ph="ph_tz_std" oninput="updateTzLabel()">
+                <input type="number" id="tz_dst_in" placeholder="DST offset (s)" data-i18n-ph="ph_tz_dst" oninput="updateTzLabel()">
             </div>
             <div style="font-size:0.75rem; color:#777; margin:6px 0">
                 UTC offset: <span id="tz_device_time">—</span>
@@ -782,12 +800,12 @@ const char index_html[] PROGMEM = R"rawliteral(
                 <input type="checkbox" id="chk_mqtt_en" style="width:auto">
                 <label for="chk_mqtt_en" data-i18n="enable_mqtt">Enable MQTT</label>
             </div>
-            <input type="text" id="txt_mqtt_server" placeholder="Server IP">
+            <input type="text" id="txt_mqtt_server" placeholder="Server IP" data-i18n-ph="ph_mqtt_server">
             <div style="display:flex; gap:5px">
-                <input type="text" id="txt_mqtt_port" placeholder="Port (1883)">
-                <input type="text" id="txt_mqtt_user" placeholder="Username">
+                <input type="text" id="txt_mqtt_port" placeholder="Port (1883)" data-i18n-ph="ph_mqtt_port">
+                <input type="text" id="txt_mqtt_user" placeholder="Username" data-i18n-ph="ph_username">
             </div>
-            <input type="password" id="txt_mqtt_pass" placeholder="Password">
+            <input type="password" id="txt_mqtt_pass" placeholder="Password" data-i18n-ph="ph_password">
             <button onclick="saveMQTTConfig()" class="sec" data-i18n="save_mqtt">Uložit MQTT</button>
 
             <div class="section-title" data-i18n="telegram_notifications">Telegram Notifications</div>
@@ -795,16 +813,16 @@ const char index_html[] PROGMEM = R"rawliteral(
                 <input type="checkbox" id="chk_tg_en" style="width:auto">
                 <label for="chk_tg_en" data-i18n="enable_bot">Enable Bot</label>
             </div>
-            <input type="text" id="txt_tg_token" placeholder="Bot Token">
-            <input type="text" id="txt_tg_chat" placeholder="Chat ID">
+            <input type="text" id="txt_tg_token" placeholder="Bot Token" data-i18n-ph="ph_bot_token">
+            <input type="text" id="txt_tg_chat" placeholder="Chat ID" data-i18n-ph="ph_chat_id">
             <div style="display:flex; gap:5px">
                 <button onclick="saveTelegram()" class="sec" data-i18n="save">Uložit</button>
                 <button onclick="testTelegram()" class="sec">Test</button>
             </div>
             <div class="section-title" data-i18n="credentials_title">CREDENTIALS</div>
-            <input type="text" id="txt_auth_user" placeholder="Username">
-            <input type="password" id="txt_auth_pass" placeholder="New Password">
-            <input type="password" id="txt_auth_pass2" placeholder="Confirm Password">
+            <input type="text" id="txt_auth_user" placeholder="Username" data-i18n-ph="ph_username">
+            <input type="password" id="txt_auth_pass" placeholder="New Password" data-i18n-ph="ph_new_password">
+            <input type="password" id="txt_auth_pass2" placeholder="Confirm Password" data-i18n-ph="ph_confirm_pass">
             <button onclick="saveAuth()" class="warn" data-i18n="change_pass">Změnit heslo</button>
 
             <div class="section-title" data-i18n="cfg_backup">ZÁLOHA KONFIGURACE</div>
@@ -970,7 +988,7 @@ const char index_html[] PROGMEM = R"rawliteral(
             <label style="font-size:0.85rem" data-i18n="wifi_ssid">SSID</label>
             <input type="text" id="csi_wifi_ssid" maxlength="32" placeholder="—" style="margin-bottom:6px">
             <label style="font-size:0.85rem" data-i18n="wifi_pass">Heslo</label>
-            <input type="password" id="csi_wifi_pass" maxlength="64" placeholder="(nemění se pokud prázdné při edit)" style="margin-bottom:6px">
+            <input type="password" id="csi_wifi_pass" maxlength="64" placeholder="(nemění se pokud prázdné při edit)" data-i18n-ph="ph_wifi_pass_hint" style="margin-bottom:6px">
             <div style="display:flex; gap:6px; flex-wrap:wrap">
                 <button onclick="saveCsiWifi()" class="warn" style="flex:2; min-width:140px" data-i18n="save_reboot">💾 Uložit a rebootovat</button>
                 <button onclick="resetCsiWifi()" class="sec" style="flex:1; min-width:120px" data-i18n="wifi_use_default">↩️ Compile-time default</button>
@@ -1087,7 +1105,7 @@ const char index_html[] PROGMEM = R"rawliteral(
         </div>
         <input type="text" id="pull_url" placeholder="https://example.com/firmware.bin" style="width:100%; box-sizing:border-box; margin-bottom:6px">
         <input type="text" id="pull_auth" placeholder="Bearer …" style="width:100%; box-sizing:border-box; margin-bottom:6px">
-        <input type="text" id="pull_md5" maxlength="32" placeholder="MD5 checksum (required)" style="width:100%; box-sizing:border-box; margin-bottom:6px">
+        <input type="text" id="pull_md5" maxlength="32" placeholder="MD5 checksum (required)" data-i18n-ph="ph_md5_required" style="width:100%; box-sizing:border-box; margin-bottom:6px">
         <div id="pull_status" style="margin-top:4px; font-size:0.85em; color:#aaa; min-height:1.1em"></div>
         <button id="btn_pull" onclick="pullFW()" class="sec" data-i18n="pull_ota_btn">⤓ Stáhnout a flashnout</button>
     </div>

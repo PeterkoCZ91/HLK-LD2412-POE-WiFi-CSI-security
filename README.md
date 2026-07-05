@@ -3,7 +3,7 @@
 [![PlatformIO](https://img.shields.io/badge/PlatformIO-ESP32-orange?logo=platformio)](https://platformio.org/)
 [![ESP32](https://img.shields.io/badge/MCU-ESP32--WROOM--32-blue?logo=espressif)](https://www.espressif.com/)
 [![License](https://img.shields.io/badge/License-GPL--3.0-blue)](LICENSE)
-[![Version](https://img.shields.io/badge/Version-5.0.16--poe--wifi-blue)]()
+[![Version](https://img.shields.io/badge/Version-5.0.17--poe--wifi-blue)]()
 [![Discussions](https://img.shields.io/badge/GitHub-Discussions-purple?logo=github)](https://github.com/PeterkoCZ91/HLK-LD2412-POE-WiFi-CSI-security/discussions)
 
 **Dual-sensor intrusion detection system** — ESP32 + HLK-LD2412 24 GHz mmWave radar + **WiFi CSI (Channel State Information) passive motion detection** over **wired Ethernet with Power over Ethernet**. Full alarm state machine, zone management, Home Assistant integration, Telegram bot, and a dark-mode web dashboard. No cloud required.
@@ -11,7 +11,7 @@
 WiFi CSI detection algorithms based on [ESPectre](https://github.com/francescopace/espectre) by Francesco Pace (GPLv3).
 
 > [!TIP]
-> **v5.0.16** — dashboard polish: the web UI is now radar-aware and hides all microwave-radar chrome on CSI-only units (distance gauge, radar health rows, Gate sensitivity / Zones tabs, radar-only fields) while promoting WiFi CSI to the main readout, packs cards without empty gaps via a masonry layout, collapses expert detail behind collapsible sections on the CSI tab, and finally renders fully in the selected language on load (`applyLang()` previously never ran at startup; English by default). See [CHANGELOG](CHANGELOG.md).
+> **v5.0.17** — dashboard organization: the Basic tab now opens as a short overview on radar units too (expert radar fields — gate min/max, hold time, diagnostics, BT warning, calibration — collapsed into a new "Advanced radar configuration" section), input placeholders are localized (cs/en), and CSI metric labels lead with a human description ("Overall motion score (composite)", "Signal variance", "Motion exit threshold"). See [CHANGELOG](CHANGELOG.md).
 >
 > **v5.0.7** — quick wins: new [`/metrics` Prometheus endpoint](#prometheus-metrics) for Grafana dashboards, per-IP brute-force lockout on web auth (`429` + exponential backoff), first automated unit tests (`pio test -e native`) and cppcheck static analysis in CI. See [CHANGELOG](CHANGELOG.md).
 >
@@ -802,6 +802,7 @@ A: Yes. Each device gets a unique `device_id` (auto-derived from MAC) so HA disc
 | v5.0.8-poe-wifi | **OTA & config reliability:** fixed the "empty reply" / 180 s hang on authenticated OTA and config-import (the AsyncWebServer fork authenticated *after* buffering the body — now stateless preemptive Basic + close-on-auth-fail); config-import now actually applies string fields (ArduinoJson `is<String>()` returned false for JSON strings → switched to `is<const char*>()`); out-of-coverage WiFi diagnostics always exposed over `/api/csi` (link state, reconnects, disconnect reason — pullable over Ethernet, no serial); 8 MB flash board variant (`esp32_poe_csi_8mb` + `partitions_8mb.csv`). Pull OTA validated end-to-end on a remote node. |
 | v5.0.15-poe-wifi | **Sensor visibility:** main dashboard splits the status card into MW radar and WiFi CSI sections with explicit `CSI offline` / `No data` / `idle` / `motion` states; CSI data-starvation detection (logs `CSI data lost`/`restored`, exposed as `csi_data_ok` + Prometheus metric); radar CSI-only latch (`radar_monitoring_disabled`) stops log spam on radar-less units; radar readout shows `Radar disconnected` / `—` instead of stale zeros / `NaN`; full CZ/EN localization parity. |
 | v5.0.16-poe-wifi | **Dashboard polish:** radar-aware UI hides all microwave-radar chrome on CSI-only units (distance gauge, radar health rows, Restart/Reset buttons, Gate sensitivity / Zones tabs, radar-only fields) and promotes WiFi CSI to the main readout, with a reveal link for the hidden controls; masonry card layout packs cards vertically (no large empty areas); collapsible expert sections so the CSI tab opens as a short overview; fixed language not applied on load (`window.onload = init` overrode `<body onload>`, so `applyLang()` never ran — English by default); telemetry-flicker fix on partial frames. |
+| v5.0.17-poe-wifi | **Dashboard organization:** Basic tab reorganized — expert radar fields (gate Min/Max with cm readout, hold time, diagnostics, BT warning, calibration) moved into a collapsed radar-only "Advanced radar configuration" section, leaving device name, sensitivity and LED on top; placeholder localization via new `data-i18n-ph` mechanism (12 cs/en keys); CSI metric labels humanized — human description first, technical term in parentheses (composite, variance, exit multiplier, DSER/PLCR expansions in ML help). |
 
 ---
 
