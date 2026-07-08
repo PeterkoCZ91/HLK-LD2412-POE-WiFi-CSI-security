@@ -994,44 +994,59 @@ float CSIService::getCompositeScore() const {
 void CSIService::_publishMQTT() {
     if (!_mqtt || !_mqtt->connected()) return;
 
+    // Change-gated publishing: floats go out when they move by >5 % (plus a
+    // small absolute floor for near-zero metrics), ON/OFF states on flip. A
+    // 60 s heartbeat republishes everything so consumers survive a missed
+    // message. Unconditional publishing at the 1 s tick pushed ~720 msg/min
+    // of mostly unchanged values to the broker.
+    uint32_t now = millis();
+    bool force = !_pubValid || (uint32_t)(now - _mqttHeartbeatMs) >= 60000UL;
+    if (force) _mqttHeartbeatMs = now;
+
+    // Float metrics are inherently noisy — the deadband alone still fired
+    // ~40 msg/min per topic at the 1 s tick. Pace them to one evaluation per
+    // 10 s; ON/OFF states below stay per-tick so flips reach HA instantly.
+    bool floatTick = force || (uint32_t)(now - _floatPaceMs) >= 10000UL;
+    if (floatTick) _floatPaceMs = now;
+
     char val[16];
+    auto pubFloat = [&](const char* topic, float v, float& last) {
+        if (!floatTick) return;
+        if (force || fabsf(v - last) > (0.05f * fabsf(last) + 1e-4f)) {
+            snprintf(val, sizeof(val), "%.4f", v);
+            if (_mqtt->publish(topic, val)) last = v;
+        }
+    };
 
-    snprintf(val, sizeof(val), "%s", _motionState ? "ON" : "OFF");
-    _mqtt->publish(_tMotion, val, true);
+    if (force || _motionState != _pubMotion) {
+        if (_mqtt->publish(_tMotion, _motionState ? "ON" : "OFF", true))
+            _pubMotion = _motionState;
+    }
 
-    snprintf(val, sizeof(val), "%.4f", _lastTurbulence);
-    _mqtt->publish(_tTurbulence, val);
+    pubFloat(_tTurbulence, _lastTurbulence,     _pubTurbulence);
+    pubFloat(_tVariance,   _runningVariance,    _pubVariance);
+    pubFloat(_tPhaseTurb,  _lastPhaseTurb,      _pubPhaseTurb);
+    pubFloat(_tRatioTurb,  _lastRatioTurb,      _pubRatioTurb);
+    pubFloat(_tBreathing,  getBreathingScore(), _pubBreathing);
+    pubFloat(_tComposite,  getCompositeScore(), _pubComposite);
+    pubFloat(_tDser,       _lastDser,           _pubDser);
+    pubFloat(_tPlcr,       _lastPlcr,           _pubPlcr);
 
-    snprintf(val, sizeof(val), "%.4f", _runningVariance);
-    _mqtt->publish(_tVariance, val);
-
-    snprintf(val, sizeof(val), "%.4f", _lastPhaseTurb);
-    _mqtt->publish(_tPhaseTurb, val);
-
-    snprintf(val, sizeof(val), "%.4f", _lastRatioTurb);
-    _mqtt->publish(_tRatioTurb, val);
-
-    snprintf(val, sizeof(val), "%.4f", getBreathingScore());
-    _mqtt->publish(_tBreathing, val);
-
-    snprintf(val, sizeof(val), "%.4f", getCompositeScore());
-    _mqtt->publish(_tComposite, val);
-
-    snprintf(val, sizeof(val), "%lu", (unsigned long)_totalPackets);
-    _mqtt->publish(_tPackets, val);
-
-    snprintf(val, sizeof(val), "%.4f", _lastDser);
-    _mqtt->publish(_tDser, val);
-
-    snprintf(val, sizeof(val), "%.4f", _lastPlcr);
-    _mqtt->publish(_tPlcr, val);
+    // Monotonic counter — changes every tick by definition, heartbeat only.
+    if (force) {
+        snprintf(val, sizeof(val), "%lu", (unsigned long)_totalPackets);
+        _mqtt->publish(_tPackets, val);
+    }
 
     if (_mlEnabled) {
-        snprintf(val, sizeof(val), "%.4f", _mlProbability);
-        _mqtt->publish(_tMlProb, val);
-        snprintf(val, sizeof(val), "%s", _mlMotion ? "ON" : "OFF");
-        _mqtt->publish(_tMlMotion, val, true);
+        pubFloat(_tMlProb, _mlProbability, _pubMlProb);
+        if (force || _mlMotion != _pubMlMotion) {
+            if (_mqtt->publish(_tMlMotion, _mlMotion ? "ON" : "OFF", true))
+                _pubMlMotion = _mlMotion;
+        }
     }
+
+    _pubValid = true;
 }
 
 // ============================================================================

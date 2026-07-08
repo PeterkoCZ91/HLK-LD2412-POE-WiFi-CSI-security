@@ -110,6 +110,9 @@ public:
     // CSI Fusion — radar+WiFi combined detection
     void setCSISource(CSIService* csi) { _csiService = csi; }
     bool isFusionActive() const { return _csiService != nullptr; }
+    // CSI data freshness (fed from main's starvation detector). When stale,
+    // fusion must not let frozen variance/ML values out-vote a live radar.
+    void setCsiDataOk(bool ok) { _csiDataOk = ok; }
     bool isFusionPresence() const { return _fusionPresence; }
     float getFusionConfidence() const { return _fusionConfidence; }
     const char* getFusionSourceStr() const;
@@ -222,7 +225,7 @@ private:
     // _entryDelay/_exitDelay/_triggerTimeout/_autoRearm/_alarmDebounceFrames are the
     // config source — copied into _fsm via syncFsmConfig() before each transition call.
     // The matching start-timestamps (exit/entry/trigger) now live inside AlarmFSM.
-    unsigned long _entryDelay = 30000;
+    unsigned long _entryDelay = 0;      // immediate trigger — mirrors DEFAULT_ENTRY_DELAY_MS (constants.h)
     unsigned long _exitDelay = 30000;
     unsigned long _triggerTimeout = 900000;  // 15 min default
     bool _autoRearm = true;
@@ -324,11 +327,15 @@ private:
 
     // CSI Fusion state
     CSIService* _csiService = nullptr;
+    bool _csiDataOk = true;                 // false = CSI starved, fusion falls back to radar-only
     bool _fusionPresence = false;           // Combined presence decision
     float _fusionConfidence = 0.0f;         // 0.0–1.0 confidence level
     uint8_t _fusionSource = 0;              // Bitmask: bit0=radar, bit1=CSI
     uint8_t _csiSuppressCount = 0;          // Debounce counter for false-positive suppression
     unsigned long _csiOnlyStart = 0;        // Timestamp when CSI-only detection began
+    bool fusionDbgGate(unsigned long now);  // Rate-limits per-tick FUSION DBG lines
+    uint8_t _lastFusionDbgKey = 0xFF;       // Last logged fusion state (source|presence)
+    unsigned long _lastFusionDbgMs = 0;
     static constexpr uint8_t CSI_SUPPRESS_FRAMES = 6;  // Frames CSI must disagree to suppress radar
     static constexpr float CSI_ONLY_MIN_SCORE = 0.4f;  // Minimum composite score for CSI-only presence
     static constexpr unsigned long CSI_ONLY_HOLD_MS = 3000;  // CSI must persist 3s alone before fusion accepts

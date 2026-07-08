@@ -375,6 +375,20 @@ void SecurityMonitor::checkRadarHealth(bool isConnected) {
     }
 }
 
+// Rate-limit gate for per-tick FUSION DBG lines: a state change logs
+// immediately, an unchanged state at most once per 10 s. At the 20 Hz radar
+// tick a steady source (e.g. ML saturated on a weak CSI link) otherwise
+// floods serial and evicts everything else from the DebugLog ring.
+bool SecurityMonitor::fusionDbgGate(unsigned long now) {
+    uint8_t key = (uint8_t)((_fusionSource & 0x7) | (_fusionPresence ? 0x8 : 0));
+    if (key == _lastFusionDbgKey && (unsigned long)(now - _lastFusionDbgMs) < 10000UL) {
+        return false;
+    }
+    _lastFusionDbgKey = key;
+    _lastFusionDbgMs = now;
+    return true;
+}
+
 const char* SecurityMonitor::getFusionSourceStr() const {
     // Bitmask: bit0=radar, bit1=CSI variance, bit2=CSI MLP
     switch (_fusionSource & 0x7) {
@@ -584,7 +598,11 @@ void SecurityMonitor::processRadarData(uint16_t distance, uint8_t move_energy, u
     // ---- CSI Fusion: combined radar+WiFi presence decision ----
     // Must run BEFORE alarm logic so fusion can gate alarm transitions
 #ifdef USE_CSI
-    if (_csiService) {
+    // Gate on _csiDataOk: when CSI is starved (associated but no frames), the
+    // variance/ML values below are frozen snapshots — letting them vote would
+    // suppress a live radar detection (stale "CSI+ML disagree") or hold a
+    // phantom presence (stale ML). Starved ⇒ radar-only fallback.
+    if (_csiService && _csiDataOk) {
         bool radarSees = (distance > 0 && (move_energy > 0 || static_energy > 0)) && !_isStaticFiltered;
         bool csiSees = _csiService->getMotionState();
         bool mlSees  = _csiService->isMlEnabled() && _csiService->getMlMotionState();
@@ -630,7 +648,8 @@ void SecurityMonitor::processRadarData(uint16_t distance, uint8_t move_energy, u
                 _fusionPresence = false;
                 _fusionConfidence = 0.1f;
                 _csiOnlyStart = 0;
-                DBG("SecMon", "FUSION: CSI-only rejected (score=%.2f < %.2f, ml=%d)", csiScore, CSI_ONLY_MIN_SCORE, mlSees);
+                if (fusionDbgGate(now))
+                    DBG("SecMon", "FUSION: CSI-only rejected (score=%.2f < %.2f, ml=%d)", csiScore, CSI_ONLY_MIN_SCORE, mlSees);
             } else {
                 if (_csiOnlyStart == 0) _csiOnlyStart = now;
                 unsigned long csiOnlyDuration = now - _csiOnlyStart;
@@ -643,12 +662,14 @@ void SecurityMonitor::processRadarData(uint16_t distance, uint8_t move_energy, u
                     if (csiBreathing > 0.1f) _fusionConfidence += 0.1f;
                     if (mlSees) _fusionConfidence += 0.2f * mlProb;
                     _fusionConfidence = min(_fusionConfidence, 1.0f);
-                    DBG("SecMon", "FUSION: CSI hold (score=%.2f breath=%.3f ml=%.2f conf=%.2f dur=%lums/%lums)",
-                        csiScore, csiBreathing, mlProb, _fusionConfidence, csiOnlyDuration, holdMs);
+                    if (fusionDbgGate(now))
+                        DBG("SecMon", "FUSION: CSI hold (score=%.2f breath=%.3f ml=%.2f conf=%.2f dur=%lums/%lums)",
+                            csiScore, csiBreathing, mlProb, _fusionConfidence, csiOnlyDuration, holdMs);
                 } else {
                     _fusionPresence = false;
                     _fusionConfidence = 0.2f;
-                    DBG("SecMon", "FUSION: CSI-only debounce (%lums / %lums ml=%d)", csiOnlyDuration, holdMs, mlSees);
+                    if (fusionDbgGate(now))
+                        DBG("SecMon", "FUSION: CSI-only debounce (%lums / %lums ml=%d)", csiOnlyDuration, holdMs, mlSees);
                 }
             }
         } else if (!radarSees && !csiSees && mlSees) {
@@ -659,7 +680,8 @@ void SecurityMonitor::processRadarData(uint16_t distance, uint8_t move_energy, u
             if (mlProb > (_csiService->getMlThreshold() + 0.2f)) {
                 _fusionPresence = true;
                 _fusionConfidence = 0.3f * mlProb;
-                DBG("SecMon", "FUSION: ML-only (prob=%.2f conf=%.2f)", mlProb, _fusionConfidence);
+                if (fusionDbgGate(now))
+                    DBG("SecMon", "FUSION: ML-only (prob=%.2f conf=%.2f)", mlProb, _fusionConfidence);
             } else {
                 _fusionPresence = false;
                 _fusionConfidence = 0.1f;
@@ -673,7 +695,7 @@ void SecurityMonitor::processRadarData(uint16_t distance, uint8_t move_energy, u
     } else
 #endif
     {
-        // No CSI — fallback to radar-only presence
+        // No CSI (not compiled/attached, or data starved) — radar-only presence
         bool radarSees = (distance > 0 && (move_energy > 0 || static_energy > 0)) && !_isStaticFiltered;
         _fusionPresence = radarSees;
         _fusionConfidence = radarSees ? 0.7f : 0.0f;
@@ -700,9 +722,18 @@ void SecurityMonitor::processRadarData(uint16_t distance, uint8_t move_energy, u
     // then expires immediately on the next PENDING check → TRIGGERED).
     bool radarQualifies = (distance > 0 && !_isStaticFiltered &&
         (move_energy >= _alarmEnergyThreshold || static_energy >= _alarmEnergyThreshold));
-    bool csiOnlyQualifies = (!radarQualifies && _fusionPresence && _fusionSource == 2);
+    // CSI variance presence with radar blind qualifies — with or without ML
+    // agreement (bit2). The old `== 2` exact match disqualified source 6
+    // (csi+ml), i.e. STRONGER evidence blocked the alarm: with ML enabled and
+    // concordant, the CSI-only trigger path could never fire.
+    bool csiOnlyQualifies = (!radarQualifies && _fusionPresence && (_fusionSource & 0x3) == 0x2);
+    // Radar above the alarm energy threshold qualifies unconditionally — the
+    // CSI-disagree suppression must not veto the armed path. Deployment sites
+    // have no mechanical false-positive sources (fans/curtains), and a weak
+    // CSI link missing a real person would otherwise mute a live radar hit.
+    // Suppression still shapes fusion presence/confidence reporting.
     bool armedQualifies = (_fsm.state() == AlarmState::ARMED &&
-        _fusionPresence && (radarQualifies || csiOnlyQualifies));
+        (radarQualifies || csiOnlyQualifies));
 
     // Resolve per-frame behavior (0=entry delay, 1=immediate, 2=ignore, 3=static-zone).
     // Computed every frame but only consumed when the FSM debounce actually fires.

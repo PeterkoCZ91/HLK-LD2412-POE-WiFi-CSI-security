@@ -34,7 +34,10 @@ constexpr unsigned long INTERVAL_TIER3_HEARTBEAT_MS  = 300000;    // Force TIER 
 constexpr unsigned long TIMEOUT_GATE_VERIFY_MS       = 40000;     // Gate config verification delay (40s, post-revert window)
 
 // Security Defaults
-constexpr unsigned long DEFAULT_ENTRY_DELAY_MS       = 30000;     // Entry delay (30 sec)
+// Entry delay 0 = immediate trigger. This system guards unattended sites with
+// remote (HA/app) disarm — a keypad-style "walk to the panel" grace period
+// only hands the intruder free seconds. Sites that need it set it per-node.
+constexpr unsigned long DEFAULT_ENTRY_DELAY_MS       = 0;
 constexpr unsigned long DEFAULT_EXIT_DELAY_MS        = 30000;     // Exit delay (30 sec)
 constexpr unsigned long DEFAULT_ANTI_MASK_MS         = 300000;    // Anti-masking threshold (5 min)
 constexpr unsigned long DEFAULT_LOITER_MS            = 15000;     // Loitering threshold (15 sec)

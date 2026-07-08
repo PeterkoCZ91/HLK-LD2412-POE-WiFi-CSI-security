@@ -2,6 +2,62 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.1.0-poe-wifi] - 2026-07-08
+
+ESP-IDF 5.5 / Arduino 3.x migration release. The firmware now builds on the community
+pioarduino platform (Arduino-ESP32 3.3.9 / ESP-IDF 5.5.4) **alongside** the legacy
+espressif32@6.9.0 stack (Arduino 2.0.17 / IDF 4.4.7) — both build side by side, with
+platform-specific code guarded by `ESP_ARDUINO_VERSION_MAJOR`. This release also ships a
+batch of fusion, MQTT and radar-recovery fixes surfaced while hardening the IDF 5 stack on
+a live CSI-only node.
+
+### Added
+
+- **ESP-IDF 5.5 / Arduino 3.x build targets.** New `esp32_poe_csi_idf5` and
+  `esp32_poe_csi_idf5_8mb` environments on the pioarduino platform (release 55.03.39),
+  sitting next to the existing 6.9.0 envs. `ETH.begin()` and `esp_task_wdt_init()` ported
+  to the Arduino 3.x API behind version guards; the older stack is left untouched.
+- **`tools/smoke_test.py`.** Stdlib-only HTTP smoke test against a live device: 8 ordered
+  checks (version, healthz, health core, MQTT, radar/CSI, GUI, alarm FSM, Prometheus
+  metrics) with PASS/WARN/FAIL/SKIP output. Radar check is adaptive (SKIP on CSI-only
+  units); the alarm cycle always ends disarmed via `try/finally`. Exit 0 when no FAIL.
+
+### Fixed
+
+- **MQTT fail-fast on a half-open socket (IDF 5 watchdog fix).** On the Arduino 3.x stack
+  `WiFiClient::write()` to a dead-but-lwIP-open socket entered a 10×1 s `select()` retry
+  loop; with ~12 CSI topics per loop cycle this summed past the loopTask watchdog window.
+  The first `publish()` failure now tears the transport down immediately via
+  `_espClient.stop()`, so every later publish in the cycle fast-fails at the
+  `connected()` guard. Oversized payloads are pre-detected before any network I/O.
+- **Fusion stale-CSI gate.** Fusion falls back to radar-only when CSI data is starved —
+  frozen variance/ML snapshots no longer suppress a live radar hit or hold phantom
+  presence (fed from the main-loop starvation detector).
+- **Radar un-veto on armed path.** Radar above the alarm-energy threshold now qualifies
+  unconditionally; CSI-disagree suppression only shapes presence reporting. The
+  `csiOnlyQualifies` check uses a `(source & 0x3) == 0x2` bitmask so CSI+ML agreement no
+  longer blocks the CSI trigger path.
+- **Radar recovery give-up latch.** A radar-less node stops recovery after two full
+  hard-reset cycles (`_recoveryExhausted`, cleared on reboot), ending endless UART
+  re-init churn; a radar that worked and then died keeps retrying.
+- **IDF 5 watchdog hygiene.** Removed `esp_task_wdt_reset()` calls from the `radarTask`
+  and pre-subscription contexts (silent no-ops on IDF 4.4, `task not found` error spam on
+  IDF 5); remaining resets go through a `wdtResetSafe()` guard that only fires when the
+  task is TWDT-subscribed.
+- **FUSION DBG rate-limit.** Steady-state fusion debug lines are capped at 1×/10 s (state
+  changes still log immediately). ML saturated on weak CSI had flooded ~527k lines in
+  4.5 h and evicted the DebugLog history.
+
+### Changed
+
+- **CSI MQTT metrics change-gated.** Float metrics publish on >5 % delta paced to 10 s,
+  states on flip, plus a 60 s heartbeat — measured ~720 → ~50 msg/min on the broker.
+- **SSE queue cap 32 → 8.** A sleeping dashboard tab had queued ~48 kB of telemetry (the
+  root cause of min-heap dips to ~35 kB on IDF 5, including cbuf/WebResponses allocation
+  failures); the queue is now capped at ~12 kB.
+- **Default entry delay 30000 ms → 0.** Unattended sites with remote disarm gain nothing
+  from a keypad-style grace period.
+
 ## [5.0.17-poe-wifi] - 2026-07-06
 
 Dashboard organization release: the Basic tab opens as a short overview on radar units too,

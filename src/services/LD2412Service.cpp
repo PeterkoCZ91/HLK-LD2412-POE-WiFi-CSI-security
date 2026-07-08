@@ -1,7 +1,20 @@
 #include "services/LD2412Service.h"
 #include "debug.h"
 #include <esp_task_wdt.h>
+#include <esp_idf_version.h>
 #include <new>
+
+// esp_task_wdt_reset() from a task that isn't subscribed is a silent no-op on
+// IDF4 but logs "task_wdt: task not found" errors on IDF5 (boot-time radar
+// probing runs in loopTask before main.cpp subscribes it to the TWDT).
+// Reset only when the calling task is actually watched.
+static inline void wdtResetSafe() {
+#if ESP_IDF_VERSION_MAJOR >= 5
+    if (esp_task_wdt_status(nullptr) == ESP_OK) esp_task_wdt_reset();
+#else
+    esp_task_wdt_reset();
+#endif
+}
 
 LD2412Service::LD2412Service(int8_t rxPin, int8_t txPin)
     : _rxPin(rxPin), _txPin(txPin) {
@@ -118,7 +131,10 @@ bool LD2412Service::begin(HardwareSerial& serial, uint8_t minGate, uint8_t maxGa
             DBG("RADAR", "Enabling Engineering Mode...");
             bool engOk = false;
             for (int attempt = 0; attempt < 3 && !engOk; attempt++) {
-                esp_task_wdt_reset();
+                // No esp_task_wdt_reset() here: begin() runs in loopTask before
+                // esp_task_wdt_add(NULL) (main.cpp:781); calling reset before
+                // subscription logs "task not found" on IDF5 — see radarTask note
+                // in attemptRadarRecovery().
                 engOk = _radar->setEngineeringMode(true);
                 if (!engOk) {
                     DBG("RADAR", "Eng Mode attempt %d failed, retrying...", attempt + 1);
@@ -167,6 +183,14 @@ void LD2412Service::stop() {
 void LD2412Service::attemptRadarRecovery() {
     unsigned long now = millis();
 
+    // Radar never answered since boot and repeated escalations didn't change
+    // that — hardware is absent. Endless UART re-inits only churn CPU and
+    // flood the log; reboot re-enables probing (same contract as the
+    // SecurityMonitor CSI-only latch).
+    if (_recoveryExhausted) {
+        return;
+    }
+
     // Rate limit recovery attempts (TASK-007 - overflow safe)
     if ((unsigned long)(now - _lastRecoveryAttempt) < RECOVERY_INTERVAL) {
         return;
@@ -186,17 +210,19 @@ void LD2412Service::attemptRadarRecovery() {
     else if (_recoveryAttempts < 4) {
         // Medium reset: Restart radar module
         DBG("RADAR", "Medium reset - restarting radar module");
-        esp_task_wdt_reset();
         if (_radar) {
             _radar->restartModule();
         }
         vTaskDelay(pdMS_TO_TICKS(500)); // Non-blocking delay
-        esp_task_wdt_reset();
     }
     else {
         // Hard reset: Re-initialize entire UART
+        // Note: esp_task_wdt_reset() is intentionally absent here — this
+        // function runs in radarTask context which is not subscribed to TWDT.
+        // On IDF4.4 such calls were silent no-ops; on IDF5 they log
+        // "task not found" errors.  The TWDT cannot trigger on an unsubscribed
+        // task, so these resets serve no purpose.
         DBG("RADAR", "Hard reset - reinitializing UART");
-        esp_task_wdt_reset();
 
         if (_radar) {
             delete _radar;
@@ -209,13 +235,15 @@ void LD2412Service::attemptRadarRecovery() {
         vTaskDelay(pdMS_TO_TICKS(500)); // Non-blocking delay
 
         _radar = new LD2412(*_serial);
-        esp_task_wdt_reset();
 
         // Verify the new UART link is alive at the configured baud before we
         // try to push engineering-mode commands. readFirmwareVersion() returns
         // nullptr if the radar didn't ACK — fall back to the alternate baud
         // (115200 default vs 256000 high-speed) and re-init once.
         int* fwCheck = _radar->readFirmwareVersion();
+        if (fwCheck) {
+            _everGotData = true;  // radar answered after hard reset
+        }
         if (!fwCheck) {
             uint32_t altBaud = (_currentBaud == 115200) ? 256000 : 115200;
             DBG("RADAR", "Hard reset: no ACK at %u — retrying at %u",
@@ -226,10 +254,10 @@ void LD2412Service::attemptRadarRecovery() {
             _serial->begin(altBaud, SERIAL_8N1, _rxPin, _txPin);
             vTaskDelay(pdMS_TO_TICKS(500));
             _radar = new LD2412(*_serial);
-            esp_task_wdt_reset();
             int* fwRetry = _radar->readFirmwareVersion();
             if (fwRetry) {
                 _currentBaud = altBaud;
+                _everGotData = true;
                 DBG("RADAR", "Hard reset: alt baud %u OK", (unsigned)altBaud);
             } else {
                 DBG("RADAR", "Hard reset: alt baud %u also unresponsive",
@@ -242,7 +270,6 @@ void LD2412Service::attemptRadarRecovery() {
             DBG("RADAR", "Hard reset: restoring Engineering Mode...");
             bool engOk = false;
             for (int i = 0; i < 3 && !engOk; i++) {
-                esp_task_wdt_reset();
                 engOk = _radar->setEngineeringMode(true);
                 if (!engOk) vTaskDelay(pdMS_TO_TICKS(200));
             }
@@ -257,6 +284,14 @@ void LD2412Service::attemptRadarRecovery() {
         bool prevTamper = _tamperDetected;
         _tamperDetected = _tamperExternal || _tamperRadarFailure;
         if (_tamperDetected != prevTamper) _stateChanged = true;
+
+        // A node whose radar worked and then died keeps retrying forever
+        // (it may come back after a power blip); a node with no radar since
+        // boot gives up after two full escalation cycles.
+        if (!_everGotData && ++_hardResetCycles >= 2) {
+            _recoveryExhausted = true;
+            DBG("RADAR", "Recovery exhausted — no radar since boot, stopping attempts until reboot");
+        }
     }
 
     _recoveryAttempts++;
@@ -284,7 +319,9 @@ void LD2412Service::update() {
     // Check if we got valid data
     if (snap.valid && state >= 0) {
         _lastValidData = now;
+        _everGotData = true;
         _recoveryAttempts = 0; // Reset recovery counter on success
+        _hardResetCycles = 0;
         _tamperRadarFailure = false;
         bool prevTamper = _tamperDetected;
         _tamperDetected = _tamperExternal || _tamperRadarFailure;
@@ -547,7 +584,7 @@ void LD2412Service::loadConfigFromRadar() {
     if (!_radar) return;
     
     DBG("RADAR", "Loading configuration...");
-    esp_task_wdt_reset();
+    wdtResetSafe();
 
     // 1. Get Parameter Config (Gates, Duration)
     int* params = _radar->getParamConfig();
@@ -558,7 +595,7 @@ void LD2412Service::loadConfigFromRadar() {
         DBG("RADAR", "Config: MinGate=%d MaxGate=%d Duration=%ds",
                      _minGate, _maxGate, _maxGateDuration);
     }
-    esp_task_wdt_reset();
+    wdtResetSafe();
 
     // 2. Get Motion Sensitivity
     int* movSens = _radar->getMotionSensitivity(RETURN_ARRAY);
@@ -568,7 +605,7 @@ void LD2412Service::loadConfigFromRadar() {
         }
         DBG("RADAR", "Motion sensitivity loaded");
     }
-    esp_task_wdt_reset();
+    wdtResetSafe();
 
     // 3. Get Static Sensitivity
     int* statSens = _radar->getStaticSensitivity(RETURN_ARRAY);
@@ -578,7 +615,7 @@ void LD2412Service::loadConfigFromRadar() {
         }
         DBG("RADAR", "Static sensitivity loaded");
     }
-    esp_task_wdt_reset();
+    wdtResetSafe();
 }
 
 bool LD2412Service::verifyGateConfig(uint8_t expectedMin, uint8_t expectedMax) {
@@ -609,9 +646,9 @@ bool LD2412Service::setMotionSensitivity(uint8_t sensitivity) {
     if (!_radar) return false;
     if (xSemaphoreTake(_mutex, pdMS_TO_TICKS(500)) != pdTRUE) return false;
 
-    esp_task_wdt_reset();
+    wdtResetSafe();
     bool result = _radar->setMotionSensitivity(sensitivity);
-    esp_task_wdt_reset();
+    wdtResetSafe();
     
     if (result) {
         for (int i = 0; i < 14; i++) _motionSensitivity[i] = sensitivity;
@@ -624,9 +661,9 @@ bool LD2412Service::setMotionSensitivity(uint8_t sens[14]) {
     if (!_radar) return false;
     if (xSemaphoreTake(_mutex, pdMS_TO_TICKS(500)) != pdTRUE) return false;
 
-    esp_task_wdt_reset();
+    wdtResetSafe();
     bool result = _radar->setMotionSensitivity(sens);
-    esp_task_wdt_reset();
+    wdtResetSafe();
 
     if (result) {
         for (int i = 0; i < 14; i++) _motionSensitivity[i] = sens[i];
@@ -639,9 +676,9 @@ bool LD2412Service::setStaticSensitivity(uint8_t sensitivity) {
     if (!_radar) return false;
     if (xSemaphoreTake(_mutex, pdMS_TO_TICKS(500)) != pdTRUE) return false;
 
-    esp_task_wdt_reset();
+    wdtResetSafe();
     bool result = _radar->setStaticSensitivity(sensitivity);
-    esp_task_wdt_reset();
+    wdtResetSafe();
 
     if (result) {
         for (int i = 0; i < 14; i++) _staticSensitivity[i] = sensitivity;
@@ -654,9 +691,9 @@ bool LD2412Service::setStaticSensitivity(uint8_t sens[14]) {
     if (!_radar) return false;
     if (xSemaphoreTake(_mutex, pdMS_TO_TICKS(500)) != pdTRUE) return false;
 
-    esp_task_wdt_reset();
+    wdtResetSafe();
     bool result = _radar->setStaticSensitivity(sens);
-    esp_task_wdt_reset();
+    wdtResetSafe();
 
     if (result) {
         for (int i = 0; i < 14; i++) _staticSensitivity[i] = sens[i];
@@ -669,9 +706,9 @@ bool LD2412Service::setParamConfig(uint8_t minGate, uint8_t maxGate, uint8_t dur
     if (!_radar) return false;
     if (xSemaphoreTake(_mutex, pdMS_TO_TICKS(500)) != pdTRUE) return false;
 
-    esp_task_wdt_reset();
+    wdtResetSafe();
     bool result = _radar->setParamConfig(minGate, maxGate, duration, 0);
-    esp_task_wdt_reset();
+    wdtResetSafe();
 
     if (result) {
         _minGate = minGate;
@@ -700,9 +737,9 @@ bool LD2412Service::setResolution(float resolution) {
 
     if (xSemaphoreTake(_mutex, pdMS_TO_TICKS(500)) != pdTRUE) return false;
 
-    esp_task_wdt_reset();
+    wdtResetSafe();
     bool result = _radar->setResolution(mode);
-    esp_task_wdt_reset();
+    wdtResetSafe();
 
     if (result) {
         DBG("RADAR", "Resolution mode set to %d (%.2fm)", mode, resolution);
@@ -716,9 +753,9 @@ int LD2412Service::getResolution() {
     if (!_radar) return -1;
     if (xSemaphoreTake(_mutex, pdMS_TO_TICKS(200)) != pdTRUE) return -1;
 
-    esp_task_wdt_reset();
+    wdtResetSafe();
     int result = _radar->getResolution();
-    esp_task_wdt_reset();
+    wdtResetSafe();
 
     xSemaphoreGive(_mutex);
     return result;
@@ -728,7 +765,7 @@ bool LD2412Service::factoryReset() {
     if (!_radar) return false;
     if (xSemaphoreTake(_mutex, pdMS_TO_TICKS(500)) != pdTRUE) return false;
 
-    esp_task_wdt_reset();
+    wdtResetSafe();
     bool result = _radar->resetDeviceSettings();
     
     if (!result) {
@@ -745,7 +782,7 @@ bool LD2412Service::factoryReset() {
         result = true; // Assume success of aggressive attempt
     }
 
-    esp_task_wdt_reset();
+    wdtResetSafe();
     xSemaphoreGive(_mutex);
     return result;
 }
@@ -754,7 +791,7 @@ bool LD2412Service::restartRadar() {
     if (!_radar) return false;
     if (xSemaphoreTake(_mutex, pdMS_TO_TICKS(500)) != pdTRUE) return false;
 
-    esp_task_wdt_reset();
+    wdtResetSafe();
     bool result = _radar->restartModule();
     
     if (!result) {
@@ -771,7 +808,7 @@ bool LD2412Service::restartRadar() {
         result = true;
     }
 
-    esp_task_wdt_reset();
+    wdtResetSafe();
     xSemaphoreGive(_mutex);
     return result;
 }
@@ -784,9 +821,9 @@ bool LD2412Service::setLightFunction(uint8_t mode) {
     if (!_radar) return false;
     if (xSemaphoreTake(_mutex, pdMS_TO_TICKS(500)) != pdTRUE) return false;
 
-    esp_task_wdt_reset();
+    wdtResetSafe();
     bool result = _radar->setLightFunction(mode);
-    esp_task_wdt_reset();
+    wdtResetSafe();
 
     if (result) {
         DBG("RADAR", "Light function set to %d", mode);
@@ -799,9 +836,9 @@ bool LD2412Service::setLightThreshold(uint8_t threshold) {
     if (!_radar) return false;
     if (xSemaphoreTake(_mutex, pdMS_TO_TICKS(500)) != pdTRUE) return false;
 
-    esp_task_wdt_reset();
+    wdtResetSafe();
     bool result = _radar->setLightThreshold(threshold);
-    esp_task_wdt_reset();
+    wdtResetSafe();
 
     if (result) {
         DBG("RADAR", "Light threshold set to %d", threshold);
@@ -814,9 +851,9 @@ int LD2412Service::getLightFunction() {
     if (!_radar) return -1;
     if (xSemaphoreTake(_mutex, pdMS_TO_TICKS(200)) != pdTRUE) return -1;
 
-    esp_task_wdt_reset();
+    wdtResetSafe();
     int result = _radar->getLightFunction();
-    esp_task_wdt_reset();
+    wdtResetSafe();
 
     xSemaphoreGive(_mutex);
     return result;
@@ -826,9 +863,9 @@ int LD2412Service::getLightThreshold() {
     if (!_radar) return -1;
     if (xSemaphoreTake(_mutex, pdMS_TO_TICKS(200)) != pdTRUE) return -1;
 
-    esp_task_wdt_reset();
+    wdtResetSafe();
     int result = _radar->getLightThreshold();
-    esp_task_wdt_reset();
+    wdtResetSafe();
 
     xSemaphoreGive(_mutex);
     return result;
@@ -925,9 +962,9 @@ bool LD2412Service::startCalibration() {
     if (!_radar) return false;
     if (xSemaphoreTake(_mutex, pdMS_TO_TICKS(500)) != pdTRUE) return false;
 
-    esp_task_wdt_reset();
+    wdtResetSafe();
     bool result = _radar->enterCalibrationMode();
-    esp_task_wdt_reset();
+    wdtResetSafe();
 
     xSemaphoreGive(_mutex);
     return result;
@@ -1048,12 +1085,13 @@ uint8_t LD2412Service::getLightLevelSafe() const {
 
 bool LD2412Service::readFirmwareVersion() {
     if (!_radar) return false;
-    esp_task_wdt_reset();
+    wdtResetSafe();
     int* fw = _radar->readFirmwareVersion();
-    esp_task_wdt_reset();
+    wdtResetSafe();
     if (fw) {
         _fwMajor = fw[1];
         _fwMinor = fw[2];
+        _everGotData = true;  // radar ACKed — hardware confirmed present
         return true;
     }
     return false;
@@ -1071,9 +1109,9 @@ int LD2412Service::readRadarBluetoothState() {
     if (!_radar) return -1;
     if (xSemaphoreTake(_mutex, pdMS_TO_TICKS(500)) != pdTRUE) return -1;
     uint8_t mac[6] = {0};
-    esp_task_wdt_reset();
+    wdtResetSafe();
     bool ok = _radar->readMacAddress(mac);
-    esp_task_wdt_reset();
+    wdtResetSafe();
     xSemaphoreGive(_mutex);
     if (!ok) return -1;
     return _isNoMacSentinel(mac) ? 0 : 1;
@@ -1083,9 +1121,9 @@ bool LD2412Service::getRadarMacString(char out[18]) {
     if (!_radar || !out) return false;
     if (xSemaphoreTake(_mutex, pdMS_TO_TICKS(500)) != pdTRUE) return false;
     uint8_t mac[6] = {0};
-    esp_task_wdt_reset();
+    wdtResetSafe();
     bool ok = _radar->readMacAddress(mac);
-    esp_task_wdt_reset();
+    wdtResetSafe();
     xSemaphoreGive(_mutex);
     if (!ok) {
         out[0] = '\0';
@@ -1112,13 +1150,13 @@ bool LD2412Service::applyBluetoothState(bool desired) {
     if (xSemaphoreTake(_mutex, pdMS_TO_TICKS(500)) != pdTRUE) return false;
     Serial.printf("[RADAR] Bluetooth %s → %s (applying, radar will restart)\n",
                   cur ? "ON" : "OFF", desired ? "ON" : "OFF");
-    esp_task_wdt_reset();
+    wdtResetSafe();
     bool setOk = _radar->setBluetooth(desired);
     bool restartOk = false;
     if (setOk) {
         restartOk = _radar->restartModule();
     }
-    esp_task_wdt_reset();
+    wdtResetSafe();
     xSemaphoreGive(_mutex);
 
     if (!setOk) {
@@ -1142,9 +1180,11 @@ bool LD2412Service::applyBluetoothState(bool desired) {
 bool LD2412Service::_setEngModeInternal(bool enable) {
     if (!_radar) return false;
 
-    esp_task_wdt_reset();
+    // No esp_task_wdt_reset() here: this function is called from radarTask via
+    // update(), and radarTask is not subscribed to TWDT.  On IDF4.4 such calls
+    // were silent ESP_ERR_NOT_FOUND returns; on IDF5 they log "task not found".
+    // See the same rationale in attemptRadarRecovery().
     bool result = _radar->setEngineeringMode(enable);
-    esp_task_wdt_reset();
 
     if (result) {
         _engineeringMode = enable;
@@ -1170,9 +1210,9 @@ bool LD2412Service::setTrackingMode(bool enable) {
     if (!_radar) return false;
     if (xSemaphoreTake(_mutex, pdMS_TO_TICKS(500)) != pdTRUE) return false;
     
-    esp_task_wdt_reset();
+    wdtResetSafe();
     bool result = _radar->enableTrackingMode(enable);
-    esp_task_wdt_reset();
+    wdtResetSafe();
     
     if (result) {
         DBG("RADAR", "Tracking mode %s", enable ? "ENABLED" : "DISABLED");

@@ -164,6 +164,9 @@ private:
     bool _initSuccess = false;
     uint8_t _recoveryAttempts = 0;
     unsigned long _lastRecoveryAttempt = 0;
+    bool _everGotData = false;        // radar ACKed/sent a valid frame since boot
+    uint8_t _hardResetCycles = 0;     // full recovery escalations without any data
+    bool _recoveryExhausted = false;  // latched: no radar since boot, stop probing until reboot
     static constexpr uint8_t MAX_RECOVERY_ATTEMPTS = 5;
     static constexpr unsigned long RECOVERY_INTERVAL = 5000; // 5s between attempts
     static constexpr unsigned long DISCONNECT_TIMEOUT = 2000; // 2s (was 5s) - TASK-006

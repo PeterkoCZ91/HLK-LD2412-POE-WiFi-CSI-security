@@ -313,6 +313,15 @@ private:
     float    _packetRate = 0.0f;
     bool     _reconnectRequested = false;
 
+    // MQTT change-gating: last published values + heartbeat clock. Floats go
+    // out when they move, states on flip; heartbeat republishes everything.
+    uint32_t _mqttHeartbeatMs = 0;
+    uint32_t _floatPaceMs = 0;    // floats evaluated at most once per 10 s (noisy)
+    bool     _pubValid = false;   // false until first full publish after (re)connect
+    bool     _pubMotion = false, _pubMlMotion = false;
+    float    _pubTurbulence = 0, _pubVariance = 0, _pubPhaseTurb = 0, _pubRatioTurb = 0;
+    float    _pubBreathing = 0, _pubComposite = 0, _pubDser = 0, _pubPlcr = 0, _pubMlProb = 0;
+
     // Calibration
     bool     _calibrating = false;
     uint32_t _calibStartMs = 0;

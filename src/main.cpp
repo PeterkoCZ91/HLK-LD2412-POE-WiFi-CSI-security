@@ -44,7 +44,7 @@
 // -------------------------------------------------------------------------
 #include <Update.h>
 #ifndef FW_VERSION
-#define FW_VERSION "v5.0.17-poe-wifi"
+#define FW_VERSION "v5.1.0-poe-wifi"
 #endif
 #define WDT_TIMEOUT_SECONDS 60
 
@@ -660,7 +660,11 @@ void setup() {
 
     // --- Start Ethernet ---
     Serial.println("[ETH] Initializing LAN8720A...");
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+    ETH.begin(ETH_PHY_TYPE, ETH_PHY_ADDR, ETH_PHY_MDC, ETH_PHY_MDIO, -1, ETH_CLK_MODE);
+#else
     ETH.begin(ETH_PHY_ADDR, -1, ETH_PHY_MDC, ETH_PHY_MDIO, ETH_PHY_TYPE, ETH_CLK_MODE);
+#endif
 
     // Apply static IP if configured
     if (strlen(configManager.getConfig().static_ip) > 0) {
@@ -759,7 +763,21 @@ void setup() {
 #endif
 
     // WDT after ETH init
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+    {
+        esp_task_wdt_config_t wdtCfg = {};
+        wdtCfg.timeout_ms = WDT_TIMEOUT_SECONDS * 1000;
+        wdtCfg.idle_core_mask = 0;      // idle tasks not watched (matches 2.x behaviour)
+        wdtCfg.trigger_panic = true;
+        // Arduino 3.x core TWDT typically already initialized → init returns ESP_ERR_INVALID_STATE;
+        // reconfigure in that case so the 60s timeout is actually applied.
+        if (esp_task_wdt_init(&wdtCfg) != ESP_OK) {
+            esp_task_wdt_reconfigure(&wdtCfg);
+        }
+    }
+#else
     esp_task_wdt_init(WDT_TIMEOUT_SECONDS, true);
+#endif
     esp_task_wdt_add(NULL);
 
     // --- Web Server Routes ---
@@ -1514,6 +1532,7 @@ void loop() {
                 }
             }
             g_csiDataStarved.store(csiStarved);
+            securityMonitor.setCsiDataOk(!csiStarved);
         }
 #endif
     }

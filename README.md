@@ -3,7 +3,7 @@
 [![PlatformIO](https://img.shields.io/badge/PlatformIO-ESP32-orange?logo=platformio)](https://platformio.org/)
 [![ESP32](https://img.shields.io/badge/MCU-ESP32--WROOM--32-blue?logo=espressif)](https://www.espressif.com/)
 [![License](https://img.shields.io/badge/License-GPL--3.0-blue)](LICENSE)
-[![Version](https://img.shields.io/badge/Version-5.0.17--poe--wifi-blue)]()
+[![Version](https://img.shields.io/badge/Version-5.1.0--poe--wifi-blue)]()
 [![Discussions](https://img.shields.io/badge/GitHub-Discussions-purple?logo=github)](https://github.com/PeterkoCZ91/HLK-LD2412-POE-WiFi-CSI-security/discussions)
 
 **Dual-sensor intrusion detection system** — ESP32 + HLK-LD2412 24 GHz mmWave radar + **WiFi CSI (Channel State Information) passive motion detection** over **wired Ethernet with Power over Ethernet**. Full alarm state machine, zone management, Home Assistant integration, Telegram bot, and a dark-mode web dashboard. No cloud required.
@@ -11,6 +11,8 @@
 WiFi CSI detection algorithms based on [ESPectre](https://github.com/francescopace/espectre) by Francesco Pace (GPLv3).
 
 > [!TIP]
+> **v5.1.0** — ESP-IDF 5.5 / Arduino 3.x migration: the firmware now builds on the community pioarduino platform (Arduino-ESP32 3.3.9 / ESP-IDF 5.5.4) via the new `esp32_poe_csi_idf5` env **alongside** the legacy espressif32@6.9.0 stack, with platform code guarded by `ESP_ARDUINO_VERSION_MAJOR`. Ships a batch of fusion/MQTT/radar-recovery fixes hardened on a live CSI-only node (stale-CSI fusion gate, radar un-veto & recovery give-up latch, MQTT fail-fast on half-open sockets, change-gated CSI telemetry, SSE queue cap) plus a stdlib-only `tools/smoke_test.py`. See [CHANGELOG](CHANGELOG.md).
+>
 > **v5.0.17** — dashboard organization: the Basic tab now opens as a short overview on radar units too (expert radar fields — gate min/max, hold time, diagnostics, BT warning, calibration — collapsed into a new "Advanced radar configuration" section), input placeholders are localized (cs/en), and CSI metric labels lead with a human description ("Overall motion score (composite)", "Signal variance", "Motion exit threshold"). See [CHANGELOG](CHANGELOG.md).
 >
 > **v5.0.7** — quick wins: new [`/metrics` Prometheus endpoint](#prometheus-metrics) for Grafana dashboards, per-IP brute-force lockout on web auth (`429` + exponential backoff), first automated unit tests (`pio test -e native`) and cppcheck static analysis in CI. See [CHANGELOG](CHANGELOG.md).
@@ -145,6 +147,15 @@ pio run -e esp32_poe_csi_8mb --target upload # With WiFi CSI on an 8 MB flash bo
 # or
 pio run -e esp32_poe --target upload        # Radar only (no CSI)
 ```
+
+> **ESP-IDF 5.5 / Arduino 3.x builds (v5.1.0).** The same source also builds on the
+> community pioarduino platform (Arduino-ESP32 3.3.9 / ESP-IDF 5.5.4) via the
+> `esp32_poe_csi_idf5` env (`esp32_poe_csi_idf5_8mb` for 8 MB boards), sitting **alongside**
+> the default espressif32@6.9.0 stack — platform-specific code is guarded by
+> `ESP_ARDUINO_VERSION_MAJOR`, so both build side by side:
+> ```bash
+> pio run -e esp32_poe_csi_idf5 --target upload   # WiFi CSI on the IDF 5.5 / Arduino 3.x stack
+> ```
 
 > **⚠️ Check your flash size first.** The default build targets **16 MB** flash (the
 > reference board's spec). We have observed ESP32-STICK-PoE units that actually ship
@@ -479,6 +490,13 @@ The embedded web dashboard provides real-time telemetry, alarm control, zone man
 | ![Zones](docs/screenshots/zones.png) | ![Events](docs/screenshots/events.png) |
 | ![CSI Fusion](docs/screenshots/csi-fusion.png) | |
 
+**CSI-only unit (English UI, v5.1.0):**
+
+| | |
+|---|---|
+| ![Dashboard — CSI-only](docs/screenshots/01-dashboard-csi-en.png) | ![WiFi CSI](docs/screenshots/02-wifi-csi-en.png) |
+| ![Security](docs/screenshots/03-security-en.png) | ![Network & Cloud](docs/screenshots/04-network-en.png) |
+
 Since v5.0.16 the dashboard adapts to the sensors actually present: on a CSI-only unit (no radar wired) it hides all microwave-radar chrome — the distance gauge, radar health rows, the Restart/Reset buttons, and the Gate sensitivity and Zones tabs — promotes WiFi CSI to the main readout, and offers a reveal link for the hidden controls; dual-sensor units are unaffected and radar chrome returns automatically once the radar is reattached. Cards pack vertically with a masonry layout (no large empty gaps), expert CSI detail is collapsed behind collapsible sections by default, and the UI renders fully in the selected language on load (English by default).
 
 The CSI tab shows live turbulence / composite score / packet rate / RSSI, runtime SSID/password switching, site-learning controls (start/stop/progress/elapsed), MLP probability, NBVI mask + best/worst subcarrier, and adaptive-threshold diagnostics. The Network tab covers static IP / DHCP / DNS, MQTT broker config, Telegram bot, schedule (auto-arm/disarm + idle-timeout arm), timezone picker, and full config export/import as JSON. The Security tab adds the cold-reboot-before-OTA checkbox (default on) for the upload flow. The Events tab features a 24h activity heatmap with type filtering and CSV export. CZ/EN language toggle in header.
@@ -700,7 +718,7 @@ The HLK-LD2412 sensor has several known firmware issues:
 - [x] Site learning (long-term quiet baseline + EMA refresh) — **v5.0.0**
 - [x] Pull-based OTA from URL (HTTPS, enforced MD5, NVS phase tracking; redirects rejected since v5.0.6) — **v5.0.0**
 - [ ] Sonoff/door corroboration window for low-confidence alarms (v5.1.x)
-- [ ] Platform/library bump to ESP32Async/platform-espressif32 (v5.1.x)
+- [x] Platform/library bump to ESP-IDF 5.5 / Arduino 3.x (pioarduino, side-by-side with 6.9.0) — **v5.1.0**
 
 ---
 
@@ -803,6 +821,7 @@ A: Yes. Each device gets a unique `device_id` (auto-derived from MAC) so HA disc
 | v5.0.15-poe-wifi | **Sensor visibility:** main dashboard splits the status card into MW radar and WiFi CSI sections with explicit `CSI offline` / `No data` / `idle` / `motion` states; CSI data-starvation detection (logs `CSI data lost`/`restored`, exposed as `csi_data_ok` + Prometheus metric); radar CSI-only latch (`radar_monitoring_disabled`) stops log spam on radar-less units; radar readout shows `Radar disconnected` / `—` instead of stale zeros / `NaN`; full CZ/EN localization parity. |
 | v5.0.16-poe-wifi | **Dashboard polish:** radar-aware UI hides all microwave-radar chrome on CSI-only units (distance gauge, radar health rows, Restart/Reset buttons, Gate sensitivity / Zones tabs, radar-only fields) and promotes WiFi CSI to the main readout, with a reveal link for the hidden controls; masonry card layout packs cards vertically (no large empty areas); collapsible expert sections so the CSI tab opens as a short overview; fixed language not applied on load (`window.onload = init` overrode `<body onload>`, so `applyLang()` never ran — English by default); telemetry-flicker fix on partial frames. |
 | v5.0.17-poe-wifi | **Dashboard organization:** Basic tab reorganized — expert radar fields (gate Min/Max with cm readout, hold time, diagnostics, BT warning, calibration) moved into a collapsed radar-only "Advanced radar configuration" section, leaving device name, sensitivity and LED on top; placeholder localization via new `data-i18n-ph` mechanism (12 cs/en keys); CSI metric labels humanized — human description first, technical term in parentheses (composite, variance, exit multiplier, DSER/PLCR expansions in ML help). |
+| v5.1.0-poe-wifi | **ESP-IDF 5.5 / Arduino 3.x migration:** firmware now builds on the community pioarduino platform (Arduino-ESP32 3.3.9 / ESP-IDF 5.5.4) via new `esp32_poe_csi_idf5` / `esp32_poe_csi_idf5_8mb` envs **alongside** the legacy espressif32@6.9.0 stack, with `ETH.begin()` / `esp_task_wdt_init()` ported behind `ESP_ARDUINO_VERSION_MAJOR` guards. **Fusion/MQTT/radar fixes** hardened on a live CSI-only node: stale-CSI fusion gate (radar-only fallback on CSI starvation), radar un-veto on the armed path, radar recovery give-up latch, MQTT fail-fast on half-open sockets (IDF 5 watchdog fix), IDF 5 watchdog hygiene (`wdtResetSafe()`), and FUSION DBG rate-limit. **Telemetry diet:** change-gated CSI MQTT metrics (~720 → ~50 msg/min), SSE queue cap 32 → 8, default entry delay 30 s → 0. New stdlib-only `tools/smoke_test.py` (8 ordered live-device checks). |
 
 ---
 

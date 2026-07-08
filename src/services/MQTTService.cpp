@@ -263,27 +263,62 @@ bool MQTTService::publish(const char* topic, const char* payload, bool retained)
         if (_offlineBuffer) _offlineBuffer->store(topic, payload, retained);
         return false;
     }
+
+    // fail-fast: detect oversized payload before calling PubSubClient.
+    // PubSubClient returns false without network I/O when topic+payload
+    // exceeds its buffer — don't kill a healthy connection for a sizing issue.
+    // (PubSubClient internal check: bufferSize < MQTT_MAX_HEADER_SIZE(5) + 2 + topicLen + payLen)
+    {
+        uint16_t bufSize = _mqttClient.getBufferSize();
+        size_t   tLen = topic   ? strnlen(topic,   bufSize) : 0;
+        size_t   pLen = payload ? strnlen(payload, bufSize) : 0;
+        if (bufSize < 5u + 2u + tLen + pLen) {
+            _publishFailTotal++;
+            _lastPublishFailMs = millis();
+            _lastFailState     = _mqttClient.state();
+            strncpy(_lastFailTopic, topic ? topic : "", sizeof(_lastFailTopic) - 1);
+            _lastFailTopic[sizeof(_lastFailTopic) - 1] = '\0';
+            DBG("MQTT", "Publish OVERSIZED '%s' (payload %u B, buf %u B) — connection kept",
+                _lastFailTopic, (unsigned)pLen, (unsigned)bufSize);
+            return false;
+        }
+    }
+
     bool success = _mqttClient.publish(topic, payload, retained);
     if (success) {
         _lastPublish = millis();
         _publishFailStreak = 0;
         return true;
     }
-    // publish() returned false while connected()==true → broker or socket stuck.
-    // Track fail streak, capture diagnostics, buffer for replay, and force a
-    // clean reconnect once streak exceeds the limit (pre-DMS recovery).
+
+    // publish() returned false while connected()+sized-OK → transport half-open.
+    // IDF5/Arduino 3.x WiFiClient::write() on a dead socket blocks ~10 s via
+    // select() retry; 12 CSI topics/loop × 10 s > 60 s TWDT limit → panic.
+    // Kill the underlying lwIP socket NOW so every subsequent publish() call
+    // this loop cycle sees connected()==false and returns instantly (fail-fast).
+    //
+    // Why _espClient.stop(), not _mqttClient.disconnect():
+    //   disconnect() sends a MQTT DISCONNECT packet over the dead socket →
+    //   same WiFiClient::write() select-loop → same ~10 s block → same risk.
+    //   _espClient.stop() closes the lwIP fd with no network I/O; the next
+    //   _mqttClient.connected() call detects the dead client and transitions
+    //   _state to MQTT_CONNECTION_LOST automatically.
     _publishFailStreak++;
     _publishFailTotal++;
     _lastPublishFailMs = millis();
-    _lastFailState = _mqttClient.state();
+    _lastFailState     = _mqttClient.state();
     strncpy(_lastFailTopic, topic, sizeof(_lastFailTopic) - 1);
     _lastFailTopic[sizeof(_lastFailTopic) - 1] = '\0';
     if (_offlineBuffer) _offlineBuffer->store(topic, payload, retained);
-    if (_publishFailStreak >= MQTT_PUBLISH_FAIL_STREAK_LIMIT) {
-        DBG("MQTT", "Publish fail streak %u on '%s' (state=%d) — forcing disconnect",
-            _publishFailStreak, topic, _lastFailState);
-        _mqttClient.disconnect();
-        _publishFailStreak = 0;
+
+    if (_publishFailStreak == 1) {
+        // Log OK→fail transition only (throttled: subsequent fails in same cycle
+        // short-circuit at connected()==false before reaching here)
+        DBG("MQTT", "Publish FAIL '%s' (state=%d) — transport stopped (fail-fast)",
+            _lastFailTopic, _lastFailState);
+        _espClient.stop();
+        // _publishFailStreak intentionally not reset here — connect() resets it
+        // on successful reconnect; health API shows streak=1 while disconnected
     }
     return false;
 }

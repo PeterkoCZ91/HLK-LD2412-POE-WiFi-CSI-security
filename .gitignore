@@ -39,3 +39,7 @@ bench_*.jsonl
 
 # Internal planning/audit artifacts — keep local, never public
 docs/superpowers/
+
+# pioarduino build artefakty (generované z idf_component manifest)
+src/idf_component.yml
+src/idf_component.yml.orig

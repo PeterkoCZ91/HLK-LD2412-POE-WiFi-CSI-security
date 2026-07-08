@@ -1,0 +1,298 @@
+#!/usr/bin/env python3
+"""Smoke test for poe-2412-wifi firmware against a live device.
+
+Usage:
+    python3 tools/smoke_test.py --ip 192.168.68.29
+    python3 tools/smoke_test.py --ip 192.168.68.29 --skip-alarm
+"""
+import argparse
+import base64
+import json
+import sys
+import time
+import urllib.error
+import urllib.request
+
+
+# ── Result tracking ──────────────────────────────────────────────────────────
+
+RESULTS = []   # list of (check_name, status, message)
+
+
+def record(check, status, msg):
+    """Record and immediately print one check result."""
+    RESULTS.append((check, status, msg))
+    print(f"  [{status:4s}] {check}: {msg}")
+
+
+# ── HTTP helpers ─────────────────────────────────────────────────────────────
+
+def _make_auth(user, password):
+    token = base64.b64encode(f"{user}:{password}".encode()).decode()
+    return f"Basic {token}"
+
+
+def http_get(ip, path, auth=None, timeout=8):
+    """GET request; returns (http_status, bytes_body). Raises on error."""
+    req = urllib.request.Request(f"http://{ip}{path}")
+    if auth:
+        req.add_header("Authorization", auth)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.status, resp.read()
+
+
+def http_post(ip, path, auth=None, timeout=8):
+    """POST request (no body); returns (http_status, bytes_body). Raises on error."""
+    req = urllib.request.Request(f"http://{ip}{path}", method="POST")
+    if auth:
+        req.add_header("Authorization", auth)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.status, resp.read()
+
+
+# ── Checks ───────────────────────────────────────────────────────────────────
+
+def check_version(ip, auth, timeout):
+    """GET /api/version (no auth) → non-empty string starting with 'v'."""
+    try:
+        _, body = http_get(ip, "/api/version", auth=None, timeout=timeout)
+        text = body.decode().strip()
+        if text.startswith("v") and len(text) > 1:
+            record("version", "PASS", text)
+        else:
+            record("version", "FAIL", f"unexpected response: {text!r}")
+    except Exception as exc:
+        record("version", "FAIL", str(exc))
+
+
+def check_healthz(ip, auth, timeout):
+    """GET /healthz → JSON with 'fw' and 'uptime_s' fields."""
+    try:
+        _, body = http_get(ip, "/healthz", auth=auth, timeout=timeout)
+        data = json.loads(body)
+        if "fw" in data and "uptime_s" in data:
+            record("healthz", "PASS", f"fw={data['fw']}  uptime={data['uptime_s']}s")
+        else:
+            record("healthz", "FAIL", f"missing required keys; got {sorted(data.keys())}")
+    except Exception as exc:
+        record("healthz", "FAIL", str(exc))
+
+
+def check_health_core(ip, auth, timeout):
+    """GET /api/health → sub-checks for heap, temp, OTA state.
+    Returns the parsed JSON dict so downstream checks can reuse it."""
+    try:
+        _, body = http_get(ip, "/api/health", auth=auth, timeout=timeout)
+        data = json.loads(body)
+    except Exception as exc:
+        record("health", "FAIL", str(exc))
+        return None
+
+    heap = data.get("free_heap", 0)
+    if heap > 40000:
+        record("health/free_heap", "PASS", f"{heap} bytes")
+    elif heap >= 20000:
+        record("health/free_heap", "WARN", f"{heap} bytes (low)")
+    else:
+        record("health/free_heap", "FAIL", f"{heap} bytes (critically low)")
+
+    temp = data.get("chip_temp", 0.0)
+    if temp < 75:
+        record("health/chip_temp", "PASS", f"{temp:.1f} °C")
+    elif temp <= 85:
+        record("health/chip_temp", "WARN", f"{temp:.1f} °C (hot)")
+    else:
+        record("health/chip_temp", "FAIL", f"{temp:.1f} °C (overheating)")
+
+    ota = data.get("ota_state", "unknown")
+    if ota == "valid":
+        record("health/ota_state", "PASS", ota)
+    else:
+        record("health/ota_state", "WARN", f"ota_state={ota!r}")
+
+    return data
+
+
+def check_mqtt(ip, auth, timeout, health_data):
+    """From /api/health JSON: check MQTT connectivity and publish health."""
+    if health_data is None:
+        record("mqtt", "SKIP", "no health data available")
+        return
+
+    mqtt = health_data.get("mqtt", {})
+    if not mqtt.get("enabled", False):
+        record("mqtt", "SKIP", "mqtt.enabled=false — not configured")
+        return
+
+    if mqtt.get("connected", False):
+        record("mqtt/connected", "PASS", f"connected to {mqtt.get('server')}:{mqtt.get('port')}")
+    else:
+        record("mqtt/connected", "FAIL", "mqtt.connected=false")
+
+    streak = mqtt.get("publish_fail_streak", 0)
+    if streak == 0:
+        record("mqtt/publish_fail_streak", "PASS", "0")
+    else:
+        record("mqtt/publish_fail_streak", "WARN", f"streak={streak}")
+
+
+def check_radar_csi(ip, auth, timeout, health_data):
+    """From /api/health JSON: radar and CSI checks (radar adaptive, CSI always)."""
+    if health_data is None:
+        record("radar", "SKIP", "no health data available")
+        record("csi", "SKIP", "no health data available")
+        return
+
+    if health_data.get("radar_monitoring_disabled", False):
+        record("radar", "SKIP", "CSI-only unit (radar_monitoring_disabled=true)")
+    else:
+        uart = health_data.get("uart_state", "")
+        rate = health_data.get("frame_rate", 0)
+        if uart == "RUNNING" and rate > 0:
+            record("radar", "PASS", f"uart_state={uart}  frame_rate={rate}")
+        else:
+            record("radar", "FAIL", f"uart_state={uart!r}  frame_rate={rate}")
+
+    if health_data.get("csi_data_ok", False):
+        record("csi", "PASS", "csi_data_ok=true")
+    else:
+        record("csi", "WARN", "csi_data_ok=false (weak signal — not a FW defect)")
+
+
+def check_gui(ip, auth, timeout):
+    """GET / → HTTP 200, HTML > 50 KB, >100 data-i18n occurrences."""
+    try:
+        _, body = http_get(ip, "/", auth=auth, timeout=timeout)
+        html = body.decode(errors="replace")
+        size = len(body)
+        i18n_count = html.count("data-i18n")
+
+        if size <= 50000:
+            record("gui", "FAIL", f"HTML too small: {size} bytes (need >50 KB)")
+        elif i18n_count <= 100:
+            record("gui", "FAIL", f"data-i18n count too low: {i18n_count} (need >100)")
+        else:
+            record("gui", "PASS", f"size={size} bytes  data-i18n={i18n_count}")
+    except Exception as exc:
+        record("gui", "FAIL", str(exc))
+
+
+def check_alarm(ip, auth, timeout):
+    """Alarm FSM cycle: get state → arm (delayed) → verify arming → disarm → verify disarmed.
+    Skips if system is not in disarmed state. Always ends with a disarm attempt (try/finally)."""
+
+    def get_alarm_state():
+        _, body = http_get(ip, "/api/alarm/status", auth=auth, timeout=timeout)
+        return json.loads(body)
+
+    # Initial state check — abort if system is not idle
+    try:
+        s = get_alarm_state()
+    except Exception as exc:
+        record("alarm", "FAIL", f"cannot read alarm status: {exc}")
+        return
+
+    if s["state"] != "disarmed":
+        record("alarm", "SKIP",
+               f"system is {s['state']!r} — skipping cycle to avoid disruption")
+        return
+
+    # Arm → check arming → disarm (always via finally)
+    try:
+        http_post(ip, "/api/alarm/arm", auth=auth, timeout=timeout)
+        time.sleep(0.5)
+        s = get_alarm_state()
+        if s["state"] == "arming":
+            record("alarm/arm", "PASS", "state=arming")
+        else:
+            record("alarm/arm", "FAIL", f"expected arming, got {s['state']!r}")
+    except Exception as exc:
+        record("alarm/arm", "FAIL", str(exc))
+    finally:
+        try:
+            http_post(ip, "/api/alarm/disarm", auth=auth, timeout=timeout)
+            time.sleep(0.5)
+            s = get_alarm_state()
+            if s["state"] == "disarmed":
+                record("alarm/disarm", "PASS", "state=disarmed")
+            else:
+                record("alarm/disarm", "FAIL", f"expected disarmed, got {s['state']!r}")
+        except Exception as exc:
+            record("alarm/disarm", "FAIL", f"disarm failed: {exc}")
+
+
+def check_metrics(ip, auth, timeout):
+    """GET /metrics → Prometheus text containing 'poe2412_' metric prefix."""
+    try:
+        _, body = http_get(ip, "/metrics", auth=auth, timeout=timeout)
+        text = body.decode()
+        if "poe2412_" in text:
+            record("metrics", "PASS", f"prometheus metrics present ({len(text)} bytes)")
+        else:
+            record("metrics", "FAIL", "poe2412_ prefix not found in /metrics output")
+    except urllib.error.HTTPError as exc:
+        if exc.code == 401:
+            record("metrics", "WARN", "HTTP 401 (older FW auth variant — non-fatal)")
+        else:
+            record("metrics", "FAIL", f"HTTP {exc.code}: {exc.reason}")
+    except Exception as exc:
+        record("metrics", "FAIL", str(exc))
+
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Smoke test for poe-2412-wifi firmware against a live device.")
+    parser.add_argument("--ip", required=True,
+                        help="Device IP address (e.g. 192.168.68.29)")
+    parser.add_argument("--user", default="admin",
+                        help="HTTP Basic auth username (default: admin)")
+    parser.add_argument("--password", default="admin",
+                        help="HTTP Basic auth password (default: admin)")
+    parser.add_argument("--skip-alarm", action="store_true",
+                        help="Skip the alarm FSM cycle check")
+    parser.add_argument("--timeout", type=float, default=8.0,
+                        help="Per-request timeout in seconds (default: 8)")
+    args = parser.parse_args()
+
+    auth = _make_auth(args.user, args.password)
+
+    print(f"=== poe-2412-wifi smoke test  target={args.ip} ===\n")
+
+    check_version(args.ip, auth, args.timeout)
+    check_healthz(args.ip, auth, args.timeout)
+    health_data = check_health_core(args.ip, auth, args.timeout)
+    check_mqtt(args.ip, auth, args.timeout, health_data)
+    check_radar_csi(args.ip, auth, args.timeout, health_data)
+    check_gui(args.ip, auth, args.timeout)
+
+    if args.skip_alarm:
+        record("alarm", "SKIP", "--skip-alarm flag set")
+    else:
+        check_alarm(args.ip, auth, args.timeout)
+
+    check_metrics(args.ip, auth, args.timeout)
+
+    # ── Summary ──────────────────────────────────────────────────────────────
+    print()
+    counts = {s: 0 for s in ("PASS", "WARN", "FAIL", "SKIP")}
+    for _, status, _ in RESULTS:
+        counts[status] = counts.get(status, 0) + 1
+
+    print(f"=== SUMMARY  PASS={counts['PASS']}  WARN={counts['WARN']}  "
+          f"FAIL={counts['FAIL']}  SKIP={counts['SKIP']} ===")
+
+    if counts["FAIL"]:
+        print("\nFailed checks:")
+        for name, status, msg in RESULTS:
+            if status == "FAIL":
+                print(f"  - {name}: {msg}")
+        sys.exit(1)
+
+    print("\nAll checks passed (no FAIL).")
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
