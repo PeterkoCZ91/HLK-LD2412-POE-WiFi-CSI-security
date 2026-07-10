@@ -3,7 +3,7 @@
 [![PlatformIO](https://img.shields.io/badge/PlatformIO-ESP32-orange?logo=platformio)](https://platformio.org/)
 [![ESP32](https://img.shields.io/badge/MCU-ESP32--WROOM--32-blue?logo=espressif)](https://www.espressif.com/)
 [![License](https://img.shields.io/badge/License-GPL--3.0-blue)](LICENSE)
-[![Version](https://img.shields.io/badge/Version-5.1.0--poe--wifi-blue)]()
+[![Version](https://img.shields.io/badge/Version-5.1.1--poe--wifi-blue)]()
 [![Discussions](https://img.shields.io/badge/GitHub-Discussions-purple?logo=github)](https://github.com/PeterkoCZ91/HLK-LD2412-POE-WiFi-CSI-security/discussions)
 
 **Dual-sensor intrusion detection system** — ESP32 + HLK-LD2412 24 GHz mmWave radar + **WiFi CSI (Channel State Information) passive motion detection** over **wired Ethernet with Power over Ethernet**. Full alarm state machine, zone management, Home Assistant integration, Telegram bot, and a dark-mode web dashboard. No cloud required.
@@ -11,6 +11,8 @@
 WiFi CSI detection algorithms based on [ESPectre](https://github.com/francescopace/espectre) by Francesco Pace (GPLv3).
 
 > [!TIP]
+> **v5.1.1** — Site-learning API fix: `POST /api/csi/site_learning` no longer silently *starts* a multi-hour learning run when called with an unrecognized `action` parameter — `action=start` / `action=stop` now work as documented aliases and any other `action` value returns `400 Bad Request`. API docs corrected to the real parameters (`duration_s`/`duration_h`, `stop=1`, `clear_model=1`); `tools/smoke_test.py` gained a site-learning contract check. See [CHANGELOG](CHANGELOG.md).
+>
 > **v5.1.0** — ESP-IDF 5.5 / Arduino 3.x migration: the firmware now builds on the community pioarduino platform (Arduino-ESP32 3.3.9 / ESP-IDF 5.5.4) via the new `esp32_poe_csi_idf5` env **alongside** the legacy espressif32@6.9.0 stack, with platform code guarded by `ESP_ARDUINO_VERSION_MAJOR`. Ships a batch of fusion/MQTT/radar-recovery fixes hardened on a live CSI-only node (stale-CSI fusion gate, radar un-veto & recovery give-up latch, MQTT fail-fast on half-open sockets, change-gated CSI telemetry, SSE queue cap) plus a stdlib-only `tools/smoke_test.py`. See [CHANGELOG](CHANGELOG.md).
 >
 > **v5.0.17** — dashboard organization: the Basic tab now opens as a short overview on radar units too (expert radar fields — gate min/max, hold time, diagnostics, BT warning, calibration — collapsed into a new "Advanced radar configuration" section), input placeholders are localized (cs/en), and CSI metric labels lead with a human description ("Overall motion score (composite)", "Signal variance", "Motion exit threshold"). See [CHANGELOG](CHANGELOG.md).
@@ -389,7 +391,7 @@ After the timed run completes, the firmware **continues to refresh the baseline 
 **How to start / stop**
 
 - **Web GUI:** *CSI* tab → *Site learning* card → pick a duration and click **Start**. Progress, elapsed time, accepted samples, and rejected-motion counter update live.
-- **REST:** `POST /api/csi/site_learning?action=start&duration_s=86400` (24 h). Stop with `?action=stop`.
+- **REST:** `POST /api/csi/site_learning?duration_s=86400` (24 h) or `?duration_h=24`. Stop with `?stop=1`, discard the learned model with `?clear_model=1`. Progress/status is read from `GET /api/csi` (`learning_active`, `learning_progress`, `learning_samples`, `model_ready`, …). `action=start` / `action=stop` are accepted as aliases; any other `action` value returns `400` (v5.1.1+ — older firmware silently *started* learning on unrecognized parameters, so double-check `learning_active` after scripted calls on ≤v5.1.0).
 
 **Site learning vs. Calibrate** — Both exist and are *not* the same thing.
 
@@ -585,7 +587,7 @@ All endpoints require Digest auth except where noted.
 |--------|----------|-------------|
 | GET/POST | `/api/csi` | CSI metrics, config, diagnostics (incl. site learning, MLP, NBVI, adaptive threshold, `ht_ltf_seen`) |
 | POST | `/api/csi/calibrate` | Auto-calibrate CSI threshold |
-| POST | `/api/csi/site_learning` | Start/stop long-term site-learning baseline (`?action=start|stop&duration_s=...`) |
+| POST | `/api/csi/site_learning` | Start long-term site-learning baseline (`?duration_s=...` or `?duration_h=...`, default 48 h); stop with `?stop=1`; discard model with `?clear_model=1`; `action=start\|stop` aliases accepted, other `action` values → 400 |
 | POST | `/api/csi/reset_baseline` | Reset CSI idle baselines |
 | POST | `/api/csi/reconnect` | Force WiFi reconnect for CSI |
 | GET/POST | `/api/csi/wifi` | Read configured SSID / set runtime SSID + password (NVS-persisted, requires reboot) |
@@ -822,6 +824,7 @@ A: Yes. Each device gets a unique `device_id` (auto-derived from MAC) so HA disc
 | v5.0.16-poe-wifi | **Dashboard polish:** radar-aware UI hides all microwave-radar chrome on CSI-only units (distance gauge, radar health rows, Restart/Reset buttons, Gate sensitivity / Zones tabs, radar-only fields) and promotes WiFi CSI to the main readout, with a reveal link for the hidden controls; masonry card layout packs cards vertically (no large empty areas); collapsible expert sections so the CSI tab opens as a short overview; fixed language not applied on load (`window.onload = init` overrode `<body onload>`, so `applyLang()` never ran — English by default); telemetry-flicker fix on partial frames. |
 | v5.0.17-poe-wifi | **Dashboard organization:** Basic tab reorganized — expert radar fields (gate Min/Max with cm readout, hold time, diagnostics, BT warning, calibration) moved into a collapsed radar-only "Advanced radar configuration" section, leaving device name, sensitivity and LED on top; placeholder localization via new `data-i18n-ph` mechanism (12 cs/en keys); CSI metric labels humanized — human description first, technical term in parentheses (composite, variance, exit multiplier, DSER/PLCR expansions in ML help). |
 | v5.1.0-poe-wifi | **ESP-IDF 5.5 / Arduino 3.x migration:** firmware now builds on the community pioarduino platform (Arduino-ESP32 3.3.9 / ESP-IDF 5.5.4) via new `esp32_poe_csi_idf5` / `esp32_poe_csi_idf5_8mb` envs **alongside** the legacy espressif32@6.9.0 stack, with `ETH.begin()` / `esp_task_wdt_init()` ported behind `ESP_ARDUINO_VERSION_MAJOR` guards. **Fusion/MQTT/radar fixes** hardened on a live CSI-only node: stale-CSI fusion gate (radar-only fallback on CSI starvation), radar un-veto on the armed path, radar recovery give-up latch, MQTT fail-fast on half-open sockets (IDF 5 watchdog fix), IDF 5 watchdog hygiene (`wdtResetSafe()`), and FUSION DBG rate-limit. **Telemetry diet:** change-gated CSI MQTT metrics (~720 → ~50 msg/min), SSE queue cap 32 → 8, default entry delay 30 s → 0. New stdlib-only `tools/smoke_test.py` (8 ordered live-device checks). |
+| v5.1.1-poe-wifi | **Site-learning API fix:** `POST /api/csi/site_learning` rejected-unknown-action guard — the handler never read the `action` parameter documented since v5.0.0, so calls like `?action=stop` or `?action=status` fell through to the default branch and silently **started** a 48 h learning run; `action=start|stop` are now accepted as aliases and any other `action` value returns `400 Bad Request`. README/FIRST_BOOT API docs corrected to the real parameters (`duration_s`/`duration_h`, `stop=1`, `clear_model=1`, status via `GET /api/csi`). `tools/smoke_test.py` gained a `site_learning` contract check (3 sub-checks, `--skip-learning` flag). |
 
 ---
 

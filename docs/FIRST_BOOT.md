@@ -111,8 +111,9 @@ If `ht_ltf_seen` stays `false` with healthy RSSI, or `pps ≈ 0`, see
 [AP requirements](../README.md#wifi-access-point-requirements-for-csi).
 
 3. Tune for low false positives: `POST /api/csi/calibrate` (quiet room, ~30 s),
-   then `POST /api/csi/site_learning?action=start&duration_s=86400` (24 h
-   recommended). See [Site Learning](../README.md#site-learning-workflow-csi).
+   then `POST /api/csi/site_learning?duration_s=86400` (24 h recommended; stop
+   early with `?stop=1`). Only run site learning while the space is empty.
+   See [Site Learning](../README.md#site-learning-workflow-csi).
 
 ## Verify MQTT / Home Assistant (optional)
 

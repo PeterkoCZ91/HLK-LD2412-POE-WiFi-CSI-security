@@ -2,6 +2,37 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.1.1-poe-wifi] - 2026-07-10
+
+Site-learning API fix release. The REST API for long-term site learning behaved
+differently from what the documentation described — and the mismatch was dangerous:
+a call that *looked* like a stop or status request could silently start a multi-hour
+learning run.
+
+### Fixed
+
+- **`POST /api/csi/site_learning` unknown-parameter guard.** The handler never read the
+  `action` parameter that the README had documented since v5.0.0; any request without
+  `stop`/`clear_model` fell through to the default branch and **started** site learning
+  (48 h default) — including `?action=stop` and `?action=status`. The handler now accepts
+  `action=start` and `action=stop` as aliases for the real parameters (so calls written
+  against the old docs keep working), and any other `action` value returns
+  `400 Bad Request` instead of silently starting a learning run.
+- **API documentation corrected.** README (Site Learning workflow + API Reference table)
+  and `docs/FIRST_BOOT.md` now document the parameters the firmware actually implements:
+  `?duration_s=...` / `?duration_h=...` to start (default 48 h), `?stop=1` to stop,
+  `?clear_model=1` to discard the learned model, and progress/status via `GET /api/csi`
+  (`learning_active`, `learning_progress`, `learning_samples`, `model_ready`, …).
+  Site learning should only run while the space is empty.
+
+### Added
+
+- **`site_learning` contract check in `tools/smoke_test.py`.** Three sub-checks against a
+  live device: unknown `action` → HTTP 400 with learning *not* started, `action=start` →
+  200 + `learning_active=true`, `action=stop` → 200 + `learning_active=false`. Skips when
+  CSI is inactive or learning is already running, always cleans up via `?stop=1`, and can
+  be disabled with `--skip-learning`.
+
 ## [5.1.0-poe-wifi] - 2026-07-08
 
 ESP-IDF 5.5 / Arduino 3.x migration release. The firmware now builds on the community

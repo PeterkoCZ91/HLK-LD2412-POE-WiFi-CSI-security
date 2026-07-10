@@ -2632,6 +2632,22 @@ void setupCSIRoutes() {
             return;
         }
 
+        // action=start|stop kept as documented aliases; any other value is
+        // rejected so an unrecognized request can never silently start a
+        // multi-hour learning run
+        if (request->hasParam("action")) {
+            String action = request->getParam("action")->value();
+            if (action == "stop") {
+                _deps.csiService->stopSiteLearning();
+                request->send(200, "text/plain", "Site learning stopped");
+                return;
+            }
+            if (action != "start") {
+                request->send(400, "text/plain", "Unknown action (use start|stop)");
+                return;
+            }
+        }
+
         if (request->hasParam("stop")) {
             _deps.csiService->stopSiteLearning();
             request->send(200, "text/plain", "Site learning stopped");

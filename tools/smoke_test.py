@@ -2,8 +2,8 @@
 """Smoke test for poe-2412-wifi firmware against a live device.
 
 Usage:
-    python3 tools/smoke_test.py --ip 192.168.68.29
-    python3 tools/smoke_test.py --ip 192.168.68.29 --skip-alarm
+    python3 tools/smoke_test.py --ip 192.168.1.50
+    python3 tools/smoke_test.py --ip 192.168.1.50 --skip-alarm
 """
 import argparse
 import base64
@@ -221,6 +221,77 @@ def check_alarm(ip, auth, timeout):
             record("alarm/disarm", "FAIL", f"disarm failed: {exc}")
 
 
+def check_site_learning(ip, auth, timeout):
+    """Site-learning API contract (README-compatible action= aliases + unknown-action guard):
+    - POST ?action=status (unknown action) → HTTP 400, learning must NOT start
+    - POST ?action=start&duration_s=3600  → HTTP 200, learning_active=true
+    - POST ?action=stop                    → HTTP 200, learning_active=false
+    Skips if CSI is inactive or learning is already running. Always ends with ?stop=1."""
+
+    def get_csi():
+        _, body = http_get(ip, "/api/csi", auth=auth, timeout=timeout)
+        return json.loads(body)
+
+    def post_sl(query):
+        """POST /api/csi/site_learning?<query> → (status, body); HTTPError → its code."""
+        try:
+            return http_post(ip, f"/api/csi/site_learning?{query}", auth=auth, timeout=timeout)
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.read()
+
+    # Precondition — abort if CSI is down or learning already in progress
+    try:
+        csi = get_csi()
+    except Exception as exc:
+        record("site_learning", "SKIP", f"cannot read /api/csi: {exc}")
+        return
+
+    if not csi.get("active", False):
+        record("site_learning", "SKIP", "CSI inactive")
+        return
+    if csi.get("learning_active", False):
+        record("site_learning", "SKIP", "learning already running — not interfering")
+        return
+
+    try:
+        # Unknown action value must be rejected, never fall through to a silent start
+        status, _ = post_sl("action=status")
+        time.sleep(0.5)
+        active = get_csi().get("learning_active", False)
+        if status == 400 and not active:
+            record("site_learning/unknown_action", "PASS", "HTTP 400, learning not started")
+        else:
+            record("site_learning/unknown_action", "FAIL",
+                   f"HTTP {status}, learning_active={active} (expected 400 + false)")
+
+        # README-documented alias: action=start
+        status, _ = post_sl("action=start&duration_s=3600")
+        time.sleep(0.5)
+        active = get_csi().get("learning_active", False)
+        if status == 200 and active:
+            record("site_learning/action_start", "PASS", "HTTP 200, learning_active=true")
+        else:
+            record("site_learning/action_start", "FAIL",
+                   f"HTTP {status}, learning_active={active} (expected 200 + true)")
+
+        # README-documented alias: action=stop
+        status, _ = post_sl("action=stop")
+        time.sleep(0.5)
+        active = get_csi().get("learning_active", False)
+        if status == 200 and not active:
+            record("site_learning/action_stop", "PASS", "HTTP 200, learning_active=false")
+        else:
+            record("site_learning/action_stop", "FAIL",
+                   f"HTTP {status}, learning_active={active} (expected 200 + false)")
+    except Exception as exc:
+        record("site_learning", "FAIL", str(exc))
+    finally:
+        try:
+            post_sl("stop=1")
+        except Exception:
+            pass
+
+
 def check_metrics(ip, auth, timeout):
     """GET /metrics → Prometheus text containing 'poe2412_' metric prefix."""
     try:
@@ -245,13 +316,15 @@ def main():
     parser = argparse.ArgumentParser(
         description="Smoke test for poe-2412-wifi firmware against a live device.")
     parser.add_argument("--ip", required=True,
-                        help="Device IP address (e.g. 192.168.68.29)")
+                        help="Device IP address (e.g. 192.168.1.50)")
     parser.add_argument("--user", default="admin",
                         help="HTTP Basic auth username (default: admin)")
     parser.add_argument("--password", default="admin",
                         help="HTTP Basic auth password (default: admin)")
     parser.add_argument("--skip-alarm", action="store_true",
                         help="Skip the alarm FSM cycle check")
+    parser.add_argument("--skip-learning", action="store_true",
+                        help="Skip the CSI site-learning API contract check")
     parser.add_argument("--timeout", type=float, default=8.0,
                         help="Per-request timeout in seconds (default: 8)")
     args = parser.parse_args()
@@ -271,6 +344,11 @@ def main():
         record("alarm", "SKIP", "--skip-alarm flag set")
     else:
         check_alarm(args.ip, auth, args.timeout)
+
+    if args.skip_learning:
+        record("site_learning", "SKIP", "--skip-learning flag set")
+    else:
+        check_site_learning(args.ip, auth, args.timeout)
 
     check_metrics(args.ip, auth, args.timeout)
 
