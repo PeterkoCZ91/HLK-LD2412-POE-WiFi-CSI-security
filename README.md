@@ -616,6 +616,33 @@ All endpoints require Digest auth except where noted.
 | POST | `/api/bluetooth/start` | Enable BLE config mode |
 | DELETE/POST | `/api/www` | Manage LittleFS web assets (delete / upload) |
 
+#### Firmware variants — match your flash size (8 MB vs 16 MB)
+
+Each release ships **two** firmware binaries, one per flash size:
+
+| Asset | Flash | Partition layout | For |
+|-------|-------|------------------|-----|
+| `firmware-vX.Y.Z-poe-wifi-csi.bin` | **16 MB** | `partitions_16mb.csv` (app0/app1 4 MB, spiffs ~8 MB) | boards with 16 MB flash (the spec build) |
+| `firmware-vX.Y.Z-poe-wifi-csi-8mb.bin` | **8 MB** | `partitions_8mb.csv` (app0/app1 3 MB, spiffs ~2 MB) | boards with 8 MB flash |
+
+> **⚠️ Flash the build that matches your chip.** The two builds differ only in the
+> partition table and flash-size config — the application code is identical. Flashing
+> the **16 MB** build to an **8 MB** board **boot-loops** (the partition table places
+> `app1`/`spiffs` beyond 8 MB). ESP32-POE boards are not all the same: nominally 16 MB
+> parts sometimes ship with an 8 MB flash chip, so **check before flashing** rather
+> than assuming.
+
+Check your flash size over USB with esptool:
+
+```bash
+esptool.py --port /dev/ttyUSB0 flash_id | grep "Detected flash size"
+# "Detected flash size: 8MB"  -> use the -8mb.bin
+# "Detected flash size: 16MB" -> use firmware-...-poe-wifi-csi.bin
+```
+
+Both variants OTA-update in place via espota (see the espota window endpoint above);
+the learned CSI site model and config survive the flash (stored in NVS).
+
 ---
 
 ## Prometheus Metrics
