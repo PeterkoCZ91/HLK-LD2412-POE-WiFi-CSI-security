@@ -552,7 +552,6 @@ All endpoints require Digest auth except where noted.
 | POST | `/api/alarm/disarm` | Disarm system |
 | GET/POST | `/api/alarm/config` | Entry/exit delay, debounce frames, disarm reminder |
 | GET/POST | `/api/security/config` | Anti-masking, loitering, heartbeat, pet immunity |
-| POST | `/api/security/event/ack` | Acknowledge a security event |
 | POST | `/api/security/mqtt-pin` | Set or clear the MQTT alarm PIN (`?pin=1234`; omit value to clear) |
 | GET/POST | `/api/schedule` | Scheduled arm/disarm times |
 | GET/POST | `/api/timezone` | Timezone and DST offset |
@@ -571,6 +570,7 @@ All endpoints require Digest auth except where noted.
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | POST | `/api/radar/restart` | Restart radar (UART reset) |
+| GET/POST | `/api/radar/bluetooth` | Read radar module BT state + MAC / enable-disable it (`enable=1|0`, restarts radar) |
 | POST | `/api/radar/factory_reset` | Restore radar to factory defaults |
 | POST | `/api/radar/calibrate` | Start radar calibration |
 | POST | `/api/engineering` | Toggle engineering mode (raw gate data) |
@@ -644,7 +644,10 @@ The `note`, `active`, `shadow`, `agree`, `disagree`, `active_thr`, `shadow_thr` 
 | GET | `/api/ota/status` | OTA runtime owner, espota maintenance window, timeout/progress diagnostics |
 | POST | `/api/ota/espota/prepare` | Open bounded espota maintenance window (`?seconds=120`) |
 | POST | `/api/restart` | Soft reboot |
+| GET/POST | `/api/reboot_inhibit` | Stability-test reboot inhibit — GET reports state, POST `{"enabled":bool}` toggles (NVS-persisted; OTA always bypasses) |
 | POST | `/api/bluetooth/start` | Enable BLE config mode |
+| GET | `/api/www/info` | Current LittleFS web asset metadata (override active, size, version) |
+| POST | `/api/www/upload` | Upload `index.html.gz` web asset override to LittleFS |
 | DELETE/POST | `/api/www` | Manage LittleFS web assets (delete / upload) |
 
 #### Firmware variants — match your flash size (8 MB vs 16 MB)
