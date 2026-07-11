@@ -27,7 +27,8 @@ void EventLog::begin(bool fsAvailable) {
 // -------------------------------------------------------------------------
 // Add event — goes to RAM buffer, marked dirty for next flush
 // -------------------------------------------------------------------------
-void EventLog::addEvent(uint8_t type, uint16_t dist, uint8_t energy, const char* msg) {
+void EventLog::addEvent(uint8_t type, uint16_t dist, uint8_t energy, const char* msg,
+                        uint8_t fusionSrc, uint8_t confidence, uint8_t varRatio, uint8_t mlProb) {
     LogEvent evt;
     time_t epoch = time(nullptr);
     evt.timestamp = (epoch > 1700000000) ? (uint32_t)epoch : millis() / 1000;
@@ -36,6 +37,10 @@ void EventLog::addEvent(uint8_t type, uint16_t dist, uint8_t energy, const char*
     evt.energy = energy;
     strncpy(evt.message, msg, sizeof(evt.message) - 1);
     evt.message[sizeof(evt.message) - 1] = '\0';
+    evt.fusion_src = fusionSrc;
+    evt.confidence = confidence;
+    evt.var_ratio  = varRatio;
+    evt.ml_prob    = mlProb;
 
     if (_mutex && xSemaphoreTake(_mutex, pdMS_TO_TICKS(50)) != pdTRUE) return;
 
@@ -345,6 +350,13 @@ void EventLog::getEventsJSON(JsonDocument& doc, uint32_t offset, uint32_t limit,
         obj["dist"] = evt.distance;
         obj["en"] = evt.energy;
         obj["msg"] = (const char*)evt.message;
+        // #2 confidence fingerprint (only meaningful for security/alarm events)
+        if (evt.fusion_src || evt.confidence || evt.var_ratio || evt.ml_prob) {
+            obj["fsrc"] = evt.fusion_src;              // bit0=radar bit1=CSI
+            obj["conf"] = evt.confidence / 255.0f;
+            obj["vratio"] = evt.var_ratio / 100.0f;   // 1.0 == at threshold
+            obj["mlp"] = evt.ml_prob / 255.0f;
+        }
         added++;
     }
 

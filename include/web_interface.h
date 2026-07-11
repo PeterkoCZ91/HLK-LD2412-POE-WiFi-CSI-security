@@ -1059,6 +1059,23 @@ const char index_html[] PROGMEM = R"rawliteral(
                 <span data-i18n="learn_help"><b>Site learning:</b> dlouhodobé vzorkování variance v prázdné místnosti (doporučeno 24–72 h). Radar-gate (LD2412) odfiltruje statické lidi. Po dokončení se automaticky nastaví <code>threshold = mean + 3×std</code>. <b>Učení přežívá OTA flash</b> (uloženo v NVS). Smazat model = reset na tovární hodnoty.</span>
             </div>
 
+            <div class="section-title" data-collapsed style="margin-top:14px">SITE MODEL (candidate / apply / rollback)</div>
+            <div id="csi_sm_wrap" style="font-size:0.85rem">
+              <div class="stat-row"><span>Active</span><span id="csi_sm_active">—</span></div>
+              <div class="stat-row"><span>Candidate</span><span id="csi_sm_cand">—</span></div>
+              <div class="stat-row"><span>Previous</span><span id="csi_sm_prev">—</span></div>
+              <div class="stat-row"><span>Difference (cand vs active)</span><span id="csi_sm_diff">—</span></div>
+              <div id="csi_sm_note" style="font-size:0.78rem; color:#aaa; margin-top:4px"></div>
+              <div style="display:flex; flex-wrap:wrap; gap:6px; margin-top:8px">
+                <button class="sec" id="csi_sm_apply" style="flex:1; min-width:110px" onclick="csiApplyModel()">✅ Apply candidate</button>
+                <button class="sec" id="csi_sm_discard" style="flex:1; min-width:110px" onclick="csiDiscardCandidate()">🗑 Discard candidate</button>
+                <button class="sec" id="csi_sm_rollback" style="flex:1; min-width:110px" onclick="csiRollbackModel()">↩ Rollback</button>
+              </div>
+              <div style="font-size:0.75rem; color:#777; margin-top:8px">
+                Finished learning creates a <b>candidate</b> — detection keeps using the <b>active</b> model until you Apply. Apply keeps the old model as a rollback slot; the alarm is never changed by learning.
+              </div>
+            </div>
+
             <div class="section-title" data-collapsed style="margin-top:14px" data-i18n="ml_mlp">ML (MLP 17→18→9→1)</div>
             <div class="stat-row">
                 <span data-i18n="ml_enabled_lbl">ML povoleno</span>
@@ -1396,6 +1413,7 @@ function tab(n) {
 // --- WIFI CSI ---
 function loadCSIConfig() {
     loadCsiWifi();
+    csiRenderSiteModel();
     fetch('/api/csi').then(r=>r.json()).then(d => {
         // Compiled-in check
         $('csi_compiled_warn').style.display = d.compiled ? 'none' : 'block';
@@ -1741,6 +1759,71 @@ function saveMLConfig() {
     p.append('ml_enabled',   $('csi_ml_en').checked ? '1' : '0');
     p.append('ml_threshold', $('csi_ml_thr').value);
     api('csi', {method:'POST', body:p});
+}
+
+// --- Site model (candidate / apply / rollback) ---
+function fmtSlot(s) {
+    if (!s || !s.valid) return '—';
+    return 'gen ' + s.generation + ' · thr ' + parseFloat(s.threshold).toFixed(5) + ' · ' + s.samples + ' smp';
+}
+function csiRenderSiteModel() {
+    api('csi/site_model').then(r=>r.json()).then(d => {
+        let a = d.active, c = d.candidate, p = d.previous;
+        $('csi_sm_active').innerText = fmtSlot(a);
+        $('csi_sm_cand').innerText   = fmtSlot(c);
+        $('csi_sm_prev').innerText   = fmtSlot(p);
+        // difference candidate vs active threshold
+        let diffTxt = '—';
+        if (c && c.valid && a && a.valid && a.threshold > 0) {
+            let pct = (c.threshold - a.threshold) / a.threshold * 100;
+            diffTxt = (pct >= 0 ? '+' : '') + pct.toFixed(1) + ' %';
+            $('csi_sm_diff').style.color = Math.abs(pct) > 50 ? '#cf6679' : '';
+        } else { $('csi_sm_diff').style.color = ''; }
+        $('csi_sm_diff').innerText = diffTxt;
+        // Apply enabled only when a genuinely newer candidate exists
+        let canApply = !!d.apply_required && !d.learning_active;
+        $('csi_sm_apply').disabled    = !canApply;
+        $('csi_sm_discard').disabled  = !(c && c.valid);
+        $('csi_sm_rollback').disabled = !(p && p.valid);
+        let note = '';
+        if (d.learning_active) note = '⏳ Learning — detection still on active gen ' + (a && a.valid ? a.generation : '—');
+        else if (d.apply_required) note = '🟡 Candidate ready — not yet affecting the alarm. Review and Apply.';
+        else if (a && a.valid) note = '🟢 Detection on active gen ' + a.generation + '.';
+        $('csi_sm_note').innerText = note;
+    }).catch(()=>{});
+}
+function csiApplyModel() {
+    api('csi/site_model').then(r=>r.json()).then(d => {
+        let a = d.active, c = d.candidate;
+        let msg = 'Apply candidate model?\n\n';
+        msg += 'Active:    ' + fmtSlot(a) + '\n';
+        msg += 'Candidate: ' + fmtSlot(c) + '\n';
+        if (c && c.valid && a && a.valid && a.threshold > 0) {
+            let pct = (c.threshold - a.threshold) / a.threshold * 100;
+            msg += '\nThreshold change: ' + (pct>=0?'+':'') + pct.toFixed(1) + ' %';
+            if (Math.abs(pct) > 50) msg += '\n\n⚠️ WARNING: large change (>50%). Check the learning was done in an empty room.';
+        }
+        msg += '\n\nThe current active model is kept for rollback.';
+        if (!confirm(msg)) return;
+        api('csi/site_model/apply', {method:'POST'}).then(r => {
+            if (!r.ok) r.text().then(tx => alert('Apply failed: ' + tx));
+            setTimeout(() => { csiRenderSiteModel(); loadCSIConfig(); }, 400);
+        });
+    });
+}
+function csiRollbackModel() {
+    if (!confirm('Rollback to the previous model?\n\nThis swaps active and previous — you can rollback again to undo.')) return;
+    api('csi/site_model/rollback', {method:'POST'}).then(r => {
+        if (!r.ok) r.text().then(tx => alert('Rollback failed: ' + tx));
+        setTimeout(() => { csiRenderSiteModel(); loadCSIConfig(); }, 400);
+    });
+}
+function csiDiscardCandidate() {
+    if (!confirm('Discard the candidate model?\n\nActive and previous are untouched.')) return;
+    api('csi/site_model/candidate', {method:'DELETE'}).then(r => {
+        if (!r.ok) r.text().then(tx => alert('Discard failed: ' + tx));
+        setTimeout(csiRenderSiteModel, 400);
+    });
 }
 
 // --- Event Timeline ---

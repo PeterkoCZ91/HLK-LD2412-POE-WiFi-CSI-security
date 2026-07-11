@@ -22,7 +22,12 @@ struct LogEvent {
     uint16_t distance;       // cm
     uint8_t energy;          // max energy
     char message[48];        // Short description
-};  // 56 bytes
+    // #2 confidence fingerprint — why this event fired, for retrospective forensics.
+    uint8_t fusion_src;      // bitmask: bit0=radar, bit1=CSI (0 when N/A)
+    uint8_t confidence;      // fusion confidence * 255
+    uint8_t var_ratio;       // CSI variance/threshold * 100, capped 255 (100 == at threshold)
+    uint8_t ml_prob;         // MLP motion probability * 255
+};  // 60 bytes
 
 // Disk file header for ring buffer persistence
 struct EventFileHeader {
@@ -33,7 +38,10 @@ struct EventFileHeader {
     uint32_t sequence;       // monotonic counter
 };  // 20 bytes
 
-static constexpr uint32_t EVENT_FILE_MAGIC = 0xEE120001;
+// Bumped 0xEE120001 -> 0xEE120002 for the LogEvent fingerprint fields. On upgrade,
+// loadFromDisk() sees the old magic and re-initializes the file (old events dropped,
+// never misread) — see EventLog::loadFromDisk.
+static constexpr uint32_t EVENT_FILE_MAGIC = 0xEE120002;
 static constexpr size_t   DISK_CAPACITY    = 500;
 static constexpr size_t   RAM_CAPACITY     = 50;
 static constexpr size_t   HEADER_SIZE      = sizeof(EventFileHeader);
@@ -48,7 +56,9 @@ public:
 
     // begin() expects LittleFS already mounted externally
     void begin(bool fsAvailable = true);
-    void addEvent(uint8_t type, uint16_t dist, uint8_t energy, const char* msg);
+    void addEvent(uint8_t type, uint16_t dist, uint8_t energy, const char* msg,
+                  uint8_t fusionSrc = 0, uint8_t confidence = 0,
+                  uint8_t varRatio = 0, uint8_t mlProb = 0);
     void flush();
     void flushNow();
     void clear();

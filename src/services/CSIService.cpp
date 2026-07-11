@@ -7,6 +7,7 @@
 #include <WiFi.h>
 #include <cmath>
 #include <cstring>
+#include <ctime>
 #include <algorithm>
 #include "lwip/sockets.h"
 #include "lwip/udp.h"
@@ -227,6 +228,26 @@ void CSIService::begin(const char* ssid, const char* password,
                   _windowSize, _threshold);
 
     _loadLearnedModel();
+
+    // csi-model: migrate the legacy single model into the active slot (once) and
+    // mirror it into the runtime learned-* fields. This does NOT touch detection
+    // _threshold — boot behavior stays identical to before; only apply/rollback
+    // switch detection. Legacy csi_lrn_* keys are left in place for FW downgrade.
+    _modelStore.attach(_prefs);
+    _modelMgr.loadFromStore();
+    if (!_modelMgr.active().valid && _siteModelReady) {
+        CsiLegacyModel lg;
+        lg.ok  = true;
+        lg.thr = _learnedThreshold; lg.mu = _learnedMeanVar; lg.std = _learnedStdVar;
+        lg.max = _learnedMaxVar;
+        lg.turb = _learnedIdleMeanTurb; lg.ph = _learnedIdleMeanPhase; lg.amp = _learnedIdleAmpBaseline;
+        lg.n   = _learnedSampleCount;
+        if (_modelMgr.migrateLegacy(lg) == CsiModelOp::OK) {
+            Serial.printf("[CSI] Migrated legacy model -> active slot gen=%lu\n",
+                          (unsigned long)_modelMgr.active().generation);
+        }
+    }
+    if (_modelMgr.active().valid) _applyActiveToRuntime();
 
     // Start traffic generator for consistent CSI packet rate
     if (WiFi.status() == WL_CONNECTED) {
@@ -887,6 +908,8 @@ void CSIService::_continuousLearnRefresh() {
     if (now - _lastLearnRefreshSaveMs > 600000UL) {  // 10 min
         _saveLearnedModel(_learnedThreshold, _learnedMeanVar, _learnedStdVar,
                           _learnedMaxVar, _learnedSampleCount);
+        // EMA drifts ONLY the active slot; candidate/previous stay immutable.
+        _modelMgr.updateActiveEma(_learnedThreshold, _learnedMeanVar, _learnedStdVar);
         _lastLearnRefreshSaveMs = now;
     }
 }
@@ -1286,6 +1309,7 @@ void CSIService::update() {
                 if (_runningVariance > _siteLearnMaxVar) {
                     _siteLearnMaxVar = _runningVariance;
                 }
+                _varHist.add(_runningVariance);   // quality-report quantiles
             }
             if (now - _siteLearnStartMs >= _siteLearnDurationMs) {
                 _finalizeSiteLearning();
@@ -1398,17 +1422,30 @@ uint16_t CSIService::getNbviMask() const {
 // csi6: Long-term quiet-site learning
 // ============================================================================
 
-bool CSIService::startSiteLearning(uint32_t durationMs) {
+bool CSIService::startSiteLearning(uint32_t durationMs, bool replaceCandidate) {
     if (durationMs < 60000) durationMs = 60000;
     if (durationMs > 604800000UL) durationMs = 604800000UL; // 7 days
 
+    // A finished-but-unapplied candidate would be silently overwritten by a new
+    // run; require an explicit replace so the caller can map this to HTTP 409.
+    if (_modelMgr.hasCandidate() && !replaceCandidate) {
+        Serial.println("[CSI] Site learning refused: candidate exists (pass replace_candidate=1)");
+        return false;
+    }
+    if (_modelMgr.hasCandidate() && replaceCandidate) {
+        _modelMgr.clearCandidate();
+    }
+
     resetIdleBaseline();
+    _varHist.reset();
 
     _siteLearningActive = true;
     _siteLearnStartMs = millis();
     _siteLearnDurationMs = durationMs;
     _siteLearnAccepted = 0;
     _siteLearnRejectedMotion = 0;
+    _siteLearnRejectedRadar = 0;
+    _siteLearnBssidResetCount = 0;
     _siteLearnMeanVarAcc = 0.0f;
     _siteLearnM2Var = 0.0f;
     _siteLearnMaxVar = 0.0f;
@@ -1537,32 +1574,168 @@ void CSIService::_finalizeSiteLearning() {
         return;
     }
 
-    float threshold = _computeSiteLearningThreshold();
     float variance = (_siteLearnAccepted > 1)
         ? (_siteLearnM2Var / (float)(_siteLearnAccepted - 1))
         : 0.0f;
     float stddev = sqrtf(variance);
 
-    _threshold = threshold;
-    _siteModelReady = true;
-    _learnedThreshold = threshold;
-    _learnedMeanVar = _siteLearnMeanVarAcc;
-    _learnedStdVar = stddev;
-    _learnedMaxVar = _siteLearnMaxVar;
-    _learnedSampleCount = _siteLearnAccepted;
-    _learnedIdleMeanTurb = _idleMeanTurb;
-    _learnedIdleMeanPhase = _idleMeanPhase;
-    _learnedIdleAmpBaseline = _idleAmpBaseline;
+    // Mirror _computeSiteLearningThreshold() but record which clamp bound the result,
+    // so the quality report can explain a value like 0.005 (data vs. absolute floor).
+    float candidate = _siteLearnMeanVarAcc + 6.0f * stddev;
+    float maxGuard  = _siteLearnMaxVar * 1.15f;
+    CsiClampReason clamp = CsiClampReason::NONE;
+    if (candidate < maxGuard)              { candidate = maxGuard; clamp = CsiClampReason::MAXIMUM_LIMIT; }
+    if (candidate < MIN_LEARNED_THRESHOLD) { candidate = MIN_LEARNED_THRESHOLD; clamp = CsiClampReason::ABSOLUTE_FLOOR; }
+    if (candidate > 100.0f) candidate = 100.0f;
+    float threshold = candidate;
 
-    _saveLearnedModel(threshold, _learnedMeanVar, _learnedStdVar, _learnedMaxVar, _learnedSampleCount);
+    // Build the candidate model — the active model and detection _threshold are
+    // left UNCHANGED. The new result must be explicitly applied later.
+    CsiSiteModel cand;
+    cand.valid                 = true;
+    cand.generation            = _modelMgr.nextGeneration();
+    cand.sampleCount           = _siteLearnAccepted;
+    cand.rejectedMotion        = _siteLearnRejectedMotion;
+    cand.rejectedRadar         = _siteLearnRejectedRadar;
+    cand.bssidResetCount       = _siteLearnBssidResetCount;
+    cand.durationSec           = _siteLearnDurationMs / 1000;
+    { uint32_t ep = (uint32_t)time(nullptr); cand.createdAt = (ep > 1600000000u) ? ep : 0; }  // epoch if NTP synced
+    cand.threshold             = threshold;
+    cand.meanVariance          = _siteLearnMeanVarAcc;
+    cand.stdVariance           = stddev;
+    cand.maxVariance           = _siteLearnMaxVar;
+    cand.idleMeanTurbulence    = _idleMeanTurb;
+    cand.idleMeanPhase         = _idleMeanPhase;
+    cand.idleAmplitudeBaseline = _idleAmpBaseline;
+    if (_bssidInitialized) memcpy(cand.bssid, _lastBSSID, 6);
+
+    CsiModelOp r = _modelMgr.finalizeCandidate(cand);
+    if (r != CsiModelOp::OK) {
+        Serial.printf("[CSI] Candidate finalize failed (op=%d) — active unchanged\n", (int)r);
+        return;
+    }
+
+    // Quality report stored alongside the candidate (variance quantiles + clamp reason).
+    CsiModelQuality q;
+    q.generation           = cand.generation;
+    q.accepted             = _siteLearnAccepted;
+    q.rejectedMotion       = _siteLearnRejectedMotion;
+    q.rejectedRadar        = _siteLearnRejectedRadar;
+    q.p50 = _varHist.quantile(0.50f);
+    q.p90 = _varHist.quantile(0.90f);
+    q.p95 = _varHist.quantile(0.95f);
+    q.p99 = _varHist.quantile(0.99f);
+    q.mean = _siteLearnMeanVarAcc; q.std = stddev; q.max = _siteLearnMaxVar;
+    q.thresholdClampReason = (uint8_t)clamp;
+    csiQualitySeal(q);
+    _lastQuality = q;
+    _hasQuality  = true;
+    _publishModelState("candidate_ready");
 
     Serial.printf(
-        "[CSI] Site learning done: quiet=%lu rejected=%lu mean=%.6f std=%.6f max=%.6f threshold=%.6f\n",
+        "[CSI] Site learning -> CANDIDATE gen=%lu quiet=%lu rejected(m/r)=%lu/%lu thr=%.6f (active unchanged)\n",
+        (unsigned long)cand.generation,
         (unsigned long)_siteLearnAccepted,
         (unsigned long)_siteLearnRejectedMotion,
-        _learnedMeanVar,
-        _learnedStdVar,
-        _learnedMaxVar,
-        _learnedThreshold
+        (unsigned long)_siteLearnRejectedRadar,
+        threshold
     );
+}
+
+// ---- csi-model: runtime application of slots ------------------------------
+
+// Model management state topics — informational only, separate from the alarm/
+// ml_motion flow. Retained state is republished only on a model change (finalize/
+// apply/rollback/clear), never per-tick, so it does not add to MQTT churn.
+void CSIService::_publishModelState(const char* event) {
+    if (!_mqtt || !_mqtt->connected()) return;
+    char topic[96], buf[176];
+    const CsiSiteModel& a = _modelMgr.active();
+    snprintf(buf, sizeof(buf),
+             "{\"valid\":%s,\"generation\":%lu,\"threshold\":%.5f,\"samples\":%lu}",
+             a.valid ? "true" : "false", (unsigned long)a.generation, a.threshold,
+             (unsigned long)a.sampleCount);
+    snprintf(topic, sizeof(topic), "%s/model/active", _topicPrefix);
+    _mqtt->publish(topic, buf, true);
+
+    const CsiSiteModel& c = _modelMgr.candidate();
+    snprintf(buf, sizeof(buf),
+             "{\"valid\":%s,\"generation\":%lu,\"threshold\":%.5f,\"samples\":%lu}",
+             c.valid ? "true" : "false", (unsigned long)c.generation, c.threshold,
+             (unsigned long)c.sampleCount);
+    snprintf(topic, sizeof(topic), "%s/model/candidate", _topicPrefix);
+    _mqtt->publish(topic, buf, true);
+
+    if (event) {
+        snprintf(topic, sizeof(topic), "%s/model/event", _topicPrefix);
+        _mqtt->publish(topic, event, false);
+    }
+}
+
+void CSIService::_applyActiveToRuntime() {
+    const CsiSiteModel& a = _modelMgr.active();
+    if (!a.valid) return;
+    _siteModelReady         = true;
+    _learnedThreshold       = a.threshold;
+    _learnedMeanVar         = a.meanVariance;
+    _learnedStdVar          = a.stdVariance;
+    _learnedMaxVar          = a.maxVariance;
+    _learnedSampleCount     = a.sampleCount;
+    _learnedIdleMeanTurb    = a.idleMeanTurbulence;
+    _learnedIdleMeanPhase   = a.idleMeanPhase;
+    _learnedIdleAmpBaseline = a.idleAmplitudeBaseline;
+    if (a.idleMeanTurbulence > 0.0f || a.idleMeanPhase > 0.0f) {
+        _idleMeanTurb    = a.idleMeanTurbulence;
+        _idleMeanPhase   = a.idleMeanPhase;
+        _idleAmpBaseline = a.idleAmplitudeBaseline;
+        _idleInitialized = true;
+    }
+}
+
+void CSIService::_resetShortTermState() {
+    // Flush adaptive-P95, smoothing history and running variance so the new model
+    // never decides on variance that was mixed from the previous baseline.
+    _p95BufIndex = 0; _p95BufCount = 0; _adaptiveThreshold = 0.0f; _p95TickSinceUpdate = 0;
+    _smoothHistory = 0; _smoothCount = 0;
+    _bufCount = 0; _bufIndex = 0;
+    _runningMean = 0; _runningM2 = 0; _runningVariance = 0;
+    _breathHoldCount = 0;
+    _lastLearnRefreshSaveMs = millis();   // reinit EMA save cadence for the new active
+}
+
+void CSIService::_switchDetectionToActive() {
+    const CsiSiteModel& a = _modelMgr.active();
+    if (!a.valid) return;
+    _applyActiveToRuntime();
+    setThreshold(a.threshold);            // moves _threshold + _baseThreshold, resets stuck counters
+    _resetShortTermState();
+    if (_prefs) _prefs->putFloat("csi_thr", a.threshold);
+}
+
+CsiModelOp CSIService::applyCandidateModel() {
+    CsiModelOp r = _modelMgr.applyCandidate();
+    if (r == CsiModelOp::OK) {
+        _switchDetectionToActive();
+        _publishModelState("applied");
+        Serial.printf("[CSI] Applied candidate -> active gen=%lu thr=%.5f\n",
+                      (unsigned long)_modelMgr.active().generation, _modelMgr.active().threshold);
+    }
+    return r;
+}
+
+CsiModelOp CSIService::rollbackSiteModel() {
+    CsiModelOp r = _modelMgr.rollback();
+    if (r == CsiModelOp::OK) {
+        _switchDetectionToActive();
+        _publishModelState("rolledback");
+        Serial.printf("[CSI] Rolled back -> active gen=%lu thr=%.5f\n",
+                      (unsigned long)_modelMgr.active().generation, _modelMgr.active().threshold);
+    }
+    return r;
+}
+
+CsiModelOp CSIService::clearCandidateModel() {
+    CsiModelOp r = _modelMgr.clearCandidate();
+    if (r == CsiModelOp::OK) _publishModelState("candidate_cleared");
+    return r;
 }

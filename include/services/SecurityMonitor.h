@@ -9,6 +9,7 @@
 #include "NotificationService.h"
 #include "EventLog.h"
 #include "AlarmFSM.h"   // T6: pure alarm state machine (AlarmState/ArmResult/TickEvent/MotionEvent)
+#include "CsiTamperDetector.h"   // #5: CSI-side tamper (packet collapse / frozen variance)
 
 // Forward declarations
 class MQTTService;
@@ -209,6 +210,12 @@ private:
     // update() (radar-independent, ~500 ms) and processRadarData() (responsive, 20 Hz) so
     // exit-delay / entry-expiry / trigger-timeout fire even when the radar is silent/absent.
     void applyTick(unsigned long now);
+    // #9 pre-arm self-test: gather live radar/CSI/clock/MQTT state -> ArmWarn bitmask.
+    uint32_t _armHealthWarnings();
+    // #5 CSI-side tamper: feed live CSI/eth state to the detector, alert on latch.
+    void _checkCsiTamper();
+    CsiTamperDetector _csiTamper;
+    bool _csiTamperLatched = false;
 
     SemaphoreHandle_t _mutex = nullptr;
     NotificationService* _notifService = nullptr;

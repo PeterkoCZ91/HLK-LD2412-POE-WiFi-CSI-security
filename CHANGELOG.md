@@ -2,6 +2,73 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.2.0-poe-wifi] - 2026-07-11
+
+CSI site-model lifecycle release. Long-term site learning gains a proper
+candidate/apply/rollback workflow, plus three security/forensics hardening
+features. **Behavior change:** a completed learning run no longer activates the
+learned model automatically — it produces a *candidate* that an operator reviews
+and applies. This protects a working sensor from being silently replaced by a run
+captured under bad conditions, and makes a bad model one click to undo.
+
+### Changed
+
+- **CSI site learning finalizes to a candidate, not the active model.** A
+  completed learning run now writes a `candidate` slot plus a quality report; the
+  running detection model is left untouched until the candidate is explicitly
+  applied. `POST /api/csi/site_learning` returns **202** on start and **409** if
+  an unapplied candidate already exists (pass `replace_candidate=1` to overwrite).
+  A running learning session must be stopped before a candidate can be applied.
+
+### Added
+
+- **Three-slot CSI model manager (active/candidate/previous).** `CsiModelManager`
+  is a pure state machine over a checksummed model struct (`CsiSiteModel`,
+  portable CRC32 + semantic validation). Apply copies the active model into
+  `previous` then promotes the candidate to `active`, committing in-RAM state only
+  after both NVS writes verify; rollback swaps active<->previous. A store failure
+  at any step aborts with the in-RAM model unchanged — no half-applied state.
+  Persistence via `NvsCsiModelStore` (Preferences blob + CRC per slot). The legacy
+  single-model NVS layout is migrated once into the active slot on boot; boot
+  detection behavior is unchanged and the legacy keys are kept for downgrade.
+  27 native tests (finalize->candidate-only, atomic apply/rollback with store-
+  failure injection, clear, legacy migration, EMA-touches-active-only).
+- **CSI model REST API + dashboard panel.** `GET /api/csi/site_model`
+  (active/candidate/previous + generation + `apply_required`), `POST .../apply`,
+  `POST .../rollback`, `DELETE .../candidate`, and `GET /api/csi/model/quality`
+  (p50/p90/p95/p99, mean/std/max, accepted vs. rejected-motion/rejected-radar,
+  threshold clamp reason). `CsiModelOp` maps to 200/404/422/500. The CSI dashboard
+  tab shows all three slots, the candidate-vs-active threshold delta (red > 50 %)
+  and Apply/Discard/Rollback with before/after confirm dialogs.
+- **Pre-arm health self-test.** At arm time `computeArmWarnings()` checks
+  radar liveness, CSI packet rate, active-model presence/staleness (> 30 days),
+  NTP clock validity and MQTT connectivity, and appends any warnings to the
+  ARM/ARMING notification. It is a **warning, not a veto** — arming always
+  proceeds; the point is to flag "you armed, but the radar is offline" instead of
+  arming silently into a blind state. Pure/host-tested (11 native tests).
+- **CSI-side tamper detection.** Anti-masking previously watched only the
+  radar. `CsiTamperDetector` flags **NO_PACKETS** (packet rate collapses while
+  Ethernet is up, past a 30 s grace) and **FROZEN** (running variance bit-
+  identical for 2 min = stuck capture), evaluated ~1x/min in `checkSystemHealth`,
+  firing one `TAMPER_ALERT` on the rising edge and clearing on recovery.
+  Pure/host-tested (8 native tests).
+- **Event confidence fingerprint.** `LogEvent` gains `fusion_src`
+  (bit0=radar, bit1=CSI), `confidence`, `var_ratio` and `ml_prob` (56 -> 60 B);
+  `triggerAlert` captures the live fusion state at every event and `/api/events`
+  emits `fsrc`/`conf`/`vratio`/`mlp`, so a historical alarm is forensically
+  explainable — which sensors fired it and how confident the fusion was.
+  `EVENT_FILE_MAGIC` bumped `0xEE120001 -> 0xEE120002`; on upgrade the old
+  `/events.bin` is re-initialized (old events dropped, never misread).
+
+### Fixed
+
+- **Silent boot NVS error log for CSI model slots.** `NvsCsiModelStore` guards
+  slot reads with `isKey()`, so a not-yet-created slot no longer logs an NVS
+  "not found" error on first boot.
+- **`apply_required` compares model generation, not slot presence.** The dashboard
+  Apply gating now reflects whether the candidate is actually newer than the
+  running model rather than merely that a candidate slot is occupied.
+
 ## [5.1.1-poe-wifi] - 2026-07-10
 
 Site-learning API fix release. The REST API for long-term site learning behaved

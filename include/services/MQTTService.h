@@ -111,6 +111,9 @@ public:
     void begin(Preferences* prefs, const char* deviceId, const char* fwVersion = "unknown");
     void update();
     bool connected();
+    // True when a broker is configured (MQTT intended). Distinguishes "disconnected"
+    // from "intentionally off" for the pre-arm health check.
+    bool isConfigured() const { return _server[0] != '\0'; }
     bool publish(const char* topic, const char* payload, bool retained = false);
     unsigned long getLastPublishTime() const { return _lastPublish; }
     void forceReconnect();

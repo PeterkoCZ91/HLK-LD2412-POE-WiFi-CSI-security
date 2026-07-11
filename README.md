@@ -3,7 +3,7 @@
 [![PlatformIO](https://img.shields.io/badge/PlatformIO-ESP32-orange?logo=platformio)](https://platformio.org/)
 [![ESP32](https://img.shields.io/badge/MCU-ESP32--WROOM--32-blue?logo=espressif)](https://www.espressif.com/)
 [![License](https://img.shields.io/badge/License-GPL--3.0-blue)](LICENSE)
-[![Version](https://img.shields.io/badge/Version-5.1.1--poe--wifi-blue)]()
+[![Version](https://img.shields.io/badge/Version-5.2.0--poe--wifi-blue)]()
 [![Discussions](https://img.shields.io/badge/GitHub-Discussions-purple?logo=github)](https://github.com/PeterkoCZ91/HLK-LD2412-POE-WiFi-CSI-security/discussions)
 
 **Dual-sensor intrusion detection system** — ESP32 + HLK-LD2412 24 GHz mmWave radar + **WiFi CSI (Channel State Information) passive motion detection** over **wired Ethernet with Power over Ethernet**. Full alarm state machine, zone management, Home Assistant integration, Telegram bot, and a dark-mode web dashboard. No cloud required.
@@ -11,7 +11,7 @@
 WiFi CSI detection algorithms based on [ESPectre](https://github.com/francescopace/espectre) by Francesco Pace (GPLv3).
 
 > [!TIP]
-> **v5.1.1** — Site-learning API fix: `POST /api/csi/site_learning` no longer silently *starts* a multi-hour learning run when called with an unrecognized `action` parameter — `action=start` / `action=stop` now work as documented aliases and any other `action` value returns `400 Bad Request`. API docs corrected to the real parameters (`duration_s`/`duration_h`, `stop=1`, `clear_model=1`); `tools/smoke_test.py` gained a site-learning contract check. See [CHANGELOG](CHANGELOG.md).
+> **v5.2.0** — CSI site-model lifecycle: long-term site learning now finalizes to a **candidate** instead of auto-activating — review it, then `apply` (keeps the old model for one-click `rollback`). New `/api/csi/site_model/*` API + dashboard panel + quality report (p50–p99, clamp reason). Plus three hardening features: a **pre-arm health self-test** (warns if you arm into a blind state — radar/CSI/model/clock/MQTT), **CSI-side tamper detection** (packet collapse / frozen capture, not just radar), and a **confidence fingerprint** on every logged event (which sensors fired it, how confident). See [CHANGELOG](CHANGELOG.md).
 >
 > **v5.1.0** — ESP-IDF 5.5 / Arduino 3.x migration: the firmware now builds on the community pioarduino platform (Arduino-ESP32 3.3.9 / ESP-IDF 5.5.4) via the new `esp32_poe_csi_idf5` env **alongside** the legacy espressif32@6.9.0 stack, with platform code guarded by `ESP_ARDUINO_VERSION_MAJOR`. Ships a batch of fusion/MQTT/radar-recovery fixes hardened on a live CSI-only node (stale-CSI fusion gate, radar un-veto & recovery give-up latch, MQTT fail-fast on half-open sockets, change-gated CSI telemetry, SSE queue cap) plus a stdlib-only `tools/smoke_test.py`. See [CHANGELOG](CHANGELOG.md).
 >

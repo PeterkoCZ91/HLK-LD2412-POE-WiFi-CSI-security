@@ -2524,6 +2524,34 @@ void setupSnapshotRoutes() {
 // Conditionally compiled: USE_CSI defines real handlers, otherwise stubs
 // return 503 so the GUI can show "not compiled in" instead of 404.
 // ============================================================================
+#ifdef USE_CSI
+// Map a model-manager result to an HTTP status + message. Keeps apply/rollback/
+// clear responses consistent (spec §8.1).
+static int csiModelOpHttp(CsiModelOp op, const char*& msg) {
+    switch (op) {
+        case CsiModelOp::OK:                msg = "OK";                         return 200;
+        case CsiModelOp::NO_CANDIDATE:      msg = "No candidate model";         return 404;
+        case CsiModelOp::NO_PREVIOUS:       msg = "No previous model";          return 404;
+        case CsiModelOp::VALIDATION_FAILED: msg = "Model failed validation";    return 422;
+        case CsiModelOp::STORE_FAILED:      msg = "NVS write/verify failed";    return 500;
+    }
+    msg = "Unknown"; return 500;
+}
+// Serialize one model slot into a JSON object (only meaningful fields when valid).
+static void csiSlotToJson(JsonObject o, const CsiSiteModel& m) {
+    o["valid"] = m.valid;
+    if (!m.valid) return;
+    o["generation"]      = m.generation;
+    o["threshold"]       = m.threshold;
+    o["samples"]         = m.sampleCount;
+    o["rejected_motion"] = m.rejectedMotion;
+    o["rejected_radar"]  = m.rejectedRadar;
+    o["duration_s"]      = m.durationSec;
+    o["mean_variance"]   = m.meanVariance;
+    o["std_variance"]    = m.stdVariance;
+    o["max_variance"]    = m.maxVariance;
+}
+#endif
 void setupCSIRoutes() {
 #ifdef USE_CSI
     // GET — runtime config + live values + status
@@ -2670,8 +2698,84 @@ void setupCSIRoutes() {
             if (s >= 60 && s <= 604800) durMs = (uint32_t)s * 1000UL;
         }
 
-        _deps.csiService->startSiteLearning(durMs);
-        request->send(200, "text/plain", "Site learning started");
+        // A finished-but-unapplied candidate is not silently overwritten: require
+        // replace_candidate=1 (mapped to HTTP 409 otherwise).
+        bool replace = request->hasParam("replace_candidate");
+        if (!_deps.csiService->startSiteLearning(durMs, replace)) {
+            request->send(409, "text/plain", "Candidate exists — pass replace_candidate=1 to overwrite");
+            return;
+        }
+        request->send(202, "text/plain", "Site learning started");
+    });
+
+    // GET /api/csi/site_model — active/candidate/previous slots + runtime generation
+    _deps.server->on(AsyncURIMatcher::exact("/api/csi/site_model"), HTTP_GET, [](AsyncWebServerRequest *request) {
+        if (!checkAuthBasic(request)) return;
+        if (_deps.csiService == nullptr) { request->send(503, "text/plain", "CSI not available"); return; }
+        JsonDocument doc;
+        doc["learning_active"]   = _deps.csiService->isSiteLearning();
+        doc["learning_progress"] = _deps.csiService->getSiteLearningProgress();
+        csiSlotToJson(doc["active"].to<JsonObject>(),    _deps.csiService->modelActive());
+        csiSlotToJson(doc["candidate"].to<JsonObject>(), _deps.csiService->modelCandidate());
+        csiSlotToJson(doc["previous"].to<JsonObject>(),  _deps.csiService->modelPrevious());
+        doc["runtime_model_generation"] = _deps.csiService->activeModelGeneration();
+        // apply_required only when the candidate is genuinely newer than the active
+        // model — after an apply, candidate==active and must not read as pending.
+        doc["apply_required"] = _deps.csiService->hasCandidateModel() &&
+            (_deps.csiService->modelCandidate().generation != _deps.csiService->modelActive().generation);
+        AsyncResponseStream* response = request->beginResponseStream("application/json");
+        serializeJson(doc, *response);
+        request->send(response);
+    });
+
+    // POST /api/csi/site_model/apply — activate the candidate (keeps previous for rollback)
+    _deps.server->on("/api/csi/site_model/apply", HTTP_POST, [](AsyncWebServerRequest *request) {
+        if (!checkAuth(request)) return;
+        if (_deps.csiService == nullptr) { request->send(503, "text/plain", "CSI not available"); return; }
+        if (_deps.csiService->isSiteLearning()) {
+            request->send(409, "text/plain", "Learning in progress — stop it before applying");
+            return;
+        }
+        const char* msg = "";
+        int code = csiModelOpHttp(_deps.csiService->applyCandidateModel(), msg);
+        request->send(code, "text/plain", msg);
+    });
+
+    // POST /api/csi/site_model/rollback — swap active<->previous
+    _deps.server->on("/api/csi/site_model/rollback", HTTP_POST, [](AsyncWebServerRequest *request) {
+        if (!checkAuth(request)) return;
+        if (_deps.csiService == nullptr) { request->send(503, "text/plain", "CSI not available"); return; }
+        const char* msg = "";
+        int code = csiModelOpHttp(_deps.csiService->rollbackSiteModel(), msg);
+        request->send(code, "text/plain", msg);
+    });
+
+    // DELETE /api/csi/site_model/candidate — discard candidate; active/previous untouched
+    _deps.server->on("/api/csi/site_model/candidate", HTTP_DELETE, [](AsyncWebServerRequest *request) {
+        if (!checkAuth(request)) return;
+        if (_deps.csiService == nullptr) { request->send(503, "text/plain", "CSI not available"); return; }
+        const char* msg = "";
+        int code = csiModelOpHttp(_deps.csiService->clearCandidateModel(), msg);
+        request->send(code, "text/plain", msg);
+    });
+
+    // GET /api/csi/model/quality — last finalized candidate's quality report
+    _deps.server->on(AsyncURIMatcher::exact("/api/csi/model/quality"), HTTP_GET, [](AsyncWebServerRequest *request) {
+        if (!checkAuthBasic(request)) return;
+        if (_deps.csiService == nullptr) { request->send(503, "text/plain", "CSI not available"); return; }
+        CsiModelQuality q;
+        if (!_deps.csiService->getModelQuality(q)) { request->send(404, "text/plain", "No quality report"); return; }
+        static const char* CLAMP[] = {"none","absolute_floor","configured_floor","maximum_limit","insufficient_samples"};
+        JsonDocument doc;
+        doc["generation"]      = q.generation;
+        doc["accepted"]        = q.accepted;
+        doc["rejected_motion"] = q.rejectedMotion;
+        doc["rejected_radar"]  = q.rejectedRadar;
+        doc["p50"] = q.p50; doc["p90"] = q.p90; doc["p95"] = q.p95; doc["p99"] = q.p99;
+        doc["mean"] = q.mean; doc["std"] = q.std; doc["max"] = q.max;
+        doc["threshold_clamp_reason"] = (q.thresholdClampReason < 5) ? CLAMP[q.thresholdClampReason] : "unknown";
+        String out; serializeJson(doc, out);
+        request->send(200, "application/json", out);
     });
 
     // POST /api/csi/reset_baseline — clear idle baseline (use after moving sensor)

@@ -3,6 +3,8 @@
 #include "services/TelegramService.h"
 #ifdef USE_CSI
 #include "services/CSIService.h"
+#include "services/ArmReadiness.h"   // #9 pre-arm health self-test
+#include <time.h>
 #endif
 #include "debug.h"
 #include "constants.h"
@@ -204,6 +206,36 @@ void SecurityMonitor::update() {
     if (_mutex) xSemaphoreGive(_mutex);
 }
 
+// #9: build ArmHealthInputs from live subsystem state and return the warning
+// bitmask. A warning never blocks arming — it just tells the user the system is
+// (partly) blind so they don't trust a node that can't actually sense.
+uint32_t SecurityMonitor::_armHealthWarnings() {
+    ArmHealthInputs in;
+#ifdef USE_CSI
+    bool csiOn = (_csiService != nullptr);
+#else
+    bool csiOn = false;
+#endif
+    in.csiCompiled = csiOn;
+    in.csiEnabled  = csiOn;
+    if (csiOn) {
+        in.csiActive     = _csiService->isActive();
+        in.csiPacketRate = _csiService->getPacketRate();
+        // "Has a baseline" = a learned site model OR an initialized idle baseline;
+        // a CSI node without site-learning is not blind, so don't false-warn.
+        in.modelValid    = _csiService->hasLearnedSiteModel() || _csiService->isIdleInitialized();
+        uint32_t nowEpoch = (uint32_t)time(nullptr);
+        const CsiSiteModel& a = _csiService->modelActive();
+        in.modelAgeSec = (a.valid && a.createdAt > 0 && nowEpoch > a.createdAt)
+                         ? (nowEpoch - a.createdAt) : 0;
+    }
+    in.radarOk       = !_radarMonitoringDisabled;
+    in.timeValid     = ((uint32_t)time(nullptr) > 1600000000u);   // > 2020-09 => NTP synced
+    in.mqttWanted    = (_mqttService != nullptr) && _mqttService->isConfigured();
+    in.mqttConnected = (_mqttService != nullptr) && _mqttService->connected();
+    return computeArmWarnings(in);
+}
+
 void SecurityMonitor::setArmed(bool armed, bool immediate, bool homeMode) {
     if (_mutex && xSemaphoreTake(_mutex, pdMS_TO_TICKS(500)) != pdTRUE) return;
     unsigned long now = millis();
@@ -231,12 +263,22 @@ void SecurityMonitor::setArmed(bool armed, bool immediate, bool homeMode) {
         // r == ARMING_STARTED or ARMED_IMMEDIATE — FSM has set state + exit-delay timer.
         _alarmState = _fsm.state();
         _homeMode = homeMode;
+        // #9 pre-arm self-test: append a blind-state warning to the arm notification
+        // (never blocks arming — the state change already happened).
+        String warnSuffix;
+        uint32_t armWarn = _armHealthWarnings();
+        if (armWarn) {
+            char wbuf[96];
+            renderArmWarnings(armWarn, wbuf, sizeof(wbuf));
+            warnSuffix = "\n⚠️ Arm-check: " + String(wbuf);
+            DBG("SecMon", "ARM health warnings: %s", wbuf);
+        }
         if (r == ArmResult::ARMED_IMMEDIATE) {
             DBG("SecMon", "ARMED (immediate, home=%d)", (int)homeMode);
-            triggerAlert(NotificationType::ALARM_STATE_CHANGE, "🔒 System ARMED", homeMode ? "Immediate activation (home)." : "Immediate activation.");
+            triggerAlert(NotificationType::ALARM_STATE_CHANGE, "🔒 System ARMED", String(homeMode ? "Immediate activation (home)." : "Immediate activation.") + warnSuffix);
         } else {
             DBG("SecMon", "ARMING (exit delay %lu s, home=%d)", _exitDelay / 1000, (int)homeMode);
-            triggerAlert(NotificationType::ALARM_STATE_CHANGE, "⏳ ARMING...", "Exit delay: " + String(_exitDelay / 1000) + "s" + (homeMode ? " (home)" : ""));
+            triggerAlert(NotificationType::ALARM_STATE_CHANGE, "⏳ ARMING...", "Exit delay: " + String(_exitDelay / 1000) + "s" + (homeMode ? " (home)" : "") + warnSuffix);
         }
         clearApproachLog();
         _armedDebounceCount = 0;  // FSM owns debounce; kept zeroed for parity
@@ -811,7 +853,33 @@ void SecurityMonitor::processRadarData(uint16_t distance, uint8_t move_energy, u
     if (_mutex) xSemaphoreGive(_mutex);
 }
 
+// #5: CSI-side tamper — the passive sensor can be blinded (AP pulled/covered,
+// capture frozen) without the radar ever noticing. Fires ONE TAMPER_ALERT on the
+// rising edge and clears the latch once CSI recovers.
+void SecurityMonitor::_checkCsiTamper() {
+    if (_csiService == nullptr) { _csiTamperLatched = false; return; }
+    CsiTamperInputs in;
+    in.csiActive   = _csiService->isActive();
+    in.ethUp       = ETH.linkUp();
+    in.packetRate  = _csiService->getPacketRate();
+    in.variance    = _csiService->getVariance();
+    in.nowMs       = millis();
+    uint32_t flags = _csiTamper.update(in);
+    if (flags && !_csiTamperLatched) {
+        _csiTamperLatched = true;
+        char buf[128];
+        renderCsiTamper(flags, buf, sizeof(buf));
+        DBG("SecMon", "CSI TAMPER: %s", buf);
+        triggerAlert(NotificationType::TAMPER_ALERT, "🛡️ CSI sensor tamper",
+                     String(buf) + "\nEthernet is up but the WiFi CSI sensor stopped seeing the room.");
+    } else if (!flags && _csiTamperLatched) {
+        _csiTamperLatched = false;
+        DBG("SecMon", "CSI tamper cleared");
+    }
+}
+
 void SecurityMonitor::checkSystemHealth() {
+    _checkCsiTamper();
     bool healthy = true;
 
     // Check Ethernet (ETH — no WiFi)
@@ -865,7 +933,21 @@ void SecurityMonitor::triggerAlert(NotificationType type, const String& message,
         }
         // FIX #3: Use explicit distance when provided, not stale _lastDistance
         uint16_t logDist = (explicitDist >= 0) ? (uint16_t)explicitDist : _lastDistance;
-        _eventLog->addEvent(evtType, logDist, 0, message.c_str());
+        // #2 confidence fingerprint: capture WHY this fired so historical events are
+        // forensically readable (which sensors, how confident, variance vs threshold).
+        uint8_t fpSrc  = _fusionSource;
+        uint8_t fpConf = (uint8_t)(_fusionConfidence * 255.0f);
+        uint8_t fpVar = 0, fpMl = 0;
+#ifdef USE_CSI
+        if (_csiService) {
+            float thr = _csiService->getThreshold();
+            float ratio = (thr > 0.0f) ? (_csiService->getVariance() / thr) : 0.0f;
+            int r = (int)(ratio * 100.0f);
+            fpVar = (uint8_t)(r < 0 ? 0 : (r > 255 ? 255 : r));
+            fpMl  = (uint8_t)(_csiService->getMlProbability() * 255.0f);
+        }
+#endif
+        _eventLog->addEvent(evtType, logDist, 0, message.c_str(), fpSrc, fpConf, fpVar, fpMl);
         // FIX #16: Immediately persist critical security events
         if (evtType == EVT_SECURITY) {
             _eventLog->flushNow();

@@ -8,6 +8,9 @@
 #include <freertos/task.h>
 #include <atomic>
 #include <Preferences.h>
+#include "services/CsiSiteModel.h"
+#include "services/NvsCsiModelStore.h"
+#include "services/CsiModelManager.h"
 
 class MQTTService;
 
@@ -98,7 +101,7 @@ public:
     void calibrateThreshold(uint32_t durationMs = 10000);
     bool isCalibrating() const { return _calibrating; }
     float getCalibrationProgress() const;
-    bool startSiteLearning(uint32_t durationMs);
+    bool startSiteLearning(uint32_t durationMs, bool replaceCandidate = false);
     void stopSiteLearning();
     void clearLearnedSiteModel();
     bool isSiteLearning() const { return _siteLearningActive; }
@@ -122,6 +125,21 @@ public:
     uint32_t getLearnedSampleCount() const { return _learnedSampleCount; }
     // csi10: continuous EMA refresh of learned model (adapts to seasonal / furniture changes)
     uint32_t getLearnRefreshCount() const { return _learnRefreshCount; }
+
+    // csi-model: active/candidate/previous slot management (site-learning v2).
+    // finalize now produces a CANDIDATE only; apply/rollback switch detection.
+    CsiModelOp applyCandidateModel();
+    CsiModelOp rollbackSiteModel();
+    CsiModelOp clearCandidateModel();
+    bool hasCandidateModel() const { return _modelMgr.hasCandidate(); }
+    bool hasPreviousModel()  const { return _modelMgr.hasPrevious(); }
+    const CsiSiteModel& modelActive()    const { return _modelMgr.active(); }
+    const CsiSiteModel& modelCandidate() const { return _modelMgr.candidate(); }
+    const CsiSiteModel& modelPrevious()  const { return _modelMgr.previous(); }
+    uint32_t activeModelGeneration() const { return _modelMgr.active().generation; }
+    bool getModelQuality(CsiModelQuality& out) const {
+        if (!_hasQuality) return false; out = _lastQuality; return true;
+    }
 
     // Auto-calibration on quiet environment
     void setAutoCalibration(bool enabled, uint32_t minutes = 10) {
@@ -209,6 +227,10 @@ private:
     void _saveLearnedModel(float threshold, float meanVar, float stdVar, float maxVar, uint32_t samples);
     float _computeSiteLearningThreshold() const;
     void _finalizeSiteLearning();
+    void _publishModelState(const char* event);  // retained active/candidate JSON + event, on model change only
+    void _applyActiveToRuntime();     // mirror active slot into _learned*/idle baseline (no _threshold change)
+    void _switchDetectionToActive();  // apply/rollback only: move detection _threshold to active model
+    void _resetShortTermState();      // flush P95/hysteresis/running stats + reinit EMA timer
     void _runMlInference();
     void _continuousLearnRefresh();
 
@@ -410,6 +432,14 @@ private:
     // csi10: continuous EMA refresh state
     unsigned long _lastLearnRefreshSaveMs = 0;
     uint32_t _learnRefreshCount = 0;
+
+    // csi-model: active/candidate/previous slot manager + quality report.
+    // _modelStore MUST be declared before _modelMgr (ctor takes it by reference).
+    NvsCsiModelStore     _modelStore;
+    CsiModelManager      _modelMgr{_modelStore};
+    CsiModelQuality      _lastQuality;
+    bool                 _hasQuality = false;
+    CsiVarianceHistogram _varHist;   // variance quantiles accumulated during learning
 
     // csi8: MLP motion detection state (15 -> 16 -> 8 -> 1, dual-threshold hysteresis)
     bool     _mlEnabled     = true;
