@@ -1,10 +1,10 @@
 #include "services/SecurityMonitor.h"
 #include "services/MQTTService.h"
 #include "services/TelegramService.h"
-#ifdef USE_CSI
-#include "services/CSIService.h"
-#include "services/ArmReadiness.h"   // #9 pre-arm health self-test
+#include "services/ArmReadiness.h"   // #9 pre-arm health self-test (pure, no CSI dep)
 #include <time.h>
+#ifdef USE_CSI
+#include "services/CSIService.h"     // full CSIService type only in CSI builds
 #endif
 #include "debug.h"
 #include "constants.h"
@@ -211,14 +211,12 @@ void SecurityMonitor::update() {
 // (partly) blind so they don't trust a node that can't actually sense.
 uint32_t SecurityMonitor::_armHealthWarnings() {
     ArmHealthInputs in;
+    // CSIService is an incomplete type in non-CSI builds — every deref must be
+    // inside the preprocessor guard, not just a runtime if.
 #ifdef USE_CSI
-    bool csiOn = (_csiService != nullptr);
-#else
-    bool csiOn = false;
-#endif
-    in.csiCompiled = csiOn;
-    in.csiEnabled  = csiOn;
-    if (csiOn) {
+    if (_csiService != nullptr) {
+        in.csiCompiled   = true;
+        in.csiEnabled    = true;
         in.csiActive     = _csiService->isActive();
         in.csiPacketRate = _csiService->getPacketRate();
         // "Has a baseline" = a learned site model OR an initialized idle baseline;
@@ -229,6 +227,7 @@ uint32_t SecurityMonitor::_armHealthWarnings() {
         in.modelAgeSec = (a.valid && a.createdAt > 0 && nowEpoch > a.createdAt)
                          ? (nowEpoch - a.createdAt) : 0;
     }
+#endif
     in.radarOk       = !_radarMonitoringDisabled;
     in.timeValid     = ((uint32_t)time(nullptr) > 1600000000u);   // > 2020-09 => NTP synced
     in.mqttWanted    = (_mqttService != nullptr) && _mqttService->isConfigured();
@@ -857,6 +856,7 @@ void SecurityMonitor::processRadarData(uint16_t distance, uint8_t move_energy, u
 // capture frozen) without the radar ever noticing. Fires ONE TAMPER_ALERT on the
 // rising edge and clears the latch once CSI recovers.
 void SecurityMonitor::_checkCsiTamper() {
+#ifdef USE_CSI
     if (_csiService == nullptr) { _csiTamperLatched = false; return; }
     CsiTamperInputs in;
     in.csiActive   = _csiService->isActive();
@@ -876,6 +876,7 @@ void SecurityMonitor::_checkCsiTamper() {
         _csiTamperLatched = false;
         DBG("SecMon", "CSI tamper cleared");
     }
+#endif  // USE_CSI
 }
 
 void SecurityMonitor::checkSystemHealth() {
