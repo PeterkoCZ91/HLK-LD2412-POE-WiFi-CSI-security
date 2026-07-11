@@ -20,6 +20,8 @@
 #include "services/metrics_text.h"
 #ifdef USE_CSI
 #include "services/CSIService.h"
+#include "services/CsiHealthReasons.h"
+#include "services/CsiModelExport.h"
 #endif
 #include <LittleFS.h>
 #include "services/BluetoothService.h"
@@ -2776,6 +2778,290 @@ void setupCSIRoutes() {
         doc["threshold_clamp_reason"] = (q.thresholdClampReason < 5) ? CLAMP[q.thresholdClampReason] : "unknown";
         String out; serializeJson(doc, out);
         request->send(200, "application/json", out);
+    });
+
+    // GET /api/csi/site_model/export?slot=active|candidate|previous — P1.5
+    // (navrh 17.5). Portable, validated model JSON: schema/algo-compat, model
+    // fields, generation, anonymized BSSID fingerprint and CRC. Never contains
+    // credentials or the raw MAC.
+    _deps.server->on(AsyncURIMatcher::exact("/api/csi/site_model/export"), HTTP_GET, [](AsyncWebServerRequest *request) {
+        if (!checkAuthBasic(request)) return;
+        if (_deps.csiService == nullptr) { request->send(503, "text/plain", "CSI not available"); return; }
+        String slot = request->hasParam("slot") ? request->getParam("slot")->value() : "active";
+        const CsiSiteModel* m = nullptr;
+        if      (slot == "active")    m = &_deps.csiService->modelActive();
+        else if (slot == "candidate") m = &_deps.csiService->modelCandidate();
+        else if (slot == "previous")  m = &_deps.csiService->modelPrevious();
+        else { request->send(400, "text/plain", "slot must be active|candidate|previous"); return; }
+        if (!m->valid) { request->send(404, "text/plain", "Slot empty"); return; }
+
+        JsonDocument doc;
+        doc["slot"]            = slot;
+        doc["schema_version"]  = m->schemaVersion;
+        doc["algo_compat"]     = CSI_MODEL_ALGO_COMPAT;
+        doc["fw_version"]      = _deps.fwVersion;
+        doc["generation"]      = m->generation;
+        doc["created_at"]      = m->createdAt;
+        doc["sample_count"]    = m->sampleCount;
+        doc["rejected_motion"] = m->rejectedMotion;
+        doc["rejected_radar"]  = m->rejectedRadar;
+        doc["duration_s"]      = m->durationSec;
+        doc["threshold"]       = m->threshold;
+        doc["mean_variance"]   = m->meanVariance;
+        doc["std_variance"]    = m->stdVariance;
+        doc["max_variance"]    = m->maxVariance;
+        doc["idle_mean_turbulence"]     = m->idleMeanTurbulence;
+        doc["idle_mean_phase"]          = m->idleMeanPhase;
+        doc["idle_amplitude_baseline"]  = m->idleAmplitudeBaseline;
+        doc["bssid_hash"]      = csiBssidHash(m->bssid);   // anonymized, raw MAC never exported
+        doc["model_crc"]       = m->checksum;
+        AsyncResponseStream* response = request->beginResponseStream("application/json");
+        serializeJson(doc, *response);
+        request->send(response);
+    });
+
+    // POST /api/csi/site_model/import?slot=candidate — P1.5. Import ALWAYS lands
+    // as a validated candidate and requires an explicit apply; writing active is
+    // rejected outright.
+    _deps.server->on(AsyncURIMatcher::exact("/api/csi/site_model/import"), HTTP_POST, [](AsyncWebServerRequest *request) {
+        if (!checkAuthBasic(request)) return;   // Basic (preemptive) so the body survives; body handler re-checks
+        if (_deps.csiService == nullptr) { request->send(503, "text/plain", "CSI not available"); return; }
+        String slot = request->hasParam("slot") ? request->getParam("slot")->value() : "candidate";
+        if (slot != "candidate") {
+            request->send(400, "text/plain", "Import only accepts slot=candidate (never active)");
+            return;
+        }
+        if (_deps.csiService->isSiteLearning()) {
+            request->send(409, "text/plain", "Learning in progress — stop it before importing");
+            return;
+        }
+        uint8_t* slab = (uint8_t*)request->_tempObject;
+        if (!slab) { request->send(400, "text/plain", "Body required"); return; }
+        if (slab[0] == 1) { free(slab); request->_tempObject = nullptr; request->send(413, "text/plain", "Body too large (max 4 KB)"); return; }
+        char* bodyData = (char*)(slab + 1);
+        JsonDocument doc;
+        DeserializationError jerr = deserializeJson(doc, bodyData);
+        free(slab);
+        request->_tempObject = nullptr;
+        if (jerr) { request->send(400, "text/plain", String("Invalid JSON: ") + jerr.c_str()); return; }
+
+        // Reject incompatible algorithm versions rather than silently applying a
+        // model the current detection math cannot honour (navrh 17.10).
+        if (doc["algo_compat"].is<uint32_t>() && doc["algo_compat"].as<uint32_t>() != CSI_MODEL_ALGO_COMPAT) {
+            request->send(422, "text/plain", "Incompatible algo_compat version"); return;
+        }
+
+        CsiSiteModel m;
+        m.schemaVersion         = doc["schema_version"] | CSI_MODEL_SCHEMA;
+        m.sampleCount           = doc["sample_count"]    | 0u;
+        m.rejectedMotion        = doc["rejected_motion"] | 0u;
+        m.rejectedRadar         = doc["rejected_radar"]  | 0u;
+        m.durationSec           = doc["duration_s"]      | 0u;
+        m.threshold             = doc["threshold"]       | 0.0f;
+        m.meanVariance          = doc["mean_variance"]   | 0.0f;
+        m.stdVariance           = doc["std_variance"]    | 0.0f;
+        m.maxVariance           = doc["max_variance"]    | 0.0f;
+        m.idleMeanTurbulence    = doc["idle_mean_turbulence"]    | 0.0f;
+        m.idleMeanPhase         = doc["idle_mean_phase"]         | 0.0f;
+        m.idleAmplitudeBaseline = doc["idle_amplitude_baseline"] | 0.0f;
+        // bssid intentionally left zero — the export carries only a hash, and the
+        // model is re-associated with the local AP on apply.
+
+        const char* msg = "";
+        int code = csiModelOpHttp(_deps.csiService->importCandidateModel(m), msg);
+        request->send(code, "text/plain", msg);
+    }, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+        if (!checkAuth(request)) return;
+        if (index == 0) {
+            if (total > 4096) {
+                request->_tempObject = malloc(1);
+                if (request->_tempObject) ((uint8_t*)request->_tempObject)[0] = 1;
+                return;
+            }
+            request->_tempObject = malloc(1 + total + 1);
+            if (request->_tempObject) { ((uint8_t*)request->_tempObject)[0] = 0; ((char*)request->_tempObject)[1] = '\0'; }
+        }
+        uint8_t* slab = (uint8_t*)request->_tempObject;
+        if (slab && slab[0] == 0 && index + len <= total) {
+            memcpy(slab + 1 + index, data, len);
+            ((char*)slab)[1 + index + len] = '\0';
+        }
+    });
+
+    // GET /api/csi/decision — P1.2 decision trace: why the last motion verdict
+    // was reached (navrh 17.3). Read-only diagnostics; no side effects.
+    _deps.server->on(AsyncURIMatcher::exact("/api/csi/decision"), HTTP_GET, [](AsyncWebServerRequest *request) {
+        if (!checkAuthBasic(request)) return;
+        if (_deps.csiService == nullptr) { request->send(503, "text/plain", "CSI not available"); return; }
+        const CsiDecisionTrace& t = _deps.csiService->getDecisionTrace();
+        JsonDocument doc;
+        doc["valid"]                 = t.valid;
+        doc["decision"]              = t.decision;
+        doc["reason"]                = csiDecisionReasonStr(t.reason);
+        doc["variance"]              = t.variance;
+        doc["configured_threshold"]  = t.configuredThreshold;
+        doc["adaptive_threshold"]    = t.adaptiveThreshold;
+        doc["effective_threshold"]   = t.effectiveThreshold;
+        doc["hysteresis_threshold"]  = t.hysteresisThreshold;
+        doc["raw_motion"]            = t.rawMotion;
+        doc["smoothing_votes"]       = t.smoothingVotes;
+        doc["smoothing_window"]      = t.smoothingWindow;
+        doc["enter_votes"]           = t.enterVotes;
+        doc["exit_votes"]            = t.exitVotes;
+        doc["breathing_hold"]        = t.breathingHold;
+        doc["breath_hold_count"]     = t.breathHoldCount;
+        doc["ml_motion"]             = t.mlMotion;
+        doc["ml_probability"]        = t.mlProbability;
+        doc["radar_present"]         = t.radarPresent;
+        doc["active_generation"]     = t.activeGeneration;
+        doc["uptime_ms"]             = t.uptimeMs;
+        AsyncResponseStream* response = request->beginResponseStream("application/json");
+        serializeJson(doc, *response);
+        request->send(response);
+    });
+
+    // GET /api/csi/health — P1.4 health reason flags (navrh 17.7). motion=false
+    // does NOT imply a healthy sensor: report concrete reasons + a 0-100 score.
+    _deps.server->on(AsyncURIMatcher::exact("/api/csi/health"), HTTP_GET, [](AsyncWebServerRequest *request) {
+        if (!checkAuthBasic(request)) return;
+        if (_deps.csiService == nullptr) { request->send(503, "text/plain", "CSI not available"); return; }
+        CSIService* csi = _deps.csiService;
+
+        // Wall-clock validity: NTP-synced time is well past 2020-09 (epoch 1.6e9).
+        time_t nowSec = time(nullptr);
+        bool clockValid = nowSec > 1600000000L;
+
+        // Model staleness: active model older than the horizon (only when clock trusted).
+        static constexpr uint32_t MODEL_STALE_HORIZON_SEC = 30UL * 24UL * 3600UL;  // 30 days
+        const CsiSiteModel& active = csi->modelActive();
+        bool modelStale = clockValid && active.valid && active.createdAt > 0 &&
+                          (uint32_t)nowSec > active.createdAt &&
+                          ((uint32_t)nowSec - active.createdAt) > MODEL_STALE_HORIZON_SEC;
+
+        // Site-learning contamination: rejecting most samples (needs a minimum to matter).
+        uint32_t learnTotal = csi->getSiteLearningAcceptedSamples() +
+                              csi->getSiteLearningRejectedMotion() +
+                              csi->getSiteLearningRejectedRadar();
+        bool learnContaminated = csi->isSiteLearning() && learnTotal >= 50 &&
+                                 csi->learningRejectRatio() > 0.5f;
+
+        CsiHealthInputs in;
+        in.csiActive            = csi->isActive();
+        in.htLtfSeen            = csi->isHtLtfSeen();
+        in.packetRate           = csi->getPacketRate();
+        in.packetRateFloorPps   = 5.0f;
+        in.packetRateUnstable   = csi->isPacketRateUnstable();
+        in.wifiRoamedRecently   = csi->hasRoamedWithin(60000);
+        in.modelValid           = active.valid;
+        in.modelStale           = modelStale;
+        in.learningContaminated = learnContaminated;
+        in.radarAvailable       = (_deps.radar != nullptr) && _deps.radar->isRadarConnected();
+        in.mqttExpected         = _deps.config->mqtt_enabled;
+        in.mqttConnected        = (_deps.mqttService != nullptr) && _deps.mqttService->connected();
+        in.clockValid           = clockValid;
+
+        uint16_t flags = csiHealthReasons(in);
+
+        JsonDocument doc;
+        doc["healthy"] = (flags == CSI_HEALTH_OK);
+        doc["score"]   = csiHealthScore(flags);
+        JsonArray reasons = doc["reasons"].to<JsonArray>();
+        if (flags == CSI_HEALTH_OK) {
+            reasons.add("healthy");
+        } else {
+            for (uint8_t i = 0; i < CSI_HEALTH_FLAG_COUNT; i++) {
+                CsiHealthFlag flag = static_cast<CsiHealthFlag>(1u << i);
+                if (flags & flag) reasons.add(csiHealthFlagStr(flag));
+            }
+        }
+        AsyncResponseStream* response = request->beginResponseStream("application/json");
+        serializeJson(doc, *response);
+        request->send(response);
+    });
+
+    // GET /api/csi/events?limit=100&after_seq=1700 — P1.3 diagnostic event ring
+    // (navrh 17.2). RAM-only edges/spikes/disagreements; oldest-first after seq.
+    _deps.server->on(AsyncURIMatcher::exact("/api/csi/events"), HTTP_GET, [](AsyncWebServerRequest *request) {
+        if (!checkAuthBasic(request)) return;
+        if (_deps.csiService == nullptr) { request->send(503, "text/plain", "CSI not available"); return; }
+        uint16_t limit = 100;
+        uint32_t afterSeq = 0;
+        if (request->hasParam("limit"))     limit = (uint16_t)request->getParam("limit")->value().toInt();
+        if (request->hasParam("after_seq")) afterSeq = (uint32_t)request->getParam("after_seq")->value().toInt();
+        if (limit < 1)   limit = 1;
+        if (limit > 100) limit = 100;   // cap transient memory of the response
+
+        CsiEvent* buf = new (std::nothrow) CsiEvent[limit];
+        if (buf == nullptr) { request->send(500, "text/plain", "OOM"); return; }
+        uint16_t n = _deps.csiService->copyEventsAfter(afterSeq, limit, buf, limit);
+
+        JsonDocument doc;
+        doc["count"]     = _deps.csiService->eventCount();
+        doc["capacity"]  = _deps.csiService->eventCapacity();
+        doc["last_seq"]  = _deps.csiService->lastEventSeq();
+        doc["returned"]  = n;
+        JsonArray arr = doc["events"].to<JsonArray>();
+        for (uint16_t i = 0; i < n; i++) {
+            const CsiEvent& e = buf[i];
+            JsonObject o = arr.add<JsonObject>();
+            o["seq"]        = e.seq;
+            o["uptime_ms"]  = e.uptimeMs;
+            o["type"]       = csiEventTypeStr(e.type);
+            o["variance"]   = e.variance;
+            o["eff_thr"]    = e.effectiveThreshold;
+            o["shadow_thr"] = e.shadowThreshold;
+            o["active"]     = e.activeMotion;
+            o["shadow"]     = e.shadowMotion;
+            o["radar"]      = e.radarPresent;
+            o["ml_prob"]    = e.mlProbability;
+            o["rssi"]       = e.rssi;
+            o["pps"]        = e.pps;
+            if (e.type == CsiEventType::HEALTH_CHANGE) {
+                o["health_flags"] = e.healthFlags;
+                JsonArray hr = o["health_reasons"].to<JsonArray>();
+                if (e.healthFlags == CSI_HEALTH_OK) hr.add("healthy");
+                else for (uint8_t b = 0; b < CSI_HEALTH_FLAG_COUNT; b++) {
+                    CsiHealthFlag fl = static_cast<CsiHealthFlag>(1u << b);
+                    if (e.healthFlags & fl) hr.add(csiHealthFlagStr(fl));
+                }
+            }
+        }
+        delete[] buf;
+        AsyncResponseStream* response = request->beginResponseStream("application/json");
+        serializeJson(doc, *response);
+        request->send(response);
+    });
+
+    // DELETE /api/csi/events — clear the diagnostic ring (seq stays monotonic)
+    _deps.server->on(AsyncURIMatcher::exact("/api/csi/events"), HTTP_DELETE, [](AsyncWebServerRequest *request) {
+        if (!checkAuth(request)) return;
+        if (_deps.csiService == nullptr) { request->send(503, "text/plain", "CSI not available"); return; }
+        _deps.csiService->clearEvents();
+        request->send(200, "text/plain", "Event ring cleared");
+    });
+
+    // GET /api/csi/shadow — P1.1 shadow evaluation status (navrh 17.1).
+    // DIAGNOSTIC ONLY: the candidate verdict runs in parallel and never affects
+    // motion/alarm/PDU. Inactive (no counters) until a candidate model exists.
+    _deps.server->on(AsyncURIMatcher::exact("/api/csi/shadow"), HTTP_GET, [](AsyncWebServerRequest *request) {
+        if (!checkAuthBasic(request)) return;
+        if (_deps.csiService == nullptr) { request->send(503, "text/plain", "CSI not available"); return; }
+        CSIService* csi = _deps.csiService;
+        JsonDocument doc;
+        doc["note"]           = "SHADOW - NO ALARM EFFECT";
+        doc["active"]         = csi->isShadowActive();
+        doc["active_motion"]  = csi->getMotionState();
+        doc["shadow_motion"]  = csi->getShadowMotion();
+        doc["agree"]          = csi->getShadowAgree();
+        doc["disagree"]       = csi->getShadowDisagree();
+        uint32_t total = csi->getShadowAgree() + csi->getShadowDisagree();
+        doc["agreement_pct"]  = total ? (100.0f * csi->getShadowAgree() / total) : 0.0f;
+        doc["active_threshold"] = csi->getEffectiveThreshold();
+        doc["shadow_threshold"] = csi->getShadowThreshold();
+        doc["candidate_generation"] = csi->hasCandidateModel() ? csi->modelCandidate().generation : 0;
+        AsyncResponseStream* response = request->beginResponseStream("application/json");
+        serializeJson(doc, *response);
+        request->send(response);
     });
 
     // POST /api/csi/reset_baseline — clear idle baseline (use after moving sensor)

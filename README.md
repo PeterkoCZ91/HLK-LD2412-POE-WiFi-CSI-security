@@ -11,6 +11,8 @@
 WiFi CSI detection algorithms based on [ESPectre](https://github.com/francescopace/espectre) by Francesco Pace (GPLv3).
 
 > [!TIP]
+> **v5.3.0** — CSI diagnostics (P1): five read-only forensics features that answer *"why didn't the alarm fire?"* without external second-by-second logging. **Decision trace** (`/api/csi/decision`) explains the last motion verdict; **health reasons** (`/api/csi/health`) tell a quiet room from a starved link (motion=false ≠ healthy); a **RAM event ring** (`/api/csi/events`) keeps the last 256 edges/spikes/disagreements; **shadow evaluation** (`/api/csi/shadow`) runs a candidate model in parallel with **no alarm effect** so it can be watched 24–72 h before apply; and **model export/import** (`/api/csi/site_model/export|import`) moves a validated model between nodes (import lands as candidate only). See [CHANGELOG](CHANGELOG.md).
+>
 > **v5.2.0** — CSI site-model lifecycle: long-term site learning now finalizes to a **candidate** instead of auto-activating — review it, then `apply` (keeps the old model for one-click `rollback`). New `/api/csi/site_model/*` API + dashboard panel + quality report (p50–p99, clamp reason). Plus three hardening features: a **pre-arm health self-test** (warns if you arm into a blind state — radar/CSI/model/clock/MQTT), **CSI-side tamper detection** (packet collapse / frozen capture, not just radar), and a **confidence fingerprint** on every logged event (which sensors fired it, how confident). See [CHANGELOG](CHANGELOG.md).
 >
 > **v5.1.0** — ESP-IDF 5.5 / Arduino 3.x migration: the firmware now builds on the community pioarduino platform (Arduino-ESP32 3.3.9 / ESP-IDF 5.5.4) via the new `esp32_poe_csi_idf5` env **alongside** the legacy espressif32@6.9.0 stack, with platform code guarded by `ESP_ARDUINO_VERSION_MAJOR`. Ships a batch of fusion/MQTT/radar-recovery fixes hardened on a live CSI-only node (stale-CSI fusion gate, radar un-veto & recovery give-up latch, MQTT fail-fast on half-open sockets, change-gated CSI telemetry, SSE queue cap) plus a stdlib-only `tools/smoke_test.py`. See [CHANGELOG](CHANGELOG.md).
@@ -588,9 +590,38 @@ All endpoints require Digest auth except where noted.
 | GET/POST | `/api/csi` | CSI metrics, config, diagnostics (incl. site learning, MLP, NBVI, adaptive threshold, `ht_ltf_seen`) |
 | POST | `/api/csi/calibrate` | Auto-calibrate CSI threshold |
 | POST | `/api/csi/site_learning` | Start long-term site-learning baseline (`?duration_s=...` or `?duration_h=...`, default 48 h); stop with `?stop=1`; discard model with `?clear_model=1`; `action=start\|stop` aliases accepted, other `action` values → 400 |
+| GET | `/api/csi/site_model` | Active/candidate/previous model slots + runtime generation + `apply_required` |
+| POST | `/api/csi/site_model/apply` | Activate the candidate (keeps the old active as `previous` for rollback) |
+| POST | `/api/csi/site_model/rollback` | Swap active ↔ previous |
+| DELETE | `/api/csi/site_model/candidate` | Discard the candidate; active/previous untouched |
+| GET | `/api/csi/model/quality` | Last candidate's quality report (p50–p99, mean/std/max, clamp reason) |
+| GET | `/api/csi/site_model/export` | **P1.5** Export a slot (`?slot=active\|candidate\|previous`) as portable, validated JSON — schema/algo-compat, model fields, generation, anonymized BSSID fingerprint, CRC. No raw MAC or credentials |
+| POST | `/api/csi/site_model/import` | **P1.5** Import a model (`?slot=candidate` only) — lands as a validated **candidate**, requires explicit apply; never writes active |
+| GET | `/api/csi/decision` | **P1.2** Decision trace: why the last motion verdict was reached (reason, thresholds, smoothing votes, breathing hold, ML/radar) |
+| GET | `/api/csi/health` | **P1.4** Sensor health reasons + 0–100 score (`no_ht_ltf`, `packet_rate_low/unstable`, `wifi_roamed`, `model_missing/stale`, `learning_contaminated`, `radar_unavailable`, `mqtt_disconnected`, `clock_invalid`) — motion=false ≠ healthy |
+| GET/DELETE | `/api/csi/events` | **P1.3** RAM diagnostic event ring (`?limit=100&after_seq=N`) — motion edges, variance spikes, model disagreements; DELETE clears it |
+| GET | `/api/csi/shadow` | **P1.1** Shadow-evaluation status (candidate verdict computed in parallel) — **diagnostic only, no alarm effect** |
 | POST | `/api/csi/reset_baseline` | Reset CSI idle baselines |
 | POST | `/api/csi/reconnect` | Force WiFi reconnect for CSI |
 | GET/POST | `/api/csi/wifi` | Read configured SSID / set runtime SSID + password (NVS-persisted, requires reboot) |
+
+The P1 diagnostics are also surfaced read-only in the dashboard's **CSI tab → "CSI DIAGNOSTIKA (P1)"** panel (health score + reasons, last decision, shadow agree/disagree, event-ring fill).
+
+#### Shadow model in Home Assistant (optional, manual)
+
+Shadow evaluation publishes a **retained, diagnostic-only** JSON to `<csi_prefix>/model/shadow` (e.g. `poe2412_device/csi/model/shadow`), explicitly marked `SHADOW - NO ALARM EFFECT`. It is deliberately **not** part of the auto-discovery entity set — it must never drive an automation. To watch a candidate before applying it, add a manual MQTT sensor:
+
+```yaml
+mqtt:
+  sensor:
+    - name: "CSI shadow disagreements"
+      state_topic: "poe2412_device/csi/model/shadow"
+      value_template: "{{ value_json.disagree }}"
+      json_attributes_topic: "poe2412_device/csi/model/shadow"
+      icon: mdi:ab-testing
+```
+
+The `note`, `active`, `shadow`, `agree`, `disagree`, `active_thr`, `shadow_thr` and `candidate_gen` fields are exposed as attributes. **Do not** wire this sensor to the alarm — it reflects an unapplied model.
 
 ### Configuration & OTA
 

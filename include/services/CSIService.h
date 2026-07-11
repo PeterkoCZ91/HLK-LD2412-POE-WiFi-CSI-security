@@ -11,6 +11,10 @@
 #include "services/CsiSiteModel.h"
 #include "services/NvsCsiModelStore.h"
 #include "services/CsiModelManager.h"
+#include "services/CsiDecisionTrace.h"
+#include "services/CsiEventRing.h"
+#include "services/CsiShadowDetector.h"
+#include "services/CsiHealthReasons.h"
 
 class MQTTService;
 
@@ -57,6 +61,29 @@ public:
     float getVariance() const { return _runningVariance; }
     uint32_t getPacketCount() const { return _totalPackets; }
 
+    // P1.2 decision trace — read-only snapshot of the last motion decision
+    // (navrh 17.3). Exposed via GET /api/csi/decision; purely diagnostic.
+    const CsiDecisionTrace& getDecisionTrace() const { return _decisionTrace; }
+
+    // P1.3 diagnostic event ring (navrh 17.2) — read-only access for
+    // GET/DELETE /api/csi/events. RAM only; edges/spikes/disagreements/health.
+    uint16_t copyEventsAfter(uint32_t afterSeq, uint16_t limit, CsiEvent* out, uint16_t outCap) const {
+        return _events.query(afterSeq, limit, out, outCap);
+    }
+    void     clearEvents()          { _events.clear(); }
+    uint32_t lastEventSeq()   const { return _events.lastSeq(); }
+    uint16_t eventCount()     const { return _events.count(); }
+    uint16_t eventCapacity()  const { return _events.capacity(); }
+
+    // P1.1 shadow evaluation (navrh 17.1) — candidate verdict computed in
+    // parallel, DIAGNOSTIC ONLY, never affects motion/alarm/PDU. Active only
+    // when a candidate model exists.
+    bool     isShadowActive()      const { return hasCandidateModel(); }
+    bool     getShadowMotion()     const { return _shadowMotion; }
+    uint32_t getShadowAgree()      const { return _shadowAgree; }
+    uint32_t getShadowDisagree()   const { return _shadowDisagree; }
+    float    getShadowThreshold()  const { return hasCandidateModel() ? modelCandidate().threshold : 0.0f; }
+
     // csi10c: HT LTF presence flag — true after first valid HT LTF frame.
     // Stays false when AP emits only HE PHY (WiFi 6 hardware) — lets users
     // distinguish "AP incompatible" from "WiFi not associated" within seconds.
@@ -64,6 +91,22 @@ public:
 
     // Runtime stats
     float getPacketRate() const { return _packetRate; }
+    // P1.4 health: capture rate swinging far from its own running average
+    bool  isPacketRateUnstable() const {
+        return _packetRateEma > 1.0f &&
+               fabsf(_packetRate - _packetRateEma) > 0.5f * _packetRateEma;
+    }
+    // P1.4 health: true if the AP/BSSID changed within the last `windowMs` ms
+    bool  hasRoamedWithin(uint32_t windowMs) const {
+        return _bssidChangeCount > 0 && _lastBssidChangeMs != 0 &&
+               (millis() - _lastBssidChangeMs) < windowMs;
+    }
+    // P1.4 health: fraction of site-learning samples rejected (0 if not learning / no data)
+    float learningRejectRatio() const {
+        uint32_t total = _siteLearnAccepted + _siteLearnRejectedMotion + _siteLearnRejectedRadar;
+        if (total == 0) return 0.0f;
+        return (float)(_siteLearnRejectedMotion + _siteLearnRejectedRadar) / (float)total;
+    }
     int   getWifiRSSI() const;
     uint8_t getLastDisconnectReason() const { return _lastDisconnectReason; }
     uint32_t getReconnectAttempts() const { return _reconnectAttempts; }
@@ -131,6 +174,10 @@ public:
     CsiModelOp applyCandidateModel();
     CsiModelOp rollbackSiteModel();
     CsiModelOp clearCandidateModel();
+    // P1.5 import (navrh 17.5): land an externally-supplied model as CANDIDATE
+    // only — never active. Assigns a fresh generation, validates+seals via the
+    // model manager, and requires an explicit apply afterwards.
+    CsiModelOp importCandidateModel(const CsiSiteModel& src);
     bool hasCandidateModel() const { return _modelMgr.hasCandidate(); }
     bool hasPreviousModel()  const { return _modelMgr.hasPrevious(); }
     const CsiSiteModel& modelActive()    const { return _modelMgr.active(); }
@@ -218,6 +265,13 @@ private:
     void _processCSI(wifi_csi_info_t* info);
     void _publishMQTT();
     void _updateMotionState();
+    void _recordDecisionTrace(bool bufferReady, bool rawMotion, bool finalMotion,
+                              bool breathHold, uint8_t votes, uint8_t window, float effThr);
+    void _pushEvent(CsiEventType type, float effThr, float shadowThr = 0.0f,
+                    bool shadowMotion = false, uint16_t healthFlags = 0);
+    void _updateShadow(float effThr);  // P1.1: run candidate verdict in parallel
+    uint16_t _computeCsiHealthFlags() const;  // P1.4: CSI-intrinsic health subset
+    void _updateHealthEvents(float effThr);    // emit HEALTH_CHANGE on transition
     void _initWiFiForCSI(const char* ssid, const char* password);
     void _restoreEthDefaultNetif();
     void _startTrafficGen();
@@ -315,6 +369,29 @@ private:
     // Motion state
     bool _motionState = false;
 
+    // P1.2 decision trace — filled at every _updateMotionState() call
+    CsiDecisionTrace _decisionTrace;
+
+    // P1.3 diagnostic event ring (RAM only). 256 events ≈ 11 KB.
+    static constexpr uint16_t CSI_EVENT_RING_CAP = 256;
+    CsiEventRing<CSI_EVENT_RING_CAP> _events;
+    uint32_t _lastSpikeEventMs = 0;               // rate-limit VARIANCE_SPIKE
+    static constexpr uint32_t SPIKE_EVENT_MIN_GAP_MS = 10000;
+    static constexpr float    SPIKE_VARIANCE_FACTOR  = 3.0f;
+
+    // P1.1 shadow evaluation — candidate verdict in parallel, diagnostic only.
+    CsiShadowDetector _shadow;
+    bool     _shadowMotion   = false;
+    uint32_t _shadowAgree    = 0;
+    uint32_t _shadowDisagree = 0;
+    uint32_t _shadowCandGen  = 0;    // candidate generation the counters belong to
+    bool     _pubShadowMotion = false;
+
+    // P1.4 health-change events — CSI-intrinsic flag subset tracked per tick.
+    // Sentinel 0xFFFF (never a real value, only 10 bits used) forces the first
+    // evaluation to log the initial health state.
+    uint16_t _lastHealthFlags = 0xFFFF;
+
     // Breathing-aware presence hold
     uint16_t _breathHoldCount = 0;
     static constexpr uint16_t BREATH_HOLD_MAX = 300; // ~5 min at 1s publish
@@ -333,6 +410,7 @@ private:
     volatile uint32_t _reconnectAttempts = 0;    // DIAG: count of background WiFi reconnect attempts (out-of-coverage visibility)
     uint32_t _lastPublishMs = 0;
     float    _packetRate = 0.0f;
+    float    _packetRateEma = 0.0f;   // P1.4: slow average of _packetRate for stability check
     bool     _reconnectRequested = false;
 
     // MQTT change-gating: last published values + heartbeat clock. Floats go
@@ -369,6 +447,7 @@ private:
     uint8_t  _lastBSSID[6] = {0};
     bool     _bssidInitialized = false;
     uint32_t _bssidChangeCount = 0;
+    uint32_t _lastBssidChangeMs = 0;   // P1.4: millis() of last roam (0 = never)
 
     // csi4: adaptive P95 rolling threshold
     static constexpr uint16_t P95_BUFFER_SIZE = 300;
@@ -475,6 +554,7 @@ private:
     char _tPlcr[80] = {};
     char _tMlProb[80] = {};
     char _tMlMotion[80] = {};
+    char _tShadow[80] = {};   // P1.1: diagnostic candidate-shadow JSON (retained)
 };
 
 #endif // CSI_SERVICE_H

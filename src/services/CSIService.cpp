@@ -185,6 +185,7 @@ void CSIService::begin(const char* ssid, const char* password,
     snprintf(_tPlcr,       sizeof(_tPlcr),       "%s/plcr",            _topicPrefix);
     snprintf(_tMlProb,     sizeof(_tMlProb),     "%s/ml_probability",  _topicPrefix);
     snprintf(_tMlMotion,   sizeof(_tMlMotion),   "%s/ml_motion",       _topicPrefix);
+    snprintf(_tShadow,     sizeof(_tShadow),     "%s/model/shadow",    _topicPrefix);
 
     // Allocate turbulence buffer
     _turbBuffer = new (std::nothrow) float[_windowSize];
@@ -787,13 +788,20 @@ void CSIService::_processCSI(wifi_csi_info_t* info) {
 // ============================================================================
 
 void CSIService::_updateMotionState() {
-    if (_bufCount < _windowSize) return;
+    if (_bufCount < _windowSize) {
+        // Not enough samples yet — record an (invalid) trace so /api/csi/decision
+        // reports why no decision is being made rather than stale data.
+        _recordDecisionTrace(false, false, _motionState, false, 0, 0, getEffectiveThreshold());
+        return;
+    }
 
     // csi4: effective threshold is max of user-set and adaptive-P95.
     float effThr = _threshold;
     if (_adaptiveThresholdEnabled && _adaptiveThreshold > effThr) {
         effThr = _adaptiveThreshold;
     }
+
+    bool prevMotion = _motionState;  // P1.3: detect motion edges for the event ring
 
     bool rawMotion;
     if (!_motionState) {
@@ -830,6 +838,7 @@ void CSIService::_updateMotionState() {
 
         if (breathHold && _breathHoldCount < BREATH_HOLD_MAX) {
             _breathHoldCount++;
+            _recordDecisionTrace(true, rawMotion, _motionState, true, motionCount, _smoothCount, effThr);
             return; // Keep MOTION state, don't update
         }
     }
@@ -841,6 +850,26 @@ void CSIService::_updateMotionState() {
         _motionState = false;
         _breathHoldCount = 0;
     }
+
+    _recordDecisionTrace(true, rawMotion, _motionState, false, motionCount, _smoothCount, effThr);
+
+    // P1.3: log motion edges and variance spikes to the diagnostic ring.
+    if (_motionState != prevMotion) {
+        _pushEvent(_motionState ? CsiEventType::MOTION_ENTER : CsiEventType::MOTION_EXIT, effThr);
+    } else if (_runningVariance > SPIKE_VARIANCE_FACTOR * effThr) {
+        uint32_t nowMs = millis();
+        if (_lastSpikeEventMs == 0 || (nowMs - _lastSpikeEventMs) >= SPIKE_EVENT_MIN_GAP_MS) {
+            _lastSpikeEventMs = nowMs;
+            _pushEvent(CsiEventType::VARIANCE_SPIKE, effThr);
+        }
+    }
+
+    // P1.1: shadow-evaluate the candidate in parallel (diagnostic only, must run
+    // AFTER the active decision so disagreements compare against the real verdict).
+    _updateShadow(effThr);
+
+    // P1.4: log CSI-intrinsic health transitions to the diagnostic ring.
+    _updateHealthEvents(effThr);
 
     // Update idle baselines when idle (EMA)
     if (!_motionState && _bufCount >= _windowSize) {
@@ -855,6 +884,119 @@ void CSIService::_updateMotionState() {
             _idleMeanPhase = alpha * _lastPhaseTurb + (1.0f - alpha) * _idleMeanPhase;
             _idleAmpBaseline = alpha * _lastAmpSum + (1.0f - alpha) * _idleAmpBaseline;
         }
+    }
+}
+
+// P1.2: capture a read-only snapshot of the last motion decision. Purely
+// diagnostic — never influences detection. Called at every exit of
+// _updateMotionState() so /api/csi/decision explains the current verdict.
+void CSIService::_recordDecisionTrace(bool bufferReady, bool rawMotion, bool finalMotion,
+                                      bool breathHold, uint8_t votes, uint8_t window, float effThr) {
+    CsiDecisionTrace& t = _decisionTrace;
+    t.valid               = bufferReady;
+    t.decision            = finalMotion;
+    t.reason              = csiClassifyDecision(bufferReady, rawMotion, finalMotion, breathHold);
+    t.variance            = _runningVariance;
+    t.configuredThreshold = _threshold;
+    t.adaptiveThreshold   = _adaptiveThresholdEnabled ? _adaptiveThreshold : 0.0f;
+    t.effectiveThreshold  = effThr;
+    t.hysteresisThreshold = effThr * _hysteresis;
+    t.rawMotion           = rawMotion;
+    t.smoothingVotes      = votes;
+    t.smoothingWindow     = window;
+    t.enterVotes          = SMOOTH_ENTER;
+    t.exitVotes           = SMOOTH_EXIT;
+    t.breathingHold       = breathHold;
+    t.breathHoldCount     = _breathHoldCount;
+    t.mlMotion            = _mlMotion;
+    t.mlProbability       = _mlProbability;
+    t.radarPresent        = _radarPresent;
+    t.activeGeneration    = _modelMgr.active().generation;
+    t.uptimeMs            = millis();
+}
+
+// P1.3: append a diagnostic event snapshot to the RAM ring. Shadow fields are
+// filled for MODEL_DISAGREEMENT events (P1.1); defaulted otherwise.
+void CSIService::_pushEvent(CsiEventType type, float effThr, float shadowThr,
+                            bool shadowMotion, uint16_t healthFlags) {
+    CsiEvent e;
+    e.uptimeMs           = millis();
+    e.type               = type;
+    e.variance           = _runningVariance;
+    e.effectiveThreshold = effThr;
+    e.shadowThreshold    = shadowThr;
+    e.activeMotion       = _motionState;
+    e.shadowMotion       = shadowMotion;
+    e.radarPresent       = _radarPresent;
+    e.mlProbability      = _mlProbability;
+    e.rssi               = (int16_t)getWifiRSSI();
+    e.pps                = _packetRate;
+    e.healthFlags        = healthFlags;
+    _events.push(e);
+}
+
+// P1.4: CSI-intrinsic health flag subset. Radar and MQTT are external subsystems
+// CSIService cannot see, so they are marked benign here (radarAvailable=true,
+// mqttExpected=false) — the full picture (incl. radar/mqtt) is assembled in the
+// /api/csi/health handler. This subset is what the sensor itself can log as it
+// changes over time.
+uint16_t CSIService::_computeCsiHealthFlags() const {
+    CsiHealthInputs in;
+    in.csiActive          = _active;
+    in.htLtfSeen          = _htLtfSeen;
+    in.packetRate         = _packetRate;
+    in.packetRateFloorPps = 5.0f;
+    in.packetRateUnstable = isPacketRateUnstable();
+    in.wifiRoamedRecently = hasRoamedWithin(60000);
+    const CsiSiteModel& a = _modelMgr.active();
+    in.modelValid         = a.valid;
+    uint32_t ep = (uint32_t)time(nullptr);
+    in.clockValid         = ep > 1600000000u;
+    in.modelStale         = in.clockValid && a.valid && a.createdAt > 0 && ep > a.createdAt &&
+                            (ep - a.createdAt) > (30u * 24u * 3600u);
+    uint32_t learnTotal   = _siteLearnAccepted + _siteLearnRejectedMotion + _siteLearnRejectedRadar;
+    in.learningContaminated = _siteLearningActive && learnTotal >= 50 && learningRejectRatio() > 0.5f;
+    in.radarAvailable     = true;    // external — excluded from the CSI-intrinsic subset
+    in.mqttExpected       = false;   // external — excluded from the CSI-intrinsic subset
+    in.mqttConnected      = true;
+    return csiHealthReasons(in);
+}
+
+// P1.4: log a HEALTH_CHANGE event when the CSI-intrinsic health flags change.
+void CSIService::_updateHealthEvents(float effThr) {
+    uint16_t hf = _computeCsiHealthFlags();
+    if (hf != _lastHealthFlags) {
+        _lastHealthFlags = hf;
+        _pushEvent(CsiEventType::HEALTH_CHANGE, effThr, 0.0f, false, hf);
+    }
+}
+
+// P1.1: run the candidate model's verdict in parallel with the active model.
+// DIAGNOSTIC ONLY — reads _runningVariance/_hysteresis and writes only shadow
+// members, so it can never mutate active detection state. Counters reset when
+// the candidate changes (finalize/apply/rollback/clear) so they always belong
+// to the candidate currently under evaluation.
+void CSIService::_updateShadow(float effThr) {
+    if (!hasCandidateModel()) { _shadowMotion = false; return; }
+
+    uint32_t cg = modelCandidate().generation;
+    if (cg != _shadowCandGen) {
+        _shadow.reset();
+        _shadowAgree = 0;
+        _shadowDisagree = 0;
+        _shadowMotion = false;
+        _shadowCandGen = cg;
+    }
+
+    float shThr = modelCandidate().threshold;
+    bool sh = _shadow.update(_runningVariance, shThr, _hysteresis);
+    _shadowMotion = sh;
+
+    if (sh == _motionState) {
+        _shadowAgree++;
+    } else {
+        _shadowDisagree++;
+        _pushEvent(CsiEventType::MODEL_DISAGREEMENT, effThr, shThr, sh);
     }
 }
 
@@ -1069,6 +1211,22 @@ void CSIService::_publishMQTT() {
         }
     }
 
+    // P1.1: retained shadow state — DIAGNOSTIC ONLY, explicitly marked so no
+    // automation ever wires it to the alarm. Published on shadow flip or the
+    // heartbeat, and only while a candidate is under evaluation.
+    if (hasCandidateModel() && (force || _shadowMotion != _pubShadowMotion)) {
+        char js[256];
+        snprintf(js, sizeof(js),
+            "{\"note\":\"SHADOW - NO ALARM EFFECT\",\"active\":%s,\"shadow\":%s,"
+            "\"agree\":%lu,\"disagree\":%lu,\"variance\":%.5f,"
+            "\"active_thr\":%.5f,\"shadow_thr\":%.5f,\"candidate_gen\":%lu}",
+            _motionState ? "true" : "false", _shadowMotion ? "true" : "false",
+            (unsigned long)_shadowAgree, (unsigned long)_shadowDisagree,
+            _runningVariance, getEffectiveThreshold(), modelCandidate().threshold,
+            (unsigned long)modelCandidate().generation);
+        if (_mqtt->publish(_tShadow, js, true)) _pubShadowMotion = _shadowMotion;
+    }
+
     _pubValid = true;
 }
 
@@ -1149,6 +1307,9 @@ void CSIService::update() {
     if (now - _lastPublishMs >= _publishIntervalMs) {
         uint32_t windowMs = now - _lastPublishMs;
         if (windowMs > 0) _packetRate = (float)_windowPackets * 1000.0f / (float)windowMs;
+        // P1.4 health: slow EMA of the capture rate for the stability check.
+        _packetRateEma = (_packetRateEma <= 0.0f) ? _packetRate
+                                                  : 0.2f * _packetRate + 0.8f * _packetRateEma;
         _lastPublishMs = now;
         _updateMotionState();
         _runMlInference();
@@ -1213,6 +1374,7 @@ void CSIService::update() {
                         curBSSID[0], curBSSID[1], curBSSID[2], curBSSID[3], curBSSID[4], curBSSID[5]);
                     memcpy(_lastBSSID, curBSSID, 6);
                     _bssidChangeCount++;
+                    _lastBssidChangeMs = millis();  // P1.4 health: mark recent roam
                     resetIdleBaseline();
                     resetAutoCalibration();
                     // Also drop adaptive-P95 buffer: old noise stats no longer valid.
@@ -1737,5 +1899,22 @@ CsiModelOp CSIService::rollbackSiteModel() {
 CsiModelOp CSIService::clearCandidateModel() {
     CsiModelOp r = _modelMgr.clearCandidate();
     if (r == CsiModelOp::OK) _publishModelState("candidate_cleared");
+    return r;
+}
+
+// P1.5: land an imported model as CANDIDATE only. A fresh generation makes it
+// newer than active (apply_required), and finalizeCandidate re-seals+validates,
+// so a malformed import fails here and never reaches the active slot.
+CsiModelOp CSIService::importCandidateModel(const CsiSiteModel& src) {
+    CsiSiteModel cand = src;
+    cand.generation = _modelMgr.nextGeneration();
+    uint32_t ep = (uint32_t)time(nullptr);
+    if (ep > 1600000000u) cand.createdAt = ep;   // stamp import time when clock is synced
+    CsiModelOp r = _modelMgr.finalizeCandidate(cand);
+    if (r == CsiModelOp::OK) {
+        _publishModelState("candidate_imported");
+        Serial.printf("[CSI] Imported candidate gen=%lu thr=%.5f (apply required)\n",
+                      (unsigned long)_modelMgr.candidate().generation, _modelMgr.candidate().threshold);
+    }
     return r;
 }

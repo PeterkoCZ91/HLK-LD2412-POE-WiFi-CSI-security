@@ -292,6 +292,94 @@ def check_site_learning(ip, auth, timeout):
             pass
 
 
+def check_csi_diagnostics(ip, auth, timeout):
+    """P1 CSI diagnostics contract: decision / health / events / shadow / export
+    (Basic auth), plus the import safety guard (slot=active must be rejected)."""
+    # decision trace
+    try:
+        _, body = http_get(ip, "/api/csi/decision", auth=auth, timeout=timeout)
+        d = json.loads(body)
+        if "reason" in d and "effective_threshold" in d:
+            record("csi_decision", "PASS", f"reason={d['reason']} valid={d.get('valid')}")
+        else:
+            record("csi_decision", "FAIL", "missing reason/effective_threshold")
+    except urllib.error.HTTPError as exc:
+        record("csi_decision", "WARN" if exc.code in (404, 503) else "FAIL",
+               f"HTTP {exc.code} (non-CSI build?)" if exc.code in (404, 503) else f"HTTP {exc.code}")
+    except Exception as exc:
+        record("csi_decision", "FAIL", str(exc))
+
+    # health reasons + score
+    try:
+        _, body = http_get(ip, "/api/csi/health", auth=auth, timeout=timeout)
+        d = json.loads(body)
+        if isinstance(d.get("reasons"), list) and isinstance(d.get("score"), int):
+            record("csi_health", "PASS", f"score={d['score']} reasons={d['reasons']}")
+        else:
+            record("csi_health", "FAIL", "missing score/reasons list")
+    except urllib.error.HTTPError as exc:
+        record("csi_health", "WARN" if exc.code in (404, 503) else "FAIL", f"HTTP {exc.code}")
+    except Exception as exc:
+        record("csi_health", "FAIL", str(exc))
+
+    # event ring
+    try:
+        _, body = http_get(ip, "/api/csi/events?limit=5", auth=auth, timeout=timeout)
+        d = json.loads(body)
+        if "capacity" in d and isinstance(d.get("events"), list):
+            record("csi_events", "PASS", f"count={d.get('count')} cap={d['capacity']} returned={d.get('returned')}")
+        else:
+            record("csi_events", "FAIL", "missing capacity/events list")
+    except urllib.error.HTTPError as exc:
+        record("csi_events", "WARN" if exc.code in (404, 503) else "FAIL", f"HTTP {exc.code}")
+    except Exception as exc:
+        record("csi_events", "FAIL", str(exc))
+
+    # shadow — must be marked diagnostic-only
+    try:
+        _, body = http_get(ip, "/api/csi/shadow", auth=auth, timeout=timeout)
+        d = json.loads(body)
+        if d.get("note") == "SHADOW - NO ALARM EFFECT":
+            record("csi_shadow", "PASS", f"active={d.get('active')} agree/dis={d.get('agree')}/{d.get('disagree')}")
+        else:
+            record("csi_shadow", "FAIL", f"missing/incorrect NO-ALARM-EFFECT marker: {d.get('note')!r}")
+    except urllib.error.HTTPError as exc:
+        record("csi_shadow", "WARN" if exc.code in (404, 503) else "FAIL", f"HTTP {exc.code}")
+    except Exception as exc:
+        record("csi_shadow", "FAIL", str(exc))
+
+    # export active — must carry an anonymized hash, never a raw MAC / credentials
+    try:
+        _, body = http_get(ip, "/api/csi/site_model/export?slot=active", auth=auth, timeout=timeout)
+        d = json.loads(body)
+        leaked = [k for k in ("bssid", "password", "pass", "ssid") if k in d]
+        if "bssid_hash" in d and not leaked:
+            record("csi_export", "PASS", f"gen={d.get('generation')} bssid_hash present, no raw fields")
+        else:
+            record("csi_export", "FAIL", f"bssid_hash missing or leaked fields {leaked}")
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            record("csi_export", "WARN", "no active model yet (404)")
+        else:
+            record("csi_export", "WARN" if exc.code == 503 else "FAIL", f"HTTP {exc.code}")
+    except Exception as exc:
+        record("csi_export", "FAIL", str(exc))
+
+    # import safety guard — writing the active slot must be refused
+    try:
+        http_post(ip, "/api/csi/site_model/import?slot=active", auth=auth, timeout=timeout)
+        record("csi_import_guard", "FAIL", "import to slot=active was NOT rejected")
+    except urllib.error.HTTPError as exc:
+        if exc.code == 400:
+            record("csi_import_guard", "PASS", "import to slot=active rejected (400)")
+        elif exc.code in (404, 503):
+            record("csi_import_guard", "WARN", f"HTTP {exc.code} (non-CSI build?)")
+        else:
+            record("csi_import_guard", "FAIL", f"unexpected HTTP {exc.code} (expected 400)")
+    except Exception as exc:
+        record("csi_import_guard", "FAIL", str(exc))
+
+
 def check_metrics(ip, auth, timeout):
     """GET /metrics → Prometheus text containing 'poe2412_' metric prefix."""
     try:
@@ -325,6 +413,8 @@ def main():
                         help="Skip the alarm FSM cycle check")
     parser.add_argument("--skip-learning", action="store_true",
                         help="Skip the CSI site-learning API contract check")
+    parser.add_argument("--skip-diagnostics", action="store_true",
+                        help="Skip the P1 CSI diagnostics contract checks")
     parser.add_argument("--timeout", type=float, default=8.0,
                         help="Per-request timeout in seconds (default: 8)")
     args = parser.parse_args()
@@ -349,6 +439,11 @@ def main():
         record("site_learning", "SKIP", "--skip-learning flag set")
     else:
         check_site_learning(args.ip, auth, args.timeout)
+
+    if args.skip_diagnostics:
+        record("csi_diagnostics", "SKIP", "--skip-diagnostics flag set")
+    else:
+        check_csi_diagnostics(args.ip, auth, args.timeout)
 
     check_metrics(args.ip, auth, args.timeout)
 

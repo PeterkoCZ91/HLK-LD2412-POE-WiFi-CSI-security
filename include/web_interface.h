@@ -1076,6 +1076,17 @@ const char index_html[] PROGMEM = R"rawliteral(
               </div>
             </div>
 
+            <div class="section-title" data-collapsed style="margin-top:14px">CSI DIAGNOSTIKA (P1 · read-only)</div>
+            <div style="font-size:0.85rem">
+              <div class="stat-row"><span>Health</span><span id="csi_dg_health">—</span></div>
+              <div class="stat-row"><span>Last decision</span><span id="csi_dg_decision">—</span></div>
+              <div class="stat-row"><span>Shadow (candidate)</span><span id="csi_dg_shadow">—</span></div>
+              <div class="stat-row"><span>Event ring</span><span id="csi_dg_events">—</span></div>
+              <div style="font-size:0.75rem; color:#777; margin-top:8px">
+                Read-only diagnostics. <b>Shadow</b> runs the candidate model in parallel — <b>NO ALARM EFFECT</b>. Full detail: <code>/api/csi/{decision,health,events,shadow}</code>.
+              </div>
+            </div>
+
             <div class="section-title" data-collapsed style="margin-top:14px" data-i18n="ml_mlp">ML (MLP 17→18→9→1)</div>
             <div class="stat-row">
                 <span data-i18n="ml_enabled_lbl">ML povoleno</span>
@@ -1414,6 +1425,7 @@ function tab(n) {
 function loadCSIConfig() {
     loadCsiWifi();
     csiRenderSiteModel();
+    csiRenderDiagnostics();
     fetch('/api/csi').then(r=>r.json()).then(d => {
         // Compiled-in check
         $('csi_compiled_warn').style.display = d.compiled ? 'none' : 'block';
@@ -1790,6 +1802,29 @@ function csiRenderSiteModel() {
         else if (d.apply_required) note = '🟡 Candidate ready — not yet affecting the alarm. Review and Apply.';
         else if (a && a.valid) note = '🟢 Detection on active gen ' + a.generation + '.';
         $('csi_sm_note').innerText = note;
+    }).catch(()=>{});
+}
+// P1 read-only diagnostics: health / decision / shadow / event ring.
+function csiRenderDiagnostics() {
+    api('csi/health').then(r=>r.json()).then(d => {
+        let el = $('csi_dg_health');
+        el.innerText = 'score ' + d.score + ' · ' + ((d.reasons||[]).join(', ') || '—');
+        el.style.color = d.healthy ? '#4caf50' : (d.score >= 60 ? '#ffb300' : '#cf6679');
+    }).catch(()=>{});
+    api('csi/decision').then(r=>r.json()).then(d => {
+        if (!d.valid) { $('csi_dg_decision').innerText = d.reason || '—'; return; }
+        $('csi_dg_decision').innerText = (d.decision ? 'MOTION' : 'idle') + ' · ' + d.reason;
+    }).catch(()=>{});
+    api('csi/shadow').then(r=>r.json()).then(d => {
+        let el = $('csi_dg_shadow');
+        if (!d.active) { el.innerText = 'no candidate'; el.style.color=''; return; }
+        let tot = (d.agree||0) + (d.disagree||0);
+        let pct = tot ? (d.agree/tot*100).toFixed(1) : '—';
+        el.innerText = 'agree ' + d.agree + ' / dis ' + d.disagree + ' (' + pct + '%) — NO ALARM EFFECT';
+        el.style.color = d.disagree > 0 ? '#ffb300' : '';
+    }).catch(()=>{});
+    api('csi/events?limit=1').then(r=>r.json()).then(d => {
+        $('csi_dg_events').innerText = d.count + '/' + d.capacity + ' · last seq ' + d.last_seq;
     }).catch(()=>{});
 }
 function csiApplyModel() {

@@ -2,6 +2,71 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.3.0-poe-wifi] - 2026-07-11
+
+CSI diagnostics release (návrh sekce 17, priority **P1**). Five read-only
+forensics features layered on the v5.2.0 active/candidate/previous model
+manager. They answer *"why didn't the alarm fire?"* — and *"is the sensor even
+healthy?"* — from the device itself, without permanent external second-by-second
+logging. Nothing here changes detection, alarm, MQTT control topics or PDU
+behavior; every feature is diagnostic and additive.
+
+### Added
+
+- **P1.2 — Decision trace.** `GET /api/csi/decision` returns why the last motion
+  verdict was reached: a single dominant `reason`
+  (`variance_below/above_effective_threshold`, `smoothing_enter/exit_pending`,
+  `breathing_hold`, `insufficient_samples`) plus the supporting values —
+  variance, configured/adaptive/effective/hysteresis thresholds, smoothing
+  votes, breathing-hold count, ML motion/probability, radar presence, active
+  generation. A pure header-only classifier (`CsiDecisionTrace.h`) maps the
+  intermediate booleans of the detector to the reason without re-running the
+  thresholding math. The frontend / Home Assistant no longer has to guess which
+  part of the algorithm decided.
+
+- **P1.4 — Health reason flags.** `GET /api/csi/health` reports concrete reasons
+  and a weighted 0–100 score instead of a bare boolean: `no_ht_ltf`,
+  `packet_rate_low`, `packet_rate_unstable`, `wifi_roamed`, `model_missing`,
+  `model_stale`, `learning_contaminated`, `radar_unavailable`,
+  `mqtt_disconnected`, `clock_invalid`. `motion=false` no longer masquerades as a
+  healthy sensor — a starved link, a missing model, or a floor-pinned threshold
+  now surface explicitly. Pure classifier in `CsiHealthReasons.h`.
+
+- **P1.3 — RAM diagnostic event ring.** `GET /api/csi/events?limit=100&after_seq=N`
+  and `DELETE /api/csi/events`. A fixed-capacity ring (256 events, ~11 KB RAM,
+  `CsiEventRing.h`) records only motion edges, rate-limited variance spikes and
+  model disagreements — never per-second samples, never flash. Sequence numbers
+  stay monotonic across clears so `after_seq` pagination is stable.
+
+- **P1.1 — Shadow evaluation.** `GET /api/csi/shadow` and the retained MQTT topic
+  `…/csi/model/shadow` publish a candidate model's verdict computed **in parallel**
+  with the active model. `CsiShadowDetector` mirrors the variance/smoothing/
+  hysteresis path with its own state, driven by the same per-tick variance but
+  the candidate threshold — so feeding it can never mutate active detection.
+  Agree/disagree counters reset per candidate generation; disagreements log to
+  the event ring. Both surfaces are marked **`SHADOW - NO ALARM EFFECT`** and are
+  never wired to alarm or PDU, letting a candidate be observed 24–72 h before apply.
+
+- **P1.5 — Model export/import.** `GET /api/csi/site_model/export?slot=…`
+  serializes any slot to portable, validated JSON (schema, algorithm-compat
+  version, model fields, generation, anonymized BSSID fingerprint, CRC) — never
+  the raw MAC or credentials. `POST /api/csi/site_model/import?slot=candidate`
+  lands a model as a **candidate only**: it is assigned a fresh generation and
+  re-validated/sealed, so a malformed or below-floor model fails with **422** and
+  can never reach the active slot. Applying stays an explicit, separate step;
+  `slot=active` and incompatible `algo_compat` are rejected.
+
+### Notes
+
+- 42 new native unit tests (`test_csi_decision` 8, `test_csi_health` 10,
+  `test_csi_events` 10, `test_csi_shadow` 7, `test_csi_export` 7); full suite 127/127.
+- Read-only diagnostics panel in the dashboard CSI tab; `smoke_test.py` gained a
+  `check_csi_diagnostics` contract check for all five endpoints + import guard.
+- `HEALTH_CHANGE` events are emitted from the detector tick (CSI-intrinsic health
+  subset) and decoded to named reasons in `/api/csi/events`.
+- No NVS schema change. No behavior change to detection, alarm, or existing MQTT
+  control topics — the shadow topic is new and diagnostic-only.
+
 ## [5.2.0-poe-wifi] - 2026-07-11
 
 CSI site-model lifecycle release. Long-term site learning gains a proper
