@@ -3,14 +3,19 @@
 [![PlatformIO](https://img.shields.io/badge/PlatformIO-ESP32-orange?logo=platformio)](https://platformio.org/)
 [![ESP32](https://img.shields.io/badge/MCU-ESP32--WROOM--32-blue?logo=espressif)](https://www.espressif.com/)
 [![License](https://img.shields.io/badge/License-GPL--3.0-blue)](LICENSE)
-[![Version](https://img.shields.io/badge/Version-5.2.0--poe--wifi-blue)]()
+[![Version](https://img.shields.io/badge/Version-5.3.1--poe--wifi-blue)]()
 [![Discussions](https://img.shields.io/badge/GitHub-Discussions-purple?logo=github)](https://github.com/PeterkoCZ91/HLK-LD2412-POE-WiFi-CSI-security/discussions)
 
 **Dual-sensor intrusion detection system** — ESP32 + HLK-LD2412 24 GHz mmWave radar + **WiFi CSI (Channel State Information) passive motion detection** over **wired Ethernet with Power over Ethernet**. Full alarm state machine, zone management, Home Assistant integration, Telegram bot, and a dark-mode web dashboard. No cloud required.
 
 WiFi CSI detection algorithms based on [ESPectre](https://github.com/francescopace/espectre) by Francesco Pace (GPLv3).
 
+> [!NOTE]
+> **v5.4.0** — link-relative CSI threshold floor: the old fixed 0.005 floor sat above real walking peaks on strong WiFi links, masking motion by design. The threshold now floors at 3× the link's own learned quiet baseline instead, and the adaptive P95 estimate can lower the effective threshold instead of only raising it. Also fixes ML motion votes saturating on packet-starved links, corrects the alarm forensic `var_ratio` to divide by the effective (not the legacy static) threshold, and switches the CSI traffic generator's default target from UDP:7 to ICMP (some ISP routers throttle UDP:7 as a DDoS heuristic). Adds a runtime NBVI toggle (`POST /api/csi?nbvi=0|1`) and a planned-maintenance MQTT signal so HA can tell a planned reboot/OTA from a real offline/tamper event. Validated across a multi-day lab soak. See [CHANGELOG](CHANGELOG.md#540-poe-wifi---2026-07-15).
+
 > [!TIP]
+> **v5.3.1** — first-night fixes for the v5.3.0 diagnostic event ring: `HEALTH_CHANGE` events are now debounced (a boundary-oscillating `packet_rate_unstable` flag no longer floods the 256-slot event ring and evicts real motion edges), and health is now evaluated even when the CSI window is empty, so a starved link is reported instead of logging nothing. See [CHANGELOG](CHANGELOG.md).
+>
 > **v5.3.0** — CSI diagnostics (P1): five read-only forensics features that answer *"why didn't the alarm fire?"* without external second-by-second logging. **Decision trace** (`/api/csi/decision`) explains the last motion verdict; **health reasons** (`/api/csi/health`) tell a quiet room from a starved link (motion=false ≠ healthy); a **RAM event ring** (`/api/csi/events`) keeps the last 256 edges/spikes/disagreements; **shadow evaluation** (`/api/csi/shadow`) runs a candidate model in parallel with **no alarm effect** so it can be watched 24–72 h before apply; and **model export/import** (`/api/csi/site_model/export|import`) moves a validated model between nodes (import lands as candidate only). See [CHANGELOG](CHANGELOG.md).
 >
 > **v5.2.0** — CSI site-model lifecycle: long-term site learning now finalizes to a **candidate** instead of auto-activating — review it, then `apply` (keeps the old model for one-click `rollback`). New `/api/csi/site_model/*` API + dashboard panel + quality report (p50–p99, clamp reason). Plus three hardening features: a **pre-arm health self-test** (warns if you arm into a blind state — radar/CSI/model/clock/MQTT), **CSI-side tamper detection** (packet collapse / frozen capture, not just radar), and a **confidence fingerprint** on every logged event (which sensors fired it, how confident). See [CHANGELOG](CHANGELOG.md).
@@ -368,6 +373,22 @@ Three independent signals feed the alarm engine. The MQTT topic `security/<devic
 
 A short fusion-source buffer prevents the field from flapping on boundary frames (between radar-only and ML-only branches) — this is what makes the published source stable enough for HA automations.
 
+### Planned-Maintenance MQTT Signal
+
+`security/<device>/maintenance` (retained, `"1"`/`"0"`) is published `"1"` right
+before a planned OTA update or manual `/api/restart`, and `"0"` once the update
+finishes or the device reconnects afterward. Use it in HA automations to
+suppress "device offline while armed" alerts during an update you triggered
+yourself — without it, a planned OTA reboot looks identical to a crash, power
+loss, or sensor tamper on the shared `security/<device>/availability` topic.
+
+**Firmware does not bound how long `"1"` can stay retained.** If a flash fails
+catastrophically and the device never reconnects, nothing clears the flag.
+Any HA automation consuming this topic **must** implement its own timeout
+(e.g. a `timer` helper started on `"1"`, auto-expiring after 5-10 minutes)
+rather than trusting the retained value indefinitely — otherwise a failed
+update silently disables your offline/tamper alerting.
+
 ### Site Learning Workflow (CSI)
 
 **Site learning** builds a long-term quiet-room baseline that the CSI detector uses to set its motion threshold. It is the single most important step for low false-positive operation in your specific environment.
@@ -587,7 +608,7 @@ All endpoints require Digest auth except where noted.
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| GET/POST | `/api/csi` | CSI metrics, config, diagnostics (incl. site learning, MLP, NBVI, adaptive threshold, `ht_ltf_seen`) |
+| GET/POST | `/api/csi` | CSI metrics, config, diagnostics (incl. site learning, MLP, NBVI, adaptive threshold, `ht_ltf_seen`); `POST ?nbvi=0\|1` toggles NBVI subcarrier auto-selection at runtime (diagnostic/A-B use, not persisted across reboot) |
 | POST | `/api/csi/calibrate` | Auto-calibrate CSI threshold |
 | POST | `/api/csi/site_learning` | Start long-term site-learning baseline (`?duration_s=...` or `?duration_h=...`, default 48 h); stop with `?stop=1`; discard model with `?clear_model=1`; `action=start\|stop` aliases accepted, other `action` values → 400 |
 | GET | `/api/csi/site_model` | Active/candidate/previous model slots + runtime generation + `apply_required` |
@@ -745,7 +766,7 @@ The HLK-LD2412 sensor has several known firmware issues:
 
 - WiFi CSI requires a 2.4 GHz **802.11n** AP in range — 5 GHz only networks and WiFi 6 (802.11ax) APs won't work (see [AP requirements](#wifi-access-point-requirements-for-csi))
 - ESP32 classic doesn't support AGC lock — CV normalization is used as fallback (less sensitive than locked gain)
-- CSI packet rate depends on WiFi channel conditions — DNS traffic generator compensates but may not reach full 100 pps in congested environments
+- CSI packet rate depends on WiFi channel conditions — the traffic generator (ICMP echo by default since v5.4.0, UDP:7/53 configurable) compensates but may not reach full 100 pps in congested environments. Some ISP-provided routers throttle/filter unsolicited UDP:7 as a DDoS heuristic — switch to ICMP if `packet_rate_low` persists despite good RSSI.
 - STBC doubled packets from some APs are handled but may introduce slight amplitude averaging
 - **Dual-homing (CSI WiFi on the same subnet as Ethernet) used to make espota OTA flaky** (intermittent `No Answer to our Authentication` / `Error Uploading` on a flat home LAN). **Handled automatically since v5.0.9** — the espota maintenance window single-homes the device for the flash; no VLAN and no manual steps needed. Background, diagnosis, and the manual fallback for older firmware: [docs/OTA_OPERATIONS.md → Dual-Homing](docs/OTA_OPERATIONS.md#espota-fails-when-csi-wifi-shares-the-ethernet-subnet-dual-homing)
 
@@ -775,7 +796,7 @@ The HLK-LD2412 sensor has several known firmware issues:
 - [x] Multi-sensor mesh verification — **v4.5.0**
 - [x] NBVI subcarrier auto-selection — **v5.0.0**
 - [x] MLP neural network detector (17-feature, F1=0.852) — **v5.0.0**
-- [x] Adaptive P95 threshold (300-sample rolling, raises only) — **v5.0.0**
+- [x] Adaptive P95 threshold (300-sample rolling) — **v5.0.0** (raised only; **v5.4.0** lets it lower the effective threshold too, see [CHANGELOG](CHANGELOG.md#540-poe-wifi---2026-07-15))
 - [x] Auto-recalibration after quiet period — **v5.0.0**
 - [x] Stuck-in-motion detection (auto threshold raise after 24h) — **v5.0.0**
 - [x] Site learning (long-term quiet baseline + EMA refresh) — **v5.0.0**
@@ -886,6 +907,11 @@ A: Yes. Each device gets a unique `device_id` (auto-derived from MAC) so HA disc
 | v5.0.17-poe-wifi | **Dashboard organization:** Basic tab reorganized — expert radar fields (gate Min/Max with cm readout, hold time, diagnostics, BT warning, calibration) moved into a collapsed radar-only "Advanced radar configuration" section, leaving device name, sensitivity and LED on top; placeholder localization via new `data-i18n-ph` mechanism (12 cs/en keys); CSI metric labels humanized — human description first, technical term in parentheses (composite, variance, exit multiplier, DSER/PLCR expansions in ML help). |
 | v5.1.0-poe-wifi | **ESP-IDF 5.5 / Arduino 3.x migration:** firmware now builds on the community pioarduino platform (Arduino-ESP32 3.3.9 / ESP-IDF 5.5.4) via new `esp32_poe_csi_idf5` / `esp32_poe_csi_idf5_8mb` envs **alongside** the legacy espressif32@6.9.0 stack, with `ETH.begin()` / `esp_task_wdt_init()` ported behind `ESP_ARDUINO_VERSION_MAJOR` guards. **Fusion/MQTT/radar fixes** hardened on a live CSI-only node: stale-CSI fusion gate (radar-only fallback on CSI starvation), radar un-veto on the armed path, radar recovery give-up latch, MQTT fail-fast on half-open sockets (IDF 5 watchdog fix), IDF 5 watchdog hygiene (`wdtResetSafe()`), and FUSION DBG rate-limit. **Telemetry diet:** change-gated CSI MQTT metrics (~720 → ~50 msg/min), SSE queue cap 32 → 8, default entry delay 30 s → 0. New stdlib-only `tools/smoke_test.py` (8 ordered live-device checks). |
 | v5.1.1-poe-wifi | **Site-learning API fix:** `POST /api/csi/site_learning` rejected-unknown-action guard — the handler never read the `action` parameter documented since v5.0.0, so calls like `?action=stop` or `?action=status` fell through to the default branch and silently **started** a 48 h learning run; `action=start|stop` are now accepted as aliases and any other `action` value returns `400 Bad Request`. README/FIRST_BOOT API docs corrected to the real parameters (`duration_s`/`duration_h`, `stop=1`, `clear_model=1`, status via `GET /api/csi`). `tools/smoke_test.py` gained a `site_learning` contract check (3 sub-checks, `--skip-learning` flag). |
+| v5.2.0-poe-wifi | **CSI site-model lifecycle:** long-term site learning now finalizes to a **candidate**, not the active model — an operator reviews and `apply`s it (keeps the old model as `previous` for one-click `rollback`). New three-slot model manager (`CsiModelManager`, checksummed + atomic), `/api/csi/site_model/*` API + dashboard panel, quality report (p50–p99, clamp reason). **Hardening:** pre-arm health self-test (radar/CSI/model/clock/MQTT warnings, never a veto), CSI-side tamper detection (packet collapse / frozen capture), and an event confidence fingerprint (`fusion_src`/`confidence`/`var_ratio`/`ml_prob` on every logged alarm). |
+| v5.3.0-poe-wifi | **CSI diagnostics (P1):** five read-only forensics features answering *"why didn't the alarm fire?"* — decision trace (`/api/csi/decision`), health reasons + 0–100 score (`/api/csi/health`, motion=false ≠ healthy), a 256-slot RAM event ring (`/api/csi/events`), shadow evaluation of a candidate model with **no alarm effect** (`/api/csi/shadow`), and model export/import between nodes (`/api/csi/site_model/export\|import`, import lands as candidate only). Detection, alarm and MQTT control behavior unchanged. |
+| v5.3.1-poe-wifi | **Event-ring first-night fixes:** `HEALTH_CHANGE` events debounced (`CsiHealthDebounce`, ~10-tick hold) so a boundary-oscillating `packet_rate_unstable` flag no longer floods the 256-slot ring and evicts real motion edges; health transitions now evaluated even when the CSI window is empty, so a starved link is reported instead of logging nothing. Detection/alarm/API behavior unchanged. |
+| v5.4.0-poe-wifi | **Detection-sensitivity release.** Link-relative variance floor replaces the fixed `0.005` that masked real walking peaks on strong WiFi links (`csiModelRelativeFloor()`, `max(1e-4, 3× the link's own learned quiet-mean variance)`); adaptive P95 may now *lower* the effective threshold, not only raise it; hysteresis default 0.7 → 0.5. **Fixes:** ML motion vote gated by the packet-rate floor (`csiMlVoteTrusted()` — no more `ml_probability` saturation on a starved link) and alarm forensic `var_ratio` divided by the effective (not the legacy static) threshold. **Traffic gen** defaults to ICMP (ISP routers throttle UDP:7 as a DDoS heuristic). **Added:** runtime NBVI toggle (`POST /api/csi?nbvi=0\|1`) and a retained planned-maintenance MQTT topic (`security/<device>/maintenance`) so HA can distinguish a planned reboot/OTA from a real offline/tamper event. |
+| v5.3.1-poe-wifi | **Event-ring fixes** found running v5.3.0 overnight on two nodes: `HEALTH_CHANGE` events are now debounced (a boundary-oscillating `packet_rate_unstable` flag had been evicting real motion edges from the 256-slot ring), and health is evaluated even when the CSI capture window is empty, so a starved link is reported instead of logging nothing. |
 
 ---
 

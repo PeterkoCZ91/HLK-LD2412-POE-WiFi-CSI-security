@@ -792,14 +792,17 @@ void CSIService::_updateMotionState() {
         // Not enough samples yet — record an (invalid) trace so /api/csi/decision
         // reports why no decision is being made rather than stale data.
         _recordDecisionTrace(false, false, _motionState, false, 0, 0, getEffectiveThreshold());
+        // v5.3.1: health transitions MUST be evaluated even with an empty window —
+        // a starved CSI link (the reason the window is empty) is exactly the state
+        // packet_rate_low exists to record. Overnight starvation on a weak-RSSI
+        // node previously logged nothing at all.
+        _updateHealthEvents(getEffectiveThreshold());
         return;
     }
 
-    // csi4: effective threshold is max of user-set and adaptive-P95.
-    float effThr = _threshold;
-    if (_adaptiveThresholdEnabled && _adaptiveThreshold > effThr) {
-        effThr = _adaptiveThreshold;
-    }
+    // v5.4: adaptive P95 replaces the configured threshold (may lower it),
+    // clamped by the link-relative floor — see getEffectiveThreshold().
+    float effThr = getEffectiveThreshold();
 
     bool prevMotion = _motionState;  // P1.3: detect motion edges for the event ring
 
@@ -962,11 +965,13 @@ uint16_t CSIService::_computeCsiHealthFlags() const {
     return csiHealthReasons(in);
 }
 
-// P1.4: log a HEALTH_CHANGE event when the CSI-intrinsic health flags change.
+// P1.4 (v5.3.1): log a HEALTH_CHANGE event when the CSI-intrinsic health flags
+// change AND hold stable for ~10 ticks. The debounce keeps a boundary-oscillating
+// flag (packet_rate_unstable flipping every tick filled the whole ring overnight)
+// from evicting motion edges; genuine transitions still log exactly once.
 void CSIService::_updateHealthEvents(float effThr) {
     uint16_t hf = _computeCsiHealthFlags();
-    if (hf != _lastHealthFlags) {
-        _lastHealthFlags = hf;
+    if (_healthDebounce.feed(hf)) {
         _pushEvent(CsiEventType::HEALTH_CHANGE, effThr, 0.0f, false, hf);
     }
 }
@@ -1039,8 +1044,9 @@ void CSIService::_continuousLearnRefresh() {
     _learnedStdVar = alpha * dev + (1.0f - alpha) * _learnedStdVar;
 
     float newThr = _learnedMeanVar + 3.0f * _learnedStdVar;
-    // csi10e: hard absolute floor before any other clamp
-    if (newThr < MIN_LEARNED_THRESHOLD) newThr = MIN_LEARNED_THRESHOLD;
+    // v5.4: link-relative floor (was: hard absolute MIN_LEARNED_THRESHOLD)
+    float relFloor = csiModelRelativeFloor(_learnedMeanVar);
+    if (newThr < relFloor) newThr = relFloor;
     if (newThr < _threshold) newThr = _threshold;  // never drop below user-set sensitivity
     _learnedThreshold = newThr;
 
@@ -1063,6 +1069,13 @@ void CSIService::_continuousLearnRefresh() {
 void CSIService::_runMlInference() {
     if (!_mlEnabled || _bufCount < _windowSize) {
         _mlProbability = 0.0f;
+        return;
+    }
+    // v5.4: below the usable capture floor, DSER/turbulence features run on a
+    // packet-count time base stretched far past training — don't trust the vote.
+    if (!csiMlVoteTrusted(_packetRate, ML_MIN_PACKET_RATE_PPS)) {
+        _mlProbability = 0.0f;
+        _mlMotion = false;
         return;
     }
 
@@ -1564,12 +1577,20 @@ float CSIService::getCalibrationProgress() const {
     return (float)elapsed / (float)_calibDurationMs;
 }
 
+// v5.4: adaptive P95 REPLACES the configured threshold once warmed up (it may
+// go lower — that is the fix for the strong-link blindness), clamped by the
+// link-relative floor. Adaptive off/cold -> explicit configured threshold.
 float CSIService::getEffectiveThreshold() const {
-    float eff = _threshold;
-    if (_adaptiveThresholdEnabled && _adaptiveThreshold > eff) {
-        eff = _adaptiveThreshold;
-    }
-    return eff;
+    return csiEffectiveThreshold(_threshold, _adaptiveThreshold,
+                                 _adaptiveThresholdEnabled && _adaptiveThreshold > 0.0f,
+                                 _relativeFloor());
+}
+
+// Link-relative threshold floor: 3x the learned quiet baseline of THIS link
+// (absolute sanity bound when no model exists yet). Replaces the old global
+// MIN_LEARNED_THRESHOLD=0.005, which sat above walking peaks on strong links.
+float CSIService::_relativeFloor() const {
+    return csiModelRelativeFloor(_siteModelReady ? _learnedMeanVar : 0.0f);
 }
 
 uint16_t CSIService::getNbviMask() const {
@@ -1720,9 +1741,11 @@ float CSIService::_computeSiteLearningThreshold() const {
     float maxGuard = _siteLearnMaxVar * 1.15f;
 
     if (candidate < maxGuard) candidate = maxGuard;
-    // csi10e: absolute floor raised 0.001 → 0.005; lower produced hair-trigger
-    // baselines on very quiet production sites (see 2026-04-24 false-alarm report).
-    if (candidate < MIN_LEARNED_THRESHOLD) candidate = MIN_LEARNED_THRESHOLD;
+    // v5.4: link-relative floor. The 2026-04-24 hair-trigger came from a noisy
+    // site where mean variance was high — 3x that mean still blocks it, while a
+    // clean strong link keeps its (much lower) genuine sensitivity.
+    float relFloor = csiModelRelativeFloor(_siteLearnMeanVarAcc);
+    if (candidate < relFloor) candidate = relFloor;
     if (candidate > 100.0f) candidate = 100.0f;
     return candidate;
 }
@@ -1747,7 +1770,10 @@ void CSIService::_finalizeSiteLearning() {
     float maxGuard  = _siteLearnMaxVar * 1.15f;
     CsiClampReason clamp = CsiClampReason::NONE;
     if (candidate < maxGuard)              { candidate = maxGuard; clamp = CsiClampReason::MAXIMUM_LIMIT; }
-    if (candidate < MIN_LEARNED_THRESHOLD) { candidate = MIN_LEARNED_THRESHOLD; clamp = CsiClampReason::ABSOLUTE_FLOOR; }
+    // v5.4: relative floor (3x quiet mean of THIS learning run) — reported as
+    // ABSOLUTE_FLOOR in the quality report when it binds.
+    float relFloor = csiModelRelativeFloor(_siteLearnMeanVarAcc);
+    if (candidate < relFloor)              { candidate = relFloor; clamp = CsiClampReason::ABSOLUTE_FLOOR; }
     if (candidate > 100.0f) candidate = 100.0f;
     float threshold = candidate;
 

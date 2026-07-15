@@ -11,7 +11,33 @@
 #include <cmath>
 
 constexpr uint32_t CSI_MODEL_SCHEMA = 1;
-constexpr float    CSI_MODEL_MIN_THRESHOLD = 0.005f;  // absolute floor (== CSIService MIN_LEARNED_THRESHOLD)
+
+// v5.4: the old absolute floor (0.005) proved to be a blind spot — on strong
+// (CV-compressed) links the whole variance scale sits lower (idle ~5e-5,
+// walking 1e-3..3e-3), so a fixed 0.005 masked real motion by design. The
+// floor is now RELATIVE to the link's own quiet baseline (like the working
+// ESPectre deployment: threshold ~3-5x idle level, per link, no global floor),
+// with a tiny absolute sanity bound underneath.
+constexpr float CSI_MODEL_ABS_MIN_THRESHOLD = 0.0001f;  // sanity bound, never a tuning knob
+constexpr float CSI_MODEL_REL_FLOOR_K       = 3.0f;     // floor = K x learned mean variance
+
+// Site-specific threshold floor: scales with the link's quiet baseline, so a
+// noisy link keeps April-2026-style hair-triggers blocked (mean 2e-3 -> floor
+// 6e-3) while a clean link stays sensitive (mean 5e-5 -> floor 1.5e-4).
+inline float csiModelRelativeFloor(float meanVariance) {
+    float f = CSI_MODEL_REL_FLOOR_K * meanVariance;
+    return (f > CSI_MODEL_ABS_MIN_THRESHOLD) ? f : CSI_MODEL_ABS_MIN_THRESHOLD;
+}
+
+// v5.4 effective detection threshold. When the adaptive P95 estimate is ready
+// it REPLACES the configured threshold (upstream ESPectre model — it may go
+// lower, clamped by the relative floor). Adaptive off/cold -> the explicit
+// configured threshold wins as-is (manual override is the operator's call).
+inline float csiEffectiveThreshold(float configured, float adaptive,
+                                   bool adaptiveReady, float relFloor) {
+    if (!adaptiveReady) return configured;
+    return (adaptive > relFloor) ? adaptive : relFloor;
+}
 
 enum class CsiModelSlot { ACTIVE, CANDIDATE, PREVIOUS };
 
@@ -81,7 +107,7 @@ inline CsiModelValidity csiModelValidate(const CsiSiteModel& m, uint32_t minSamp
     if (!csiFinite(m.threshold) || !csiFinite(m.meanVariance) ||
         !csiFinite(m.stdVariance) || !csiFinite(m.maxVariance))
                                                       return CsiModelValidity::NAN_INF;
-    if (m.threshold < CSI_MODEL_MIN_THRESHOLD || m.threshold > 100.0f)
+    if (m.threshold < CSI_MODEL_ABS_MIN_THRESHOLD || m.threshold > 100.0f)
                                                       return CsiModelValidity::THRESHOLD_RANGE;
     if (m.meanVariance < 0.0f || m.stdVariance < 0.0f || m.maxVariance < 0.0f)
                                                       return CsiModelValidity::NEGATIVE_STATS;
@@ -127,7 +153,10 @@ public:
         return _edgeHi(NB - 1);
     }
 private:
-    static constexpr float LO = CSI_MODEL_MIN_THRESHOLD / 4.0f;  // 0.00125
+    // v5.4: LO must sit below the idle variance of a strong (CV-compressed)
+    // link (~5e-5), otherwise all quiet samples land in bucket 0 and the
+    // quality quantiles degenerate (lab report had p50==p90==p95).
+    static constexpr float LO = 1e-5f;
     static constexpr float HI = 0.5f;
     static int _bucket(float v) {
         if (v <= LO) return 0;

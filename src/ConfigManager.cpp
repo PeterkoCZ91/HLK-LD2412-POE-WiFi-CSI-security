@@ -47,7 +47,7 @@ void ConfigManager::load() {
     // WiFi CSI runtime config
     _config.csi_enabled    = _prefs.getBool ("csi_en",     true);
     _config.csi_threshold  = _prefs.getFloat("csi_thr",    0.5f);
-    _config.csi_hysteresis = _prefs.getFloat("csi_hyst",   0.7f);
+    _config.csi_hysteresis = _prefs.getFloat("csi_hyst",   0.5f);  // v5.4 default (ESPectre fleet value)
     _config.csi_window     = _prefs.getUShort("csi_win",   75);
     _config.csi_publish_ms = _prefs.getUShort("csi_pubms", 1000);
     _config.fusion_enabled = _prefs.getBool ("fus_en",     true);

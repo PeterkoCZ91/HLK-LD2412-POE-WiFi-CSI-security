@@ -269,6 +269,7 @@ private:
                               bool breathHold, uint8_t votes, uint8_t window, float effThr);
     void _pushEvent(CsiEventType type, float effThr, float shadowThr = 0.0f,
                     bool shadowMotion = false, uint16_t healthFlags = 0);
+    float _relativeFloor() const;  // v5.4: 3x learned quiet mean (link-relative)
     void _updateShadow(float effThr);  // P1.1: run candidate verdict in parallel
     uint16_t _computeCsiHealthFlags() const;  // P1.4: CSI-intrinsic health subset
     void _updateHealthEvents(float effThr);    // emit HEALTH_CHANGE on transition
@@ -291,11 +292,16 @@ private:
     // Configuration
     uint16_t _windowSize = 75;
     float _threshold = 0.5f;
-    float _hysteresis = 0.7f;
+    float _hysteresis = 0.5f;   // v5.4: 0.7 -> 0.5 (value deployed on the working ESPectre fleet)
     uint32_t _publishIntervalMs = 1000;
     uint32_t _trafficRatePps = 100;
-    uint16_t _trafficPort = 7;      // Default: echo port (7), alt: 53 (DNS)
-    bool     _trafficICMP = false;   // ICMP echo (ping) mode — better response rate
+    uint16_t _trafficPort = 7;      // Only used in UDP mode; irrelevant when ICMP default is active
+    // v5.4: default ICMP, not UDP:7 — confirmed in the field that some ISP-
+    // provided 5G/CPE routers throttle/filter unsolicited UDP:7 as a DDoS
+    // reflection heuristic (port 7 = echo, classic amplification target),
+    // dropping capture rate to ~1% of target even at good RSSI. ICMP echo
+    // is universally allowed.
+    bool     _trafficICMP = true;
 
     // HT20 subcarrier selection (12 subcarriers, avoiding guard bands <11 and >52, DC=32)
     static constexpr uint8_t NUM_SUBCARRIERS = 12;
@@ -388,9 +394,9 @@ private:
     bool     _pubShadowMotion = false;
 
     // P1.4 health-change events — CSI-intrinsic flag subset tracked per tick.
-    // Sentinel 0xFFFF (never a real value, only 10 bits used) forces the first
-    // evaluation to log the initial health state.
-    uint16_t _lastHealthFlags = 0xFFFF;
+    // v5.3.1: debounced (flag set must hold ~10 ticks) so a boundary-oscillating
+    // flag can't fill the ring; evaluated EVERY tick incl. starved (empty window).
+    CsiHealthDebounce _healthDebounce{10};
 
     // Breathing-aware presence hold
     uint16_t _breathHoldCount = 0;
@@ -496,11 +502,12 @@ private:
     float    _siteLearnMaxVar = 0.0f;
     bool     _siteModelReady = false;
     float    _learnedThreshold = 0.0f;
-    // csi10e: absolute floor for learned variance threshold. Below this the
-    // baseline becomes a hair-trigger — even normal WiFi jitter, weather, or
-    // distant-room RF drift will exceed it and false-positive the CSI signal.
-    // Observed production false-alarm on 2026-04-24 had learned_threshold=0.001.
-    static constexpr float MIN_LEARNED_THRESHOLD = 0.005f;
+    // v5.4: the old MIN_LEARNED_THRESHOLD=0.005 absolute floor is gone — it sat
+    // above walking peaks on strong (CV-compressed) links and blinded detection
+    // by design. Floors are link-relative now: csiModelRelativeFloor() in
+    // CsiSiteModel.h (3x quiet mean, absolute sanity bound 1e-4). The 2026-04-24
+    // hair-trigger case is still covered: a noisy site has a high quiet mean,
+    // so its relative floor lands at/above the old 0.005 automatically.
     float    _learnedMeanVar = 0.0f;
     float    _learnedStdVar = 0.0f;
     float    _learnedMaxVar = 0.0f;
@@ -526,6 +533,10 @@ private:
     float    _mlProbability = 0.0f;
     bool     _mlMotion      = false;
     static constexpr float ML_EXIT_FACTOR = 0.70f;  // exit = 0.35 when threshold = 0.50
+    // Same usable-capture floor as CSI_HEALTH_PACKET_RATE_LOW (CsiHealthReasons.h) —
+    // below it, DSER/turbulence time constants are stretched far past their trained
+    // real-time window and ml_probability saturates regardless of actual motion.
+    static constexpr float ML_MIN_PACKET_RATE_PPS = 5.0f;
     // Independent N/M smoothing over ML raw decisions (shape-aligned with variance path)
     uint8_t  _mlSmoothHistory = 0;
     uint8_t  _mlSmoothCount   = 0;

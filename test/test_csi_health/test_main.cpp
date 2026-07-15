@@ -95,6 +95,70 @@ void test_flag_strings() {
     TEST_ASSERT_EQUAL_STRING("clock_invalid", csiHealthFlagStr(CSI_HEALTH_CLOCK_INVALID));
 }
 
+// ---- debounce (v5.3.1: oscillating flags must not spam the event ring) -----
+void test_debounce_stable_state_logs_once() {
+    CsiHealthDebounce d(3);
+    TEST_ASSERT_FALSE(d.feed(CSI_HEALTH_OK));   // tick 1
+    TEST_ASSERT_FALSE(d.feed(CSI_HEALTH_OK));   // tick 2
+    TEST_ASSERT_TRUE (d.feed(CSI_HEALTH_OK));   // tick 3 — stable → log initial state
+    // further identical ticks never re-log
+    for (int i = 0; i < 10; i++) TEST_ASSERT_FALSE(d.feed(CSI_HEALTH_OK));
+}
+
+void test_debounce_oscillation_never_logs() {
+    // the lab failure mode: packet_rate_low <-> +unstable flip every tick
+    CsiHealthDebounce d(3);
+    uint16_t a = CSI_HEALTH_PACKET_RATE_LOW;
+    uint16_t b = CSI_HEALTH_PACKET_RATE_LOW | CSI_HEALTH_PACKET_RATE_UNSTABLE;
+    for (int i = 0; i < 100; i++) {
+        TEST_ASSERT_FALSE(d.feed(i % 2 ? a : b));
+    }
+}
+
+void test_debounce_genuine_transition_logs_after_stability() {
+    CsiHealthDebounce d(3);
+    for (int i = 0; i < 3; i++) d.feed(CSI_HEALTH_OK);        // initial logged on 3rd
+    TEST_ASSERT_EQUAL_UINT16(CSI_HEALTH_OK, d.reported());
+    // real fault appears and STAYS
+    uint16_t f = CSI_HEALTH_PACKET_RATE_LOW;
+    TEST_ASSERT_FALSE(d.feed(f));   // 1
+    TEST_ASSERT_FALSE(d.feed(f));   // 2
+    TEST_ASSERT_TRUE (d.feed(f));   // 3 — stable fault → log
+    TEST_ASSERT_EQUAL_UINT16(f, d.reported());
+    // brief flicker back to OK (1 tick) then fault again → no log
+    TEST_ASSERT_FALSE(d.feed(CSI_HEALTH_OK));
+    TEST_ASSERT_FALSE(d.feed(f));
+    TEST_ASSERT_FALSE(d.feed(f));
+    TEST_ASSERT_FALSE(d.feed(f));   // f already reported → no re-log
+    TEST_ASSERT_EQUAL_UINT16(f, d.reported());
+}
+
+void test_debounce_return_to_reported_state_never_relogs() {
+    CsiHealthDebounce d(2);
+    d.feed(CSI_HEALTH_OK); d.feed(CSI_HEALTH_OK);             // OK reported
+    uint16_t f = CSI_HEALTH_RADAR_UNAVAILABLE;
+    d.feed(f); d.feed(f);                                      // fault reported
+    // back to OK and stable → logs the recovery exactly once
+    TEST_ASSERT_FALSE(d.feed(CSI_HEALTH_OK));
+    TEST_ASSERT_TRUE (d.feed(CSI_HEALTH_OK));
+    for (int i = 0; i < 5; i++) TEST_ASSERT_FALSE(d.feed(CSI_HEALTH_OK));
+}
+
+// ---- ML vote trust gate (v5.4: lab node ml_probability saturated near 1.0
+// at chronic packet_rate_low — DSER/turbulence features use packet-count time
+// constants tuned for a much higher pps than this site sustains) -----------
+void test_ml_vote_untrusted_below_packet_rate_floor() {
+    TEST_ASSERT_FALSE(csiMlVoteTrusted(2.0f, 5.0f));
+}
+
+void test_ml_vote_trusted_above_packet_rate_floor() {
+    TEST_ASSERT_TRUE(csiMlVoteTrusted(80.0f, 5.0f));
+}
+
+void test_ml_vote_trusted_at_floor_boundary() {
+    TEST_ASSERT_TRUE(csiMlVoteTrusted(5.0f, 5.0f));
+}
+
 int main(int, char**) {
     UNITY_BEGIN();
     RUN_TEST(test_healthy_has_no_flags_and_full_score);
@@ -107,5 +171,12 @@ int main(int, char**) {
     RUN_TEST(test_score_clamps_at_zero);
     RUN_TEST(test_score_partial_deduction);
     RUN_TEST(test_flag_strings);
+    RUN_TEST(test_debounce_stable_state_logs_once);
+    RUN_TEST(test_debounce_oscillation_never_logs);
+    RUN_TEST(test_debounce_genuine_transition_logs_after_stability);
+    RUN_TEST(test_debounce_return_to_reported_state_never_relogs);
+    RUN_TEST(test_ml_vote_untrusted_below_packet_rate_floor);
+    RUN_TEST(test_ml_vote_trusted_above_packet_rate_floor);
+    RUN_TEST(test_ml_vote_trusted_at_floor_boundary);
     return UNITY_END();
 }

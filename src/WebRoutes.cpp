@@ -954,7 +954,7 @@ void setupConfigRoutes() {
         doc["fus_en"] = _deps.config->fusion_enabled;
         // CSI traffic gen + ML (NVS-only, no struct mirror)
         doc["csi_tport"] = _deps.preferences->getUShort("csi_tport", 7);
-        doc["csi_ticmp"] = _deps.preferences->getBool("csi_ticmp", false);
+        doc["csi_ticmp"] = _deps.preferences->getBool("csi_ticmp", true);
         doc["csi_tpps"] = _deps.preferences->getUInt("csi_tpps", 100);
         doc["csi_ml_en"] = _deps.preferences->getBool("csi_ml_en", true);
         doc["csi_ml_thr"] = _deps.preferences->getFloat("csi_ml_thr", 0.50f);
@@ -1729,6 +1729,7 @@ void setupSystemRoutes() {
                 "Reboot inhibit is ON. POST /api/reboot_inhibit {\"enabled\":false} to allow manual restarts.");
             return;
         }
+        if (_deps.mqttService) _deps.mqttService->publishMaintenance(true);
         request->send(200, "text/plain", "Rebooting...");
         *_deps.shouldReboot = true;
     });
@@ -3159,6 +3160,15 @@ void setupCSIRoutes() {
                 if (_deps.csiService) _deps.csiService->setThreshold(thr);
                 changed = true;
             }
+        }
+
+        // v5.3.2-dev: NBVI subcarrier auto-selection toggle. setNbviEnabled()
+        // existed since csi5 but was never reachable over the API — needed to
+        // A/B test whether NBVI's "most stable subcarriers" pick suppresses
+        // motion sensitivity on strong links. Runtime-only (not persisted).
+        if (request->hasParam("nbvi")) {
+            bool en = request->getParam("nbvi")->value() == "1";
+            if (_deps.csiService) { _deps.csiService->setNbviEnabled(en); changed = true; }
         }
 
         if (request->hasParam("hysteresis")) {

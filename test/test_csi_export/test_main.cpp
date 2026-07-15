@@ -41,8 +41,8 @@ void test_reconstructed_model_validates() {
 
 void test_reconstructed_below_floor_rejected() {
     CsiSiteModel m;
-    m.threshold = 0.001f;  // under absolute floor → import must fail validation
-    m.meanVariance = 0.0005f; m.stdVariance = 0.0001f; m.maxVariance = 0.0008f;
+    m.threshold = 0.00005f;  // under absolute sanity bound (1e-4) → import must fail
+    m.meanVariance = 0.00002f; m.stdVariance = 0.00001f; m.maxVariance = 0.00004f;
     m.sampleCount = 6812;
     csiModelSeal(m);
     TEST_ASSERT_EQUAL(CsiModelValidity::THRESHOLD_RANGE, csiModelValidate(m));

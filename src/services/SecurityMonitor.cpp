@@ -941,7 +941,7 @@ void SecurityMonitor::triggerAlert(NotificationType type, const String& message,
         uint8_t fpVar = 0, fpMl = 0;
 #ifdef USE_CSI
         if (_csiService) {
-            float thr = _csiService->getThreshold();
+            float thr = _csiService->getEffectiveThreshold();
             float ratio = (thr > 0.0f) ? (_csiService->getVariance() / thr) : 0.0f;
             int r = (int)(ratio * 100.0f);
             fpVar = (uint8_t)(r < 0 ? 0 : (r > 255 ? 255 : r));

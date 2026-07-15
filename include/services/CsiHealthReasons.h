@@ -107,4 +107,52 @@ inline const char* csiHealthFlagStr(CsiHealthFlag flag) {
     }
 }
 
+// v5.4: below the same usable-capture floor used for PACKET_RATE_LOW, the
+// DSER/turbulence features feeding the ML head use packet-count time
+// constants (e.g. ~100-packet EMA) that stretch far beyond their trained
+// real-time window — the site's ml_probability saturates near 1.0 regardless
+// of actual motion. Mirrors the _csiDataOk starvation gate already used for
+// the fusion vote in SecurityMonitor, extended to the partial-starvation case.
+inline bool csiMlVoteTrusted(float packetRate, float packetRateFloorPps) {
+    return packetRate >= packetRateFloorPps;
+}
+
+// v5.3.1: debounce for health-change event logging. A flag set must hold for
+// `stableTicks` consecutive feeds before it is reported — a boundary-oscillating
+// flag (packet_rate_unstable flipping every tick filled the whole 256-event ring
+// with health_change overnight) never stabilizes and never logs, while genuine
+// transitions log exactly once. Pure, native-testable.
+class CsiHealthDebounce {
+public:
+    explicit CsiHealthDebounce(uint8_t stableTicks = 10) : _need(stableTicks) {}
+
+    // Feed the current flag set once per tick. Returns true when the value has
+    // been stable for `stableTicks` ticks AND differs from the last reported
+    // value — the caller should log a HEALTH_CHANGE event exactly then.
+    bool feed(uint16_t flags) {
+        if (flags == _pending) {
+            if (_count < 0xFF) _count++;
+        } else {
+            _pending = flags;
+            _count = 1;
+        }
+        if (_count >= _need && _pending != _reported) {
+            _reported = _pending;
+            return true;
+        }
+        return false;
+    }
+
+    // Last reported (logged) flag set; SENTINEL until the first report.
+    uint16_t reported() const { return _reported; }
+
+    static constexpr uint16_t SENTINEL = 0xFFFF;  // no real flag set (only 10 bits used)
+
+private:
+    uint8_t  _need;
+    uint8_t  _count = 0;
+    uint16_t _pending  = SENTINEL;
+    uint16_t _reported = SENTINEL;
+};
+
 #endif // CSI_HEALTH_REASONS_H

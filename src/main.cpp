@@ -44,7 +44,7 @@
 // -------------------------------------------------------------------------
 #include <Update.h>
 #ifndef FW_VERSION
-#define FW_VERSION "v5.3.0-poe-wifi"
+#define FW_VERSION "v5.4.0-poe-wifi"
 #endif
 #define WDT_TIMEOUT_SECONDS 60
 
@@ -975,6 +975,7 @@ void setup() {
         CSIService::setOtaInProgress(true);
         csiService.wifiDownForOta();   // single-home: drop CSI WiFi so we're not dual-homed during OTA
 #endif
+        mqttService.publishMaintenance(true);
         MQTTService::setOtaInProgress(true);
         String type;
         if (ArduinoOTA.getCommand() == U_FLASH)
@@ -996,6 +997,7 @@ void setup() {
         CSIService::setOtaInProgress(false);
 #endif
         MQTTService::setOtaInProgress(false);
+        mqttService.publishMaintenance(false);
         g_espotaMaintenance.store(false);
         g_espotaMaintenanceUntilMs.store(0);
         otaRuntimeEnd(OTA_OWNER_ESPOTA);
@@ -1048,7 +1050,7 @@ void setup() {
 
         // Traffic generator tuning from NVS
         if (preferences.isKey("csi_tport")) csiService.setTrafficPort(preferences.getUShort("csi_tport", 7));
-        if (preferences.isKey("csi_ticmp")) csiService.setTrafficICMP(preferences.getBool("csi_ticmp", false));
+        if (preferences.isKey("csi_ticmp")) csiService.setTrafficICMP(preferences.getBool("csi_ticmp", true));
         if (preferences.isKey("csi_tpps"))  csiService.setTrafficRate(preferences.getUInt("csi_tpps", 100));
 
         // csi9: ML MLP runtime settings from NVS (defaults: enabled=true, threshold=0.50)
@@ -1126,6 +1128,7 @@ void otaRuntimeRestoreServices(const char* reason, bool restartRadar) {
     csiService.wifiUpAfterOta();   // restore CSI WiFi if the OTA window closed without a reboot
 #endif
     MQTTService::setOtaInProgress(false);
+    mqttService.publishMaintenance(false);
     if (restartRadar) {
         uint8_t minGate = preferences.getUInt("radar_min", 0);
         uint8_t maxGate = preferences.getUInt("radar_max", 13);
@@ -1177,6 +1180,7 @@ static void handleEspotaMaintenance(unsigned long now) {
         CSIService::setOtaInProgress(true);
         csiService.wifiDownForOta();   // single-home: drop CSI WiFi so we're not dual-homed during OTA
 #endif
+        mqttService.publishMaintenance(true);
         MQTTService::setOtaInProgress(true);
         if (radarTaskHandle && eTaskGetState(radarTaskHandle) != eSuspended) {
             vTaskSuspend(radarTaskHandle);

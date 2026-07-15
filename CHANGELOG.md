@@ -2,6 +2,90 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.4.0-poe-wifi] - 2026-07-15
+
+Detection-sensitivity release. The v5.3.x diagnostics surfaced that the
+absolute variance floor was masking real motion on strong WiFi links; this
+release replaces it with a link-relative floor and hardens the ML vote and
+forensic logging against starved-link edge cases. Validated across a
+multi-day soak on the lab node (repeated live MOTION/alarm cycles crossing
+the adaptive threshold from real data, no quiet-site regressions).
+
+### Changed
+
+- **Link-relative threshold floor, replacing the absolute one.** The old
+  `MIN_LEARNED_THRESHOLD = 0.005` was a fixed floor that sat *above* real
+  walking peaks (0.001–0.003) on strong, CV-compressed WiFi links, masking
+  motion by design — confirmed with controlled walk tests and by comparison
+  with the working ESPectre deployment (threshold = P95 × 1.1 of the link's
+  own baseline, no global floor). `csiModelRelativeFloor()` now floors the
+  threshold at `max(1e-4, 3× the link's own learned quiet-mean variance)`,
+  applied consistently in learning finalize, threshold estimate, EMA refresh
+  and model validation. A noisy site still lands at or above the old 0.005;
+  a clean link keeps its genuine sensitivity.
+- **Adaptive P95 threshold now replaces the configured value once warmed up**
+  (`csiEffectiveThreshold()`), instead of only ever raising it — it may lower
+  the effective threshold, clamped by the new relative floor.
+- **Hysteresis default 0.7 → 0.5**, matching the value already deployed
+  across the working ESPectre fleet.
+- **CSI traffic generator defaults to ICMP, not UDP:7.** Some ISP-provided
+  routers throttle/filter unsolicited UDP to port 7 (echo — a classic DDoS
+  reflection/amplification target) as a security heuristic, even for
+  LAN-local self-generated traffic — one field node was capturing at ~1 % of
+  its 100 pps target despite good RSSI. Switching that node's traffic
+  generator to ICMP raised capture from ~1 pps to ~99.7 pps in under a
+  minute. New/unconfigured nodes now default to ICMP.
+
+### Fixed
+
+- **ML motion vote no longer trusted below the packet-rate floor.** Two of
+  the 17 MLP input features (DSER EMA, turbulence window) use packet-count
+  time constants tuned for a healthy capture rate; on a starved link the same
+  window stretches from ~1 s to 100+ s of real time, pushing the features far
+  outside their trained distribution and saturating `ml_probability` near 1.0
+  regardless of actual motion. `csiMlVoteTrusted()` now gates ML inference on
+  the same packet-rate floor already used for the `packet_rate_low` health
+  flag — below it, `ml_probability`/`ml_motion` are forced to 0/false instead
+  of voting on unreliable data. Verified live: `ml_probability` 0.999 → 0,
+  fusion source `ml` → `none`.
+- **Alarm forensic `var_ratio` compared against the effective threshold.**
+  `SecurityMonitor::triggerAlert` divided the trigger variance by the legacy
+  static floor (`getThreshold()`) instead of the adaptive threshold actually
+  used for the decision (`getEffectiveThreshold()`), so two genuine overnight
+  alarms were logged as if they had fired on a near-zero variance ratio. The
+  forensic ratio now reflects the threshold the detector really crossed.
+
+### Added
+
+- **Runtime NBVI toggle** — `POST /api/csi?nbvi=0|1` enables/disables NBVI
+  subcarrier auto-selection without a reboot (diagnostic/A-B use; not
+  persisted across restarts).
+- **Planned-maintenance MQTT signal** — new retained topic
+  `security/<device>/maintenance` (`"1"`/`"0"`), published around OTA
+  updates and manual `/api/restart`, so HA automations can distinguish a
+  planned reboot from a real offline/tamper event on the shared
+  `availability` topic. See README § Planned-Maintenance MQTT Signal for
+  the required HA-side timeout caveat.
+
+## [5.3.1-poe-wifi] - 2026-07-12
+
+First-night fixes for the v5.3.0 diagnostic event ring, found by running it on
+two real nodes overnight. Both are event-logging fixes — detection, alarm and
+API behavior are unchanged.
+
+### Fixed
+
+- **HEALTH_CHANGE events are debounced.** `packet_rate_unstable` compares the
+  live capture rate against its own average, so near the boundary it flips every
+  tick — one node logged ~2500 `health_change` events overnight and evicted every
+  motion edge from the 256-slot ring. A health-flag set must now hold stable for
+  ~10 ticks before it is logged (`CsiHealthDebounce`, pure + unit-tested);
+  oscillation logs nothing, genuine transitions log exactly once.
+- **Health transitions are evaluated even when the CSI window is empty.** The
+  health check ran only after the turbulence buffer filled, so a starved link —
+  the exact condition `packet_rate_low` exists to record — logged nothing at all
+  (a weak-RSSI node spent most of the night starved with an empty ring).
+
 ## [5.3.0-poe-wifi] - 2026-07-11
 
 CSI diagnostics release (návrh sekce 17, priority **P1**). Five read-only

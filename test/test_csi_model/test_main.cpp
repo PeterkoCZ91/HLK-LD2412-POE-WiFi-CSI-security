@@ -11,8 +11,8 @@ void tearDown() {}
 // ---- helpers ---------------------------------------------------------------
 static CsiSiteModel goodModel() {
     CsiSiteModel m;
-    // threshold must be >= CSI_MODEL_MIN_THRESHOLD (0.005) — the learning floor
-    // clamps below that, so a valid model never carries a lower threshold.
+    // threshold must be >= CSI_MODEL_ABS_MIN_THRESHOLD (1e-4 sanity bound);
+    // site-specific floors are relative (csiModelRelativeFloor) since v5.4.
     m.valid = true;
     m.threshold = 0.006f; m.meanVariance = 0.002f; m.stdVariance = 0.0005f;
     m.maxVariance = 0.003f; m.sampleCount = 6812; m.generation = 5;
@@ -40,8 +40,44 @@ void test_crc32_known_vector() {
 // ---- Task 2: validation ----------------------------------------------------
 void test_validate_ok()                 { TEST_ASSERT_EQUAL(CsiModelValidity::OK, csiModelValidate(goodModel())); }
 void test_validate_rejects_low_threshold() {
-    CsiSiteModel m = goodModel(); m.threshold = 0.0001f; csiModelSeal(m);
+    // v5.4: absolute sanity bound is CSI_MODEL_ABS_MIN_THRESHOLD (1e-4), not
+    // the old 0.005 floor — site-specific floors are relative now.
+    CsiSiteModel m = goodModel(); m.threshold = 0.00005f; csiModelSeal(m);
     TEST_ASSERT_EQUAL(CsiModelValidity::THRESHOLD_RANGE, csiModelValidate(m));
+}
+void test_validate_accepts_sub_005_threshold() {
+    // walking on a strong (CV-compressed) link lives at 0.001–0.003 — a model
+    // learned there must be valid. This was the v5.3 blind spot.
+    CsiSiteModel m = goodModel(); m.threshold = 0.001f; csiModelSeal(m);
+    TEST_ASSERT_EQUAL(CsiModelValidity::OK, csiModelValidate(m));
+}
+
+// ---- v5.4: relative floor + effective threshold -----------------------------
+void test_relative_floor_scales_with_baseline() {
+    // strong link (idle mean 5e-5): floor = max(1e-4, 3*5e-5) = 1.5e-4
+    TEST_ASSERT_FLOAT_WITHIN(1e-7f, 0.00015f, csiModelRelativeFloor(0.00005f));
+    // noisy link (idle mean 2e-3): floor = 6e-3 — April-style hair-trigger blocked
+    TEST_ASSERT_FLOAT_WITHIN(1e-6f, 0.006f, csiModelRelativeFloor(0.002f));
+}
+void test_relative_floor_absolute_minimum() {
+    // zero/near-zero baseline never yields a zero floor
+    TEST_ASSERT_FLOAT_WITHIN(1e-9f, CSI_MODEL_ABS_MIN_THRESHOLD, csiModelRelativeFloor(0.0f));
+    TEST_ASSERT_FLOAT_WITHIN(1e-9f, CSI_MODEL_ABS_MIN_THRESHOLD, csiModelRelativeFloor(1e-6f));
+}
+void test_effective_threshold_adaptive_replaces() {
+    // adaptive ready → it REPLACES the configured threshold (can go lower)
+    TEST_ASSERT_FLOAT_WITHIN(1e-7f, 0.0004f,
+        csiEffectiveThreshold(0.005f, 0.0004f, true, 0.0001f));
+}
+void test_effective_threshold_adaptive_clamped_by_floor() {
+    // adaptive below the relative floor → floor wins (hair-trigger guard)
+    TEST_ASSERT_FLOAT_WITHIN(1e-7f, 0.0003f,
+        csiEffectiveThreshold(0.005f, 0.0001f, true, 0.0003f));
+}
+void test_effective_threshold_configured_when_adaptive_off() {
+    // adaptive disabled/cold → explicit configured threshold wins, unclamped
+    TEST_ASSERT_FLOAT_WITHIN(1e-7f, 0.005f,
+        csiEffectiveThreshold(0.005f, 0.0004f, false, 0.01f));
 }
 void test_validate_rejects_nan() {
     CsiSiteModel m = goodModel(); m.meanVariance = NAN; csiModelSeal(m);
@@ -219,6 +255,12 @@ int main(int, char**) {
     RUN_TEST(test_crc32_known_vector);
     RUN_TEST(test_validate_ok);
     RUN_TEST(test_validate_rejects_low_threshold);
+    RUN_TEST(test_validate_accepts_sub_005_threshold);
+    RUN_TEST(test_relative_floor_scales_with_baseline);
+    RUN_TEST(test_relative_floor_absolute_minimum);
+    RUN_TEST(test_effective_threshold_adaptive_replaces);
+    RUN_TEST(test_effective_threshold_adaptive_clamped_by_floor);
+    RUN_TEST(test_effective_threshold_configured_when_adaptive_off);
     RUN_TEST(test_validate_rejects_nan);
     RUN_TEST(test_validate_rejects_max_lt_mean);
     RUN_TEST(test_validate_rejects_few_samples);

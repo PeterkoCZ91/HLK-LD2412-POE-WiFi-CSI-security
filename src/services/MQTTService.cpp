@@ -107,6 +107,9 @@ void MQTTService::generateTopics() {
     snprintf(_topics.fusion_presence,   sizeof(_topics.fusion_presence),   "security/%s/fusion/presence", _deviceId);
     snprintf(_topics.fusion_confidence, sizeof(_topics.fusion_confidence), "security/%s/fusion/confidence", _deviceId);
     snprintf(_topics.fusion_source,     sizeof(_topics.fusion_source),     "security/%s/fusion/source", _deviceId);
+
+    // OTA / planned-restart signal
+    snprintf(_topics.maintenance,       sizeof(_topics.maintenance),       "security/%s/maintenance", _deviceId);
 }
 
 void MQTTService::setupClient() {
@@ -212,6 +215,11 @@ void MQTTService::connect() {
         // Publish IP
         _mqttClient.publish(_topics.ip, ETH.localIP().toString().c_str(), true);
 
+        // Safety-net: any successful (re)connect clears a "1" left stuck by
+        // an OTA path that never got to publish "0" (e.g. hard reboot mid-flash,
+        // or a fresh boot after a bricked-then-recovered flash).
+        _mqttClient.publish(_topics.maintenance, "0", true);
+
         _reconnectInterval = 5000; // Reset backoff on success
         _justReconnected = true;
         _publishFailStreak = 0;
@@ -236,6 +244,12 @@ void MQTTService::connect() {
         _reconnectInterval = min(_reconnectInterval * 2, _maxReconnectInterval);
         DBG("MQTT", "Failed, rc=%d (next retry in %lus)", _mqttClient.state(), _reconnectInterval / 1000);
     }
+}
+
+void MQTTService::publishMaintenance(bool active) {
+    // Direct client publish, not the guarded publish() wrapper — see the
+    // declaration comment in MQTTService.h for why.
+    _mqttClient.publish(_topics.maintenance, active ? "1" : "0", true);
 }
 
 bool MQTTService::connected() {
@@ -418,6 +432,11 @@ void MQTTService::publishDiscoveryStep() {
         case 22: publishOneDiscovery("sensor", "restart_cause", "Restart Cause", _topics.restart_cause, "", "mdi:restart-alert", "", "{\"ent_cat\":\"diagnostic\"}"); break;
         case 23: publishOneDiscovery("sensor", "motion_type", "Motion Type", _topics.motion_type, "", "mdi:motion-sensor", "", ""); break;
         case 24: publishOneDiscovery("sensor", "chip_temp", "Chip Temperature", _topics.chip_temp, "°C", "mdi:thermometer", "temperature", "{\"ent_cat\":\"diagnostic\"}"); break;
+        // Index 53 — deliberately past the engineering-gate range (gates
+        // occupy 25-52 via the `default:` block below, gateOffset = index-25,
+        // valid for gateOffset 0-27). Do NOT renumber to a lower index
+        // without also shifting that arithmetic.
+        case 53: publishOneDiscovery("binary_sensor", "maintenance", "Maintenance Mode", _topics.maintenance, "", "mdi:wrench-clock", "", "{\"pl_on\":\"1\",\"pl_off\":\"0\",\"ent_cat\":\"diagnostic\"}"); break;
         default: {
             // Engineering gates: indices 25-52 (14 gates × 2: moving + static)
             int gateOffset = _discoveryIndex - 25;

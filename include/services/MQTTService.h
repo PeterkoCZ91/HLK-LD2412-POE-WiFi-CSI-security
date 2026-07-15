@@ -102,6 +102,10 @@ struct MQTTTopics {
     char fusion_presence[64];
     char fusion_confidence[64];
     char fusion_source[64];
+
+    // OTA / planned-restart signal — HA automations should not treat this
+    // device going offline as a real problem while maintenance == "1"
+    char maintenance[64];
 };
 
 class MQTTService {
@@ -142,6 +146,13 @@ public:
     // path, producing non-deterministic upload stalls.
     static void setOtaInProgress(bool active) { _otaInProgress.store(active); }
     static bool isOtaInProgress() { return _otaInProgress.load(); }
+
+    // Retained "1"/"0" on security/<id>/maintenance. Publishes directly via
+    // the underlying MQTT client, bypassing the _otaInProgress guard in
+    // publish() (MQTTService.cpp:261) — otherwise the "starting" edge would
+    // be dropped the instant setOtaInProgress(true) takes effect. See
+    // docs/superpowers/specs/2026-07-13-mqtt-maintenance-signal-design.md
+    void publishMaintenance(bool active);
 
 private:
     void setupClient();
