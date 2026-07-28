@@ -660,6 +660,7 @@ void setupTelemetryRoutes() {
             [responseBuf, len](uint8_t* dst, size_t maxLen, size_t index) -> size_t {
                 if (index >= len) return 0;
                 size_t chunk = (maxLen < len - index) ? maxLen : (len - index);
+                // cppcheck-suppress arithOperationsOnVoidPointer ; shared_ptr<char>::get() je char*, ne void* (cppcheck nerozřeší šablonu)
                 memcpy(dst, responseBuf.get() + index, chunk);
                 return chunk;
             });
@@ -2854,6 +2855,7 @@ void setupLogRoutes() {
             [buf, total](uint8_t* dst, size_t maxLen, size_t index) -> size_t {
                 if (index >= total) return 0;
                 size_t chunk = (maxLen < total - index) ? maxLen : (total - index);
+                // cppcheck-suppress arithOperationsOnVoidPointer ; shared_ptr<char>::get() je char*, ne void* (cppcheck nerozřeší šablonu)
                 memcpy(dst, buf.get() + index, chunk);
                 return chunk;
             });
