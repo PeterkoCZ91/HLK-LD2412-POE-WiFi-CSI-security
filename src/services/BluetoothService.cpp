@@ -26,7 +26,7 @@ void BluetoothService::begin(const char* deviceName, ConfigManager* config) {
     NimBLEDevice::setSecurityAuth(true, true, true);   // bonding, MITM protection, secure connections
     NimBLEDevice::setSecurityPasskey(142536);
     NimBLEDevice::setSecurityIOCap(BLE_HS_IO_DISPLAY_ONLY);
-    DBG("BT", "Security enabled, passkey: 142536");
+    DBG("BT", "Security enabled, passkey configured");
 
     _server = NimBLEDevice::createServer();
 
@@ -101,7 +101,7 @@ void BluetoothService::WiFiCallbacks::onWrite(NimBLECharacteristic* pCharacteris
             String ssid = String(value.substr(0, comma).c_str());
             String pass = String(value.substr(comma + 1).c_str());
             
-            DBG("BT", "New SSID: %s", ssid.c_str());
+            DBG("BT", "New WiFi network received (%u-byte SSID)", (unsigned)ssid.length());
             
             // Note: We need a way to save this to Preferences
             // Since we have pointer to ConfigManager, we can't directly write to Preferences here

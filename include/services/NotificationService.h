@@ -5,6 +5,7 @@
 #include <HTTPClient.h>
 #include <ETH.h>
 #include <Preferences.h>
+#include <atomic>
 
 // Forward declaration
 class TelegramService;
@@ -66,6 +67,7 @@ public:
 
     // Getters
     bool isEnabled() const { return _config.enabled; }
+    bool isWebhookTlsBlocked() const { return _tlsBlockedMask.load(std::memory_order_relaxed) != 0; }
     const NotificationConfig& getConfig() const { return _config; }
 
     bool sendTelegram(const String& message);
@@ -90,6 +92,9 @@ private:
     QueueHandle_t _webhookQueue = nullptr;
     TaskHandle_t _webhookTask = nullptr;
     static constexpr size_t WEBHOOK_QUEUE_SIZE = 4;
+    // One bit per configured webhook type; exposed through /healthz so a
+    // fail-closed TLS policy never turns alarm delivery into a silent failure.
+    std::atomic<uint8_t> _tlsBlockedMask{0};
 
     // Cooldown tracking per notification type
     unsigned long _lastNotification[9] = {0};  // One per NotificationType enum

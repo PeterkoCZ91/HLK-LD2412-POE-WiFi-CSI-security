@@ -44,6 +44,11 @@ const char index_html[] PROGMEM = R"rawliteral(
     button:hover { opacity: 0.9; }
     button.sec { background: var(--sec); }
     button.warn { background: var(--warn); color: black; font-weight: bold; }
+    button:disabled { opacity: 0.5; cursor: wait; }
+    .wifi-scan-list { display:flex; flex-direction:column; gap:4px; margin:6px 0; }
+    button.wifi-scan-row { display:flex; justify-content:space-between; align-items:center; gap:8px; background:#222; border:1px solid #383838; padding:8px; margin:0; text-align:left; }
+    .wifi-scan-name { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-weight:bold; }
+    .wifi-scan-meta { flex-shrink:0; color:#999; font-size:0.75rem; }
 
     /* Per-gate & Bars */
     .gate-wrapper { display: flex; align-items: center; gap: 5px; margin-bottom: 4px; font-size: 0.75rem; }
@@ -143,8 +148,13 @@ const char index_html[] PROGMEM = R"rawliteral(
       ap_compat: "AP kompatibilita (HT LTF)", ap_ok: "OK", ap_incompat: "NEKOMPATIBILNÍ", ap_checking: "čekám na HT LTF…",
       ap_incompat_hint: "AP nevysílá 802.11n HT LTF rámce (pravděpodobně WiFi 6 HW v n-módu). CSI je pasivní, ale detekce pohybu nebude fungovat. Použij pre-WiFi 6 AP.",
       wifi_ap: "WIFI AP (CSI)", wifi_ssid: "SSID", wifi_pass: "Heslo",
-      wifi_ap_hint: "Přepnutí AP pro CSI senzor. Uložení vyžaduje reboot. Prázdné = fallback na compile-time default ze <code>secrets.h</code>.",
+      wifi_ap_hint: "Přepnutí AP pro CSI senzor. Uložení vyžaduje reboot. Prázdné heslo ponechá stávající; tlačítko default obnoví údaje ze <code>secrets.h</code>.",
       save_reboot: "💾 Uložit a rebootovat", wifi_use_default: "↩️ Compile-time default",
+      wifi_scan: "🔎 Vyhledat okolní WiFi", wifi_scanning: "Vyhledávám sítě…",
+      wifi_scan_hint: "Scan na několik sekund pozastaví CSI příjem. Během site learningu, kalibrace nebo OTA je blokovaný.",
+      wifi_scan_found: "Nalezeno sítí: {n}. Kliknutím vyber SSID.", wifi_scan_none: "Žádné viditelné sítě",
+      wifi_scan_failed: "Vyhledávání WiFi selhalo", wifi_scan_busy: "WiFi scan teď nelze spustit — probíhá údržba nebo učení.",
+      wifi_current: "připojeno", wifi_channel: "kanál", wifi_pass_required: "Pro novou zabezpečenou síť zadej heslo.",
       wifi_ssid_empty: "SSID nesmí být prázdné",
       wifi_save_confirm: "Uložit SSID '{ssid}' a rebootovat? Pokud je heslo špatné, ESP se nepřipojí a bude třeba factory reset (GPIO0 5s).",
       wifi_saved_reboot: "Uloženo. Rebootuji…",
@@ -156,7 +166,7 @@ const char index_html[] PROGMEM = R"rawliteral(
       save_config: "Uložit konfiguraci", upload_fw: "Nahrát Firmware", saved: "Uloženo",
       fw_update_title: "Aktualizace FW",
       pull_ota_title: "Pull OTA z URL",
-      pull_ota_help: "ESP si stáhne firmware sám z dané URL. Funguje s HTTPS. Přesměrování (redirect) se z bezpečnostních důvodů nenásleduje — zadej přímou URL na .bin. MD5 je povinné a slouží jako hlavní kontrola integrity firmware.",
+      pull_ota_help: "HTTPS Pull OTA vyžaduje uloženou CA; HTTP zůstává jen kompatibilní režim pro privátní LAN. Přesměrování se nenásleduje a MD5 je povinná kontrola integrity firmware.",
       pull_ota_btn: "⤓ Stáhnout a flashnout",
       pull_ota_running: "Stahuji & flashuji…",
       pull_ota_phase_idle: "—",
@@ -210,6 +220,12 @@ const char index_html[] PROGMEM = R"rawliteral(
       auto_calib: "📐 Auto-kalibrace prahu (10s)", reset_baseline: "♻️ Reset idle baseline",
       reconnect_wifi: "📶 Reconnect WiFi",
       csi_help: "<b>Auto-kalibrace:</b> 10s vzorkuje variance v klidu, nastaví práh = mean×1.5. Použij v prázdné místnosti.<br><b>Reset baseline:</b> vyčistí idle hodnoty. Po přesunu senzoru.<br><b>Reconnect WiFi:</b> restart asociace při RSSI dropech.",
+      csi_rssi_quality: "Kvalita WiFi pro CSI",
+      csi_rssi_hot: "Příliš silný — oddal zařízení od AP",
+      csi_rssi_hot_hint: "Signál je silnější než −40 dBm. Pro CSI může u blízkého AP dojít k saturaci; posuň zařízení dále.",
+      csi_rssi_good: "Vhodná",
+      csi_rssi_weak: "Slabý — CSI může mít nízké SNR",
+      csi_rssi_unavailable: "WiFi nepřipojena",
       site_learning: "SITE LEARNING (dlouhodobé)",
       learn_status: "Stav učení", learn_elapsed: "Uplynulo / cíl",
       learn_samples: "Přijaté / zamítnuté (pohyb / radar)", learn_bssid_resets: "BSSID resety",
@@ -220,9 +236,9 @@ const char index_html[] PROGMEM = R"rawliteral(
       learn_confirm_clear: "Smazat naučený model? Detekce se vrátí na tovární práh.",
       learn_idle: "Neaktivní", learn_running: "Běží", learn_done: "Dokončeno",
       learned_model: "NAUČENÝ MODEL", learned_ready: "Model připraven",
-      learned_thr: "Naučený práh", learned_mean: "Mean variance",
-      learned_std: "Std variance", learned_max: "Max variance", learned_samples: "Vzorků",
-      learn_refresh: "EMA refresh samples",
+      learned_thr: "Naučený práh", learned_mean: "Průměrná variance",
+      learned_std: "Směrodatná odchylka variance", learned_max: "Maximální variance", learned_samples: "Vzorků",
+      learn_refresh: "Vzorky obnovy EMA",
       learn_help: "<b>Site learning:</b> dlouhodobé vzorkování variance v prázdné místnosti (doporučeno 24–72 h). Radar-gate (LD2412) odfiltruje statické lidi. Po dokončení se automaticky nastaví <code>threshold = mean + 3×std</code>. <b>Učení přežívá OTA flash</b> (uloženo v NVS). Smazat model = reset na tovární hodnoty.",
       ml_mlp: "ML (MLP 17→18→9→1)", ml_enabled_lbl: "ML povoleno",
       ml_motion_lbl: "ML stav", ml_prob_lbl: "Pravděpodobnost",
@@ -276,7 +292,7 @@ const char index_html[] PROGMEM = R"rawliteral(
       title: "LD2412 Security", loading: "LOADING...", arm: "ARM", disarm: "DISARM",
       disarmed: "🔓 DISARMED", arming: "⏳ ARMING...", armed: "🔒 ARMED",
       pending: "⚠️ PENDING", triggered: "🚨 TRIGGERED",
-      sensor_health: "Sensor Health", uart_state: "UART State", frame_rate: "Frame Rate",
+      sensor_health: "Stav senzoru", uart_state: "Stav UART", frame_rate: "Snímková frekvence",
       ram: "RAM (Free/Min)", chip_temp: "Chip Temperature", uptime: "Uptime",
       factory_reset_confirm: "Really perform radar factory reset?",
       tab_basic: "Basic", tab_security: "Security", tab_gates: "Gate sensitivity",
@@ -318,8 +334,13 @@ const char index_html[] PROGMEM = R"rawliteral(
       ap_compat: "AP compatibility (HT LTF)", ap_ok: "OK", ap_incompat: "INCOMPATIBLE", ap_checking: "waiting for HT LTF…",
       ap_incompat_hint: "AP is not emitting 802.11n HT LTF frames (likely WiFi 6 hardware in n-mode). CSI is still passive but motion detection won't work. Use a pre-WiFi 6 AP.",
       wifi_ap: "WIFI AP (CSI)", wifi_ssid: "SSID", wifi_pass: "Password",
-      wifi_ap_hint: "Switch AP for the CSI sensor. Saving requires reboot. Empty = fall back to compile-time default from <code>secrets.h</code>.",
+      wifi_ap_hint: "Switch AP for the CSI sensor. Saving requires reboot. An empty password keeps the current one; the default button restores <code>secrets.h</code>.",
       save_reboot: "💾 Save and reboot", wifi_use_default: "↩️ Compile-time default",
+      wifi_scan: "🔎 Scan nearby WiFi", wifi_scanning: "Scanning networks…",
+      wifi_scan_hint: "Scanning pauses CSI capture for a few seconds. It is blocked during site learning, calibration, or OTA.",
+      wifi_scan_found: "Networks found: {n}. Click to select an SSID.", wifi_scan_none: "No visible networks",
+      wifi_scan_failed: "WiFi scan failed", wifi_scan_busy: "WiFi scan is unavailable while maintenance or learning is active.",
+      wifi_current: "connected", wifi_channel: "channel", wifi_pass_required: "Enter a password for the new secured network.",
       wifi_ssid_empty: "SSID cannot be empty",
       wifi_save_confirm: "Save SSID '{ssid}' and reboot? If the password is wrong the ESP won't associate and a factory reset (GPIO0 5s) will be required.",
       wifi_saved_reboot: "Saved. Rebooting…",
@@ -331,7 +352,7 @@ const char index_html[] PROGMEM = R"rawliteral(
       save_config: "Save Configuration", upload_fw: "Upload Firmware", saved: "Saved",
       fw_update_title: "Firmware Update",
       pull_ota_title: "Pull OTA from URL",
-      pull_ota_help: "Device fetches the firmware itself from the given URL. HTTPS supported; redirects are not followed (point the URL directly at the .bin). MD5 is required and is the primary firmware integrity check.",
+      pull_ota_help: "HTTPS Pull OTA requires a saved CA; HTTP remains a private-LAN compatibility mode. Redirects are not followed and MD5 remains required for artifact integrity.",
       pull_ota_btn: "⤓ Fetch & flash",
       pull_ota_running: "Fetching & flashing…",
       pull_ota_phase_idle: "—",
@@ -385,6 +406,12 @@ const char index_html[] PROGMEM = R"rawliteral(
       auto_calib: "📐 Auto-calibrate threshold (10s)", reset_baseline: "♻️ Reset idle baseline",
       reconnect_wifi: "📶 Reconnect WiFi",
       csi_help: "<b>Auto-calibration:</b> 10s variance sampling in idle, sets threshold = mean×1.5. Use in empty room.<br><b>Reset baseline:</b> clears idle values. After moving sensor.<br><b>Reconnect WiFi:</b> restarts association on RSSI drops.",
+      csi_rssi_quality: "WiFi quality for CSI",
+      csi_rssi_hot: "Too strong — move device away from AP",
+      csi_rssi_hot_hint: "Signal is stronger than −40 dBm. A nearby AP can saturate CSI; move the device farther away.",
+      csi_rssi_good: "Suitable",
+      csi_rssi_weak: "Weak — CSI may have low SNR",
+      csi_rssi_unavailable: "WiFi disconnected",
       site_learning: "SITE LEARNING (long-term)",
       learn_status: "Learning state", learn_elapsed: "Elapsed / target",
       learn_samples: "Accepted / rejected (motion / radar)", learn_bssid_resets: "BSSID resets",
@@ -904,6 +931,7 @@ const char index_html[] PROGMEM = R"rawliteral(
             <div class="stat-row"><span data-i18n="csi_active">Aktivní</span><span id="csi_active_val" style="font-weight:bold">—</span></div>
             <div class="stat-row"><span>WiFi SSID</span><span id="csi_ssid_val">—</span></div>
             <div class="stat-row"><span>WiFi RSSI</span><span id="csi_rssi_val">—</span></div>
+            <div class="stat-row"><span data-i18n="csi_rssi_quality">Kvalita WiFi pro CSI</span><span id="csi_rssi_quality_val">—</span></div>
             <div class="stat-row"><span data-i18n="packets_per_s">Pakety/s</span><span id="csi_pps_val">—</span></div>
             <div class="stat-row"><span data-i18n="csi_idle">Idle baseline připraven</span><span id="csi_idle_val">—</span></div>
             <div class="stat-row"><span data-i18n="ap_compat">AP kompatibilita (HT LTF)</span><span id="csi_ap_compat" style="font-weight:bold">—</span></div>
@@ -918,12 +946,12 @@ const char index_html[] PROGMEM = R"rawliteral(
             <div class="stat-row"><span data-i18n="variance_window" title="Rozptyl signálu v posledním okně vzorků">Variance (okno)</span><span id="csi_var_val">—</span></div>
             <svg id="csi_graph" viewBox="0 0 100 50" style="width:100%; height:60px; background:#1a1a1a; margin-top:5px; stroke:#03dac6"></svg>
 
-            <div class="section-title">FUSION (Radar + CSI)</div>
+            <div class="section-title">FÚZE (Radar + CSI)</div>
             <div class="stat-row">
                 <span data-i18n="fusion_state">Fusion stav</span>
                 <span id="fus_presence_val" style="font-weight:bold; font-size:1.2rem">—</span>
             </div>
-            <div class="stat-row"><span>Confidence</span><span id="fus_conf_val">—</span></div>
+            <div class="stat-row"><span>Spolehlivost</span><span id="fus_conf_val">—</span></div>
             <div class="stat-row"><span data-i18n="detection_src">Zdroj detekce</span><span id="fus_source_val">—</span></div>
             <div class="stat-row">
                 <span data-i18n="fusion_enabled">Fusion povoleno</span>
@@ -961,7 +989,7 @@ const char index_html[] PROGMEM = R"rawliteral(
             <input type="range" id="csi_pub" min="200" max="5000" step="100" value="1000"
                    oninput="$('csi_pub_lbl').innerText=this.value">
 
-            <div class="section-title" data-collapsed style="margin-top:14px">TRAFFIC GENERATOR</div>
+            <div class="section-title" data-collapsed style="margin-top:14px">GENERÁTOR PROVOZU</div>
             <div class="stat-row">
                 <span data-i18n="tgen_mode">Režim</span>
                 <select id="csi_tmode" style="width:auto; padding:4px 8px" onchange="$('csi_udp_port_row').style.display=this.value==='udp'?'flex':'none'">
@@ -981,14 +1009,18 @@ const char index_html[] PROGMEM = R"rawliteral(
 
             <button onclick="saveCSIConfig()" style="margin-top:12px" data-i18n="save_config">Uložit konfiguraci</button>
 
-            <div class="section-title" data-collapsed data-i18n="wifi_ap">WIFI AP (CSI)</div>
+            <div class="section-title"  data-i18n="wifi_ap">WIFI AP (CSI)</div>
             <div style="font-size:0.75rem; color:#888; margin-bottom:6px" data-i18n="wifi_ap_hint">
-                Přepnutí AP pro CSI senzor. Uložení vyžaduje reboot. Prázdné = fallback na compile-time default ze <code>secrets.h</code>.
+                Přepnutí AP pro CSI senzor. Uložení vyžaduje reboot. Prázdné heslo ponechá stávající; tlačítko default obnoví údaje ze <code>secrets.h</code>.
             </div>
             <label style="font-size:0.85rem" data-i18n="wifi_ssid">SSID</label>
-            <input type="text" id="csi_wifi_ssid" maxlength="32" placeholder="—" style="margin-bottom:6px">
+            <input type="text" id="csi_wifi_ssid" maxlength="32" placeholder="—" oninput="csiWifiSelectionChanged()" style="margin-bottom:6px">
             <label style="font-size:0.85rem" data-i18n="wifi_pass">Heslo</label>
             <input type="password" id="csi_wifi_pass" maxlength="64" placeholder="(nemění se pokud prázdné při edit)" data-i18n-ph="ph_wifi_pass_hint" style="margin-bottom:6px">
+            <button id="csi_wifi_scan_btn" onclick="startCsiWifiScan()" class="sec" data-i18n="wifi_scan">🔎 Vyhledat okolní WiFi</button>
+            <div style="font-size:0.72rem; color:#777; margin-top:4px" data-i18n="wifi_scan_hint">Scan na několik sekund pozastaví CSI příjem.</div>
+            <div id="csi_wifi_scan_status" style="font-size:0.78rem; color:#aaa; min-height:1.1em; margin-top:6px"></div>
+            <div id="csi_wifi_scan_results" class="wifi-scan-list"></div>
             <div style="display:flex; gap:6px; flex-wrap:wrap">
                 <button onclick="saveCsiWifi()" class="warn" style="flex:2; min-width:140px" data-i18n="save_reboot">💾 Uložit a rebootovat</button>
                 <button onclick="resetCsiWifi()" class="sec" style="flex:1; min-width:120px" data-i18n="wifi_use_default">↩️ Compile-time default</button>
@@ -1050,40 +1082,40 @@ const char index_html[] PROGMEM = R"rawliteral(
             <div class="section-title" data-collapsed style="margin-top:14px" data-i18n="learned_model">NAUČENÝ MODEL</div>
             <div class="stat-row"><span data-i18n="learned_ready">Model připraven</span><span id="csi_lm_ready">—</span></div>
             <div class="stat-row"><span data-i18n="learned_thr">Naučený práh</span><span id="csi_lm_thr">—</span></div>
-            <div class="stat-row"><span data-i18n="learned_mean">Mean variance</span><span id="csi_lm_mean">—</span></div>
-            <div class="stat-row"><span data-i18n="learned_std">Std variance</span><span id="csi_lm_std">—</span></div>
-            <div class="stat-row"><span data-i18n="learned_max">Max variance</span><span id="csi_lm_max">—</span></div>
+            <div class="stat-row"><span data-i18n="learned_mean">Průměrná variance</span><span id="csi_lm_mean">—</span></div>
+            <div class="stat-row"><span data-i18n="learned_std">Směrodatná odchylka variance</span><span id="csi_lm_std">—</span></div>
+            <div class="stat-row"><span data-i18n="learned_max">Maximální variance</span><span id="csi_lm_max">—</span></div>
             <div class="stat-row"><span data-i18n="learned_samples">Vzorků</span><span id="csi_lm_samples">—</span></div>
-            <div class="stat-row"><span data-i18n="learn_refresh">EMA refresh samples</span><span id="csi_lm_refresh">—</span></div>
+            <div class="stat-row"><span data-i18n="learn_refresh">Vzorky obnovy EMA</span><span id="csi_lm_refresh">—</span></div>
             <div style="font-size:0.75rem; color:#777; margin-top:8px">
                 <span data-i18n="learn_help"><b>Site learning:</b> dlouhodobé vzorkování variance v prázdné místnosti (doporučeno 24–72 h). Radar-gate (LD2412) odfiltruje statické lidi. Po dokončení se automaticky nastaví <code>threshold = mean + 3×std</code>. <b>Učení přežívá OTA flash</b> (uloženo v NVS). Smazat model = reset na tovární hodnoty.</span>
             </div>
 
-            <div class="section-title" data-collapsed style="margin-top:14px">SITE MODEL (candidate / apply / rollback)</div>
+            <div class="section-title" data-collapsed style="margin-top:14px">MODEL STANOVIŠTĚ (kandidát / použít / vrátit)</div>
             <div id="csi_sm_wrap" style="font-size:0.85rem">
-              <div class="stat-row"><span>Active</span><span id="csi_sm_active">—</span></div>
-              <div class="stat-row"><span>Candidate</span><span id="csi_sm_cand">—</span></div>
-              <div class="stat-row"><span>Previous</span><span id="csi_sm_prev">—</span></div>
-              <div class="stat-row"><span>Difference (cand vs active)</span><span id="csi_sm_diff">—</span></div>
+              <div class="stat-row"><span>Aktivní</span><span id="csi_sm_active">—</span></div>
+              <div class="stat-row"><span>Kandidát</span><span id="csi_sm_cand">—</span></div>
+              <div class="stat-row"><span>Předchozí</span><span id="csi_sm_prev">—</span></div>
+              <div class="stat-row"><span>Rozdíl (kandidát vs. aktivní)</span><span id="csi_sm_diff">—</span></div>
               <div id="csi_sm_note" style="font-size:0.78rem; color:#aaa; margin-top:4px"></div>
               <div style="display:flex; flex-wrap:wrap; gap:6px; margin-top:8px">
-                <button class="sec" id="csi_sm_apply" style="flex:1; min-width:110px" onclick="csiApplyModel()">✅ Apply candidate</button>
-                <button class="sec" id="csi_sm_discard" style="flex:1; min-width:110px" onclick="csiDiscardCandidate()">🗑 Discard candidate</button>
-                <button class="sec" id="csi_sm_rollback" style="flex:1; min-width:110px" onclick="csiRollbackModel()">↩ Rollback</button>
+                <button class="sec" id="csi_sm_apply" style="flex:1; min-width:110px" onclick="csiApplyModel()">✅ Použít kandidáta</button>
+                <button class="sec" id="csi_sm_discard" style="flex:1; min-width:110px" onclick="csiDiscardCandidate()">🗑 Zahodit kandidáta</button>
+                <button class="sec" id="csi_sm_rollback" style="flex:1; min-width:110px" onclick="csiRollbackModel()">↩ Vrátit předchozí</button>
               </div>
               <div style="font-size:0.75rem; color:#777; margin-top:8px">
-                Finished learning creates a <b>candidate</b> — detection keeps using the <b>active</b> model until you Apply. Apply keeps the old model as a rollback slot; the alarm is never changed by learning.
+                Dokončené učení vytvoří <b>kandidáta</b> — detekce používá <b>aktivní</b> model, dokud kandidáta nepoužiješ. Původní model zůstane pro návrat; učení alarm nikdy nemění.
               </div>
             </div>
 
             <div class="section-title" data-collapsed style="margin-top:14px">CSI DIAGNOSTIKA (P1 · read-only)</div>
             <div style="font-size:0.85rem">
-              <div class="stat-row"><span>Health</span><span id="csi_dg_health">—</span></div>
-              <div class="stat-row"><span>Last decision</span><span id="csi_dg_decision">—</span></div>
-              <div class="stat-row"><span>Shadow (candidate)</span><span id="csi_dg_shadow">—</span></div>
-              <div class="stat-row"><span>Event ring</span><span id="csi_dg_events">—</span></div>
+              <div class="stat-row"><span>Stav</span><span id="csi_dg_health">—</span></div>
+              <div class="stat-row"><span>Poslední rozhodnutí</span><span id="csi_dg_decision">—</span></div>
+              <div class="stat-row"><span>Stínový model (kandidát)</span><span id="csi_dg_shadow">—</span></div>
+              <div class="stat-row"><span>Prstenec událostí</span><span id="csi_dg_events">—</span></div>
               <div style="font-size:0.75rem; color:#777; margin-top:8px">
-                Read-only diagnostics. <b>Shadow</b> runs the candidate model in parallel — <b>NO ALARM EFFECT</b>. Full detail: <code>/api/csi/{decision,health,events,shadow}</code>.
+                Diagnostika pouze pro čtení. <b>Stínový model</b> běží souběžně — <b>BEZ VLIVU NA ALARM</b>. Podrobnosti: <code>/api/csi/{decision,health,events,shadow}</code>.
               </div>
             </div>
 
@@ -1136,6 +1168,14 @@ const char index_html[] PROGMEM = R"rawliteral(
         <input type="text" id="pull_md5" maxlength="32" placeholder="MD5 checksum (required)" data-i18n-ph="ph_md5_required" style="width:100%; box-sizing:border-box; margin-bottom:6px">
         <div id="pull_status" style="margin-top:4px; font-size:0.85em; color:#aaa; min-height:1.1em"></div>
         <button id="btn_pull" onclick="pullFW()" class="sec" data-i18n="pull_ota_btn">⤓ Stáhnout a flashnout</button>
+        <details style="margin-top:10px; font-size:0.8em">
+            <summary>HTTPS CA profil</summary>
+            <div id="ota_trust_status" style="margin:6px 0; color:#aaa">Načítám stav…</div>
+            <textarea id="ota_ca_pem" maxlength="3072" placeholder="-----BEGIN CERTIFICATE-----" style="width:100%; min-height:90px; box-sizing:border-box"></textarea>
+            <button type="button" onclick="saveOtaTrust()" class="sec">Uložit CA pro HTTPS Pull OTA</button>
+            <button type="button" onclick="clearOtaTrust()" class="sec">Smazat CA</button>
+            <p style="color:#888">Certifikát je write-only; záloha konfigurace jej neobsahuje. HTTP na privátní LAN zůstává kompatibilní, ale není transportně ověřené.</p>
+        </details>
     </div>
   </div>
 
@@ -1145,12 +1185,15 @@ const char index_html[] PROGMEM = R"rawliteral(
 // --- CORE ---
 const $ = id => document.getElementById(id);
 const api = (ep, opts={}) => {
-    // ESPAsyncWebServer hasParam() only checks query params, not POST body
-    // Convert URLSearchParams body to query string automatically
-    if(opts.body instanceof URLSearchParams) {
+    // ESPAsyncWebServer hasParam() only checks query params, not POST body, so
+    // URLSearchParams bodies are folded into the query string by default.
+    // EXCEPTION: opts.inBody keeps it a real form POST body — used for secrets
+    // (MQTT password/PIN) that must never land in the URL / logs (S-0).
+    if(opts.body instanceof URLSearchParams && !opts.inBody) {
         ep += (ep.includes('?') ? '&' : '?') + opts.body.toString();
         delete opts.body;
     }
+    delete opts.inBody;
     return fetch('/api/'+ep, opts).then(r => {
         if(r.ok) showToast("OK"); else showToast(t('error'));
         return r;
@@ -1214,6 +1257,7 @@ function init() {
         if(d.hostname) $('txt_hostname').value = d.hostname;
         updateHealth(d);
     });
+    loadOtaTrust();
     
     // Load Configs
     loadMainConfig();
@@ -1466,6 +1510,7 @@ function loadCSIConfig() {
         $('csi_active_val').style.color = d.active ? 'var(--accent)' : '#888';
         $('csi_ssid_val').innerText  = d.wifi_ssid || '—';
         $('csi_rssi_val').innerText  = (d.wifi_rssi !== undefined && d.wifi_rssi !== 0) ? (d.wifi_rssi + ' dBm') : '—';
+        renderCsiRssiQuality(d.wifi_rssi);
         $('csi_pps_val').innerText   = (d.pps !== undefined) ? d.pps.toFixed(1) : '—';
         $('csi_idle_val').innerText  = d.idle_ready ? t('yes') : t('no_collecting');
         if (d.ht_ltf_seen !== undefined) {
@@ -1597,6 +1642,30 @@ function renderCsiMainPanel(csi) {
     link.innerText = linkTxt;
 }
 
+// CSI needs a WiFi association even though this PoE device uses Ethernet for
+// normal networking.  Both weak and excessively strong RSSI can degrade CSI.
+function renderCsiRssiQuality(rssi) {
+    const el = $('csi_rssi_quality_val');
+    if (!el) return;
+    if (rssi === undefined || rssi === 0) {
+        el.innerText = t('csi_rssi_unavailable');
+        el.style.color = '#888';
+        el.title = '';
+    } else if (rssi > -40) {
+        el.innerText = t('csi_rssi_hot');
+        el.style.color = 'var(--warn)';
+        el.title = t('csi_rssi_hot_hint');
+    } else if (rssi < -70) {
+        el.innerText = t('csi_rssi_weak');
+        el.style.color = 'var(--warn)';
+        el.title = '';
+    } else {
+        el.innerText = t('csi_rssi_good');
+        el.style.color = 'var(--accent)';
+        el.title = '';
+    }
+}
+
 function updateCSIUI(csi) {
     // Called from SSE telemetry handler with the `csi` sub-object
     if (!csi) return;
@@ -1615,7 +1684,10 @@ function updateCSIUI(csi) {
     if (csi.composite !== undefined) $('csi_comp_val').innerText = csi.composite.toFixed(4);
     if (csi.variance !== undefined)  $('csi_var_val').innerText  = csi.variance.toFixed(4);
     if (csi.pps !== undefined)       $('csi_pps_val').innerText  = csi.pps.toFixed(1);
-    if (csi.rssi !== undefined && csi.rssi !== 0) $('csi_rssi_val').innerText = csi.rssi + ' dBm';
+    if (csi.rssi !== undefined) {
+        $('csi_rssi_val').innerText = csi.rssi !== 0 ? csi.rssi + ' dBm' : '—';
+        renderCsiRssiQuality(csi.rssi);
+    }
 
     // Calibration progress bar
     if (csi.calibrating) {
@@ -1693,22 +1765,115 @@ function csiReconnect() {
     api('csi/reconnect', {method:'POST'});
 }
 
+let csiWifiLoadedSsid = '';
+let csiWifiSelectedNetwork = null;
+let csiWifiScanTimer = null;
+let csiWifiScanPolls = 0;
+
 function loadCsiWifi() {
     api('csi/wifi').then(r => r.json()).then(d => {
-        if (d && d.ssid) $('csi_wifi_ssid').value = d.ssid;
+        if (d && d.ssid) {
+            $('csi_wifi_ssid').value = d.ssid;
+            csiWifiLoadedSsid = d.ssid;
+        }
+        csiWifiSelectedNetwork = null;
         $('csi_wifi_pass').value = '';
     }).catch(() => {});
+}
+
+function csiWifiSelectionChanged() {
+    if (csiWifiSelectedNetwork && $('csi_wifi_ssid').value !== csiWifiSelectedNetwork.ssid) {
+        csiWifiSelectedNetwork = null;
+    }
+}
+
+function renderCsiWifiScan(data) {
+    const list = $('csi_wifi_scan_results');
+    list.innerHTML = '';
+    const networks = Array.isArray(data.networks) ? data.networks : [];
+    if (!networks.length) {
+        $('csi_wifi_scan_status').innerText = t('wifi_scan_none');
+        return;
+    }
+    $('csi_wifi_scan_status').innerText = t('wifi_scan_found').replace('{n}', networks.length);
+    networks.forEach(n => {
+        const row = document.createElement('button');
+        row.type = 'button';
+        row.className = 'wifi-scan-row';
+        const name = document.createElement('span');
+        name.className = 'wifi-scan-name';
+        name.textContent = (n.current ? '✓ ' : '') + n.ssid;
+        const meta = document.createElement('span');
+        meta.className = 'wifi-scan-meta';
+        meta.textContent = n.rssi + ' dBm · ' + t('wifi_channel') + ' ' + n.channel + ' · ' + (n.secure ? '🔒 ' : '') + n.security;
+        if (n.current) meta.textContent += ' · ' + t('wifi_current');
+        meta.style.color = n.rssi >= -55 ? 'var(--accent)' : (n.rssi >= -70 ? '#d6b85a' : 'var(--warn)');
+        row.appendChild(name);
+        row.appendChild(meta);
+        row.addEventListener('click', () => {
+            csiWifiSelectedNetwork = n;
+            $('csi_wifi_ssid').value = n.ssid;
+            $('csi_wifi_pass').value = '';
+            if (n.secure && n.ssid !== csiWifiLoadedSsid) $('csi_wifi_pass').focus();
+        });
+        list.appendChild(row);
+    });
+}
+
+function pollCsiWifiScan() {
+    fetch('/api/csi/wifi/scan').then(r => r.json()).then(d => {
+        if (d.status === 'running') {
+            csiWifiScanPolls++;
+            if (csiWifiScanPolls < 40) {
+                csiWifiScanTimer = setTimeout(pollCsiWifiScan, 500);
+                return;
+            }
+            d.status = 'failed';
+        }
+        $('csi_wifi_scan_btn').disabled = false;
+        if (d.status === 'complete') renderCsiWifiScan(d);
+        else $('csi_wifi_scan_status').innerText = t('wifi_scan_failed');
+    }).catch(() => {
+        $('csi_wifi_scan_btn').disabled = false;
+        $('csi_wifi_scan_status').innerText = t('wifi_scan_failed');
+    });
+}
+
+function startCsiWifiScan() {
+    if (csiWifiScanTimer) clearTimeout(csiWifiScanTimer);
+    csiWifiScanPolls = 0;
+    $('csi_wifi_scan_btn').disabled = true;
+    $('csi_wifi_scan_status').innerText = t('wifi_scanning');
+    $('csi_wifi_scan_results').innerHTML = '';
+    fetch('/api/csi/wifi/scan', {method:'POST'}).then(r =>
+        r.json().catch(() => ({})).then(d => ({ok:r.ok, data:d}))
+    ).then(result => {
+        if (!result.ok) {
+            $('csi_wifi_scan_btn').disabled = false;
+            $('csi_wifi_scan_status').innerText = result.data.status === 'busy' ? t('wifi_scan_busy') : t('wifi_scan_failed');
+            return;
+        }
+        pollCsiWifiScan();
+    }).catch(() => {
+        $('csi_wifi_scan_btn').disabled = false;
+        $('csi_wifi_scan_status').innerText = t('wifi_scan_failed');
+    });
 }
 
 function saveCsiWifi() {
     let ssid = $('csi_wifi_ssid').value.trim();
     let pass = $('csi_wifi_pass').value;
     if (!ssid) { showToast(t('wifi_ssid_empty')); return; }
+    let selected = csiWifiSelectedNetwork && csiWifiSelectedNetwork.ssid === ssid ? csiWifiSelectedNetwork : null;
+    if (ssid !== csiWifiLoadedSsid && !pass && (!selected || selected.secure)) {
+        showToast(t('wifi_pass_required')); return;
+    }
     if (!confirm(t('wifi_save_confirm').replace('{ssid}', ssid))) return;
     let p = new URLSearchParams();
     p.append('ssid', ssid);
     p.append('pass', pass);
-    api('csi/wifi', {method:'POST', body:p}).then(r => r.json()).then(d => {
+    if (selected && !selected.secure && !pass) p.append('clear_pass', '1');
+    api('csi/wifi', {method:'POST', body:p, inBody:true}).then(r => r.json()).then(d => {
         if (d && d.saved) {
             showToast(t('wifi_saved_reboot'));
             setTimeout(() => api('restart', {method:'POST'}), 1500);
@@ -1722,7 +1887,7 @@ function resetCsiWifi() {
     if (!confirm(t('wifi_reset_confirm'))) return;
     let p = new URLSearchParams();
     p.append('reset', '1');
-    api('csi/wifi', {method:'POST', body:p}).then(r => r.json()).then(d => {
+    api('csi/wifi', {method:'POST', body:p, inBody:true}).then(r => r.json()).then(d => {
         if (d && d.saved) {
             showToast(t('wifi_reset_reboot'));
             setTimeout(() => api('restart', {method:'POST'}), 1500);
@@ -1830,9 +1995,9 @@ function csiRenderDiagnostics() {
 function csiApplyModel() {
     api('csi/site_model').then(r=>r.json()).then(d => {
         let a = d.active, c = d.candidate;
-        let msg = 'Apply candidate model?\n\n';
-        msg += 'Active:    ' + fmtSlot(a) + '\n';
-        msg += 'Candidate: ' + fmtSlot(c) + '\n';
+        let msg = 'Použít kandidátní model?\n\n';
+        msg += 'Aktivní:      ' + fmtSlot(a) + '\n';
+        msg += 'Kandidát: ' + fmtSlot(c) + '\n';
         if (c && c.valid && a && a.valid && a.threshold > 0) {
             let pct = (c.threshold - a.threshold) / a.threshold * 100;
             msg += '\nThreshold change: ' + (pct>=0?'+':'') + pct.toFixed(1) + ' %';
@@ -2053,8 +2218,6 @@ function loadSecurityConfig() {
         $('chk_loit_en').checked = d.loiter_alert !== false;
         $('i_hb').value = d.heartbeat || 4;
         $('i_pet').value = d.pet_immunity || 0;
-        $('i_rssi_thresh').value = d.rssi_threshold || -80;
-        $('i_rssi_drop').value = d.rssi_drop || 20;
     }).catch(e => console.log('Security config not loaded'));
 
     // Load Light Config
@@ -2097,8 +2260,6 @@ function saveSec() {
     let lo_en = $('chk_loit_en').checked ? 1 : 0;
     let hb = $('i_hb').value;
     let pt = $('i_pet').value;
-    let rt = $('i_rssi_thresh').value;
-    let rd = $('i_rssi_drop').value;
     
     api(`security/config`, {
         method: 'POST',
@@ -2109,8 +2270,6 @@ function saveSec() {
             'loiter_alert': lo_en,
             'heartbeat': hb,
             'pet': pt,
-            'rssi_threshold': rt,
-            'rssi_drop': rd
         })
     });
 }
@@ -2135,6 +2294,7 @@ function saveMQTTConfig() {
 
     api(`mqtt/config`, {
         method: 'POST',
+        inBody: true,   // keep the broker password out of the URL (S-0)
         body: new URLSearchParams({
             'enabled': en,
             'server': s,
@@ -2213,11 +2373,23 @@ function saveTelegram() {
 }
 function testTelegram() {
     fetch('/api/telegram/test', {method:'POST'})
-    .then(r => r.json())
-    .then(d => {
-        showToast(d.success ? "Telegram OK!" : t('tg_error') + ": " + (d.error || t('tg_unknown')));
+    .then(async r => {
+        const d = await r.json();
+        if (!r.ok || !d.accepted) throw new Error(d.error || t('tg_unknown'));
+        showToast('Telegram: queued');
+        for (let attempt = 0; attempt < 160; attempt++) {
+            await new Promise(resolve => setTimeout(resolve, 500));
+            const statusResponse = await fetch('/api/telegram/test/status?id=' + encodeURIComponent(d.request_id));
+            const status = await statusResponse.json();
+            if (!statusResponse.ok) throw new Error(status.error || t('tg_unknown'));
+            if (status.done) {
+                showToast(status.success ? "Telegram OK!" : t('tg_error'));
+                return;
+            }
+        }
+        throw new Error('timeout');
     })
-    .catch(e => showToast(t('comm_error')));
+    .catch(e => showToast(t('tg_error') + ': ' + (e.message || t('comm_error'))));
 }
 
 // --- Timezone ---
@@ -2558,6 +2730,20 @@ function prepareEspota() {
 }
 
 // --- PULL OTA ---
+function loadOtaTrust() {
+    fetch('/api/ota/trust', {credentials:'include'}).then(r => r.json()).then(d => {
+        $('ota_trust_status').innerText = d.https_configured ? '✅ HTTPS CA je uložená a ověřování je aktivní.' : '⚠️ HTTPS Pull OTA je blokované, dokud neuložíš CA.';
+    }).catch(() => { $('ota_trust_status').innerText = '❌ Stav CA nelze načíst.'; });
+}
+function saveOtaTrust() {
+    const ca = ($('ota_ca_pem').value || '').trim();
+    if (!ca) { $('ota_trust_status').innerText = '⚠️ Vlož PEM CA certifikát.'; return; }
+    fetch('/api/ota/trust', {method:'POST', credentials:'include', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ca_pem:ca})}).then(r => r.text().then(text => { if (!r.ok) throw new Error(text || ('HTTP ' + r.status)); })).then(() => { $('ota_ca_pem').value = ''; loadOtaTrust(); showToast('HTTPS CA uložena'); }).catch(e => { $('ota_trust_status').innerText = '❌ ' + e.message; });
+}
+function clearOtaTrust() {
+    if (!confirm('Odebrat CA? HTTPS Pull OTA pak bude blokované.')) return;
+    fetch('/api/ota/trust', {method:'POST', credentials:'include', headers:{'Content-Type':'application/json'}, body:'{"clear":true}'}).then(r => r.text().then(text => { if (!r.ok) throw new Error(text || ('HTTP ' + r.status)); })).then(loadOtaTrust).catch(e => { $('ota_trust_status').innerText = '❌ ' + e.message; });
+}
 function _pullStatus(msg) { $('pull_status').innerText = msg || ''; }
 function _pullPhaseLabel(phase) {
     if (phase === "accepted" || phase === "connecting") return t("pull_ota_phase_connecting");
@@ -2677,8 +2863,10 @@ function saveAuth() {
     if(p !== p2) { showToast(t('pass_mismatch')); return; }
     if(u.length < 4 || p.length < 4) { showToast(t('min_4_chars')); return; }
 
-    fetch(`/api/auth/config?user=${encodeURIComponent(u)}&pass=${encodeURIComponent(p)}`, {
-        method: 'POST'
+    fetch('/api/auth/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ user: u, pass: p })
     }).then(r => {
         if(r.ok) { showToast(t('pass_changed')); alert(t('creds_changed')); }
         else r.text().then(errTxt => showToast(errTxt || t('error')));

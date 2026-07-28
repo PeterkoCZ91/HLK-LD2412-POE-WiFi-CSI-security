@@ -7,6 +7,8 @@
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 #include <atomic>
+#include "services/MqttPublishResult.h"
+#include "services/RuntimeOperationCoordinator.h"
 #include "secrets.h"
 #include "services/MQTTOfflineBuffer.h"
 
@@ -103,6 +105,12 @@ struct MQTTTopics {
     char fusion_confidence[64];
     char fusion_source[64];
 
+    // CSI WiFi scan/capture diagnostics (retained JSON state)
+    char csi_wifi_scan[64];
+
+    // Unified runtime operation state (retained text)
+    char runtime_operation[64];
+
     // OTA / planned-restart signal — HA automations should not treat this
     // device going offline as a real problem while maintenance == "1"
     char maintenance[64];
@@ -113,13 +121,24 @@ public:
     MQTTService();
 
     void begin(Preferences* prefs, const char* deviceId, const char* fwVersion = "unknown");
+    void setRuntimeOperationCoordinator(RuntimeOperationCoordinator* coordinator) {
+        _runtimeOperationCoordinator = coordinator;
+    }
     void update();
     bool connected();
     // True when a broker is configured (MQTT intended). Distinguishes "disconnected"
     // from "intentionally off" for the pre-arm health check.
     bool isConfigured() const { return _server[0] != '\0'; }
-    bool publish(const char* topic, const char* payload, bool retained = false);
+    PublishResult publishResult(const char* topic, const char* payload,
+                                bool retained = false, uint64_t eventId = 0);
+    bool publish(const char* topic, const char* payload, bool retained = false) {
+        return publishResult(topic, payload, retained) == PublishResult::PUBLISHED;
+    }
     unsigned long getLastPublishTime() const { return _lastPublish; }
+    // v5.4.1: true az po prvnim REALNEM uspesnem publishi od bootu —
+    // _lastPublish je inicializovany na millis(), takze sam o sobe
+    // "necerstvost" nedokazuje (viz DmsPolicy.h).
+    bool publishedSinceBoot() const { return _publishedSinceBoot; }
     void forceReconnect();
 
     // Publish health diagnostics (v4.5.6)
@@ -140,24 +159,27 @@ public:
     const char* getPort() const { return _port; }
     bool consumeReconnect() { bool v = _justReconnected; _justReconnected = false; return v; }
 
-    // csi10w: halt all MQTT activity (loop + reconnect) while HTTP/ArduinoOTA
-    // upload is in flight. Without this, a failing self-IP reconnect attempt
-    // opens/closes lwIP sockets mid-chunk and disturbs the AsyncTCP receive
-    // path, producing non-deterministic upload stalls.
-    static void setOtaInProgress(bool active) { _otaInProgress.store(active); }
-    static bool isOtaInProgress() { return _otaInProgress.load(); }
-
     // Retained "1"/"0" on security/<id>/maintenance. Publishes directly via
-    // the underlying MQTT client, bypassing the _otaInProgress guard in
+    // the underlying MQTT client, bypassing the runtime-operation guard in
     // publish() (MQTTService.cpp:261) — otherwise the "starting" edge would
-    // be dropped the instant setOtaInProgress(true) takes effect. See
+    // be dropped after the OTA operation claim. See
     // docs/superpowers/specs/2026-07-13-mqtt-maintenance-signal-design.md
     void publishMaintenance(bool active);
+    void requestMaintenancePublish(bool active) {
+        _pendingMaintenance.store(active ? 1 : 0, std::memory_order_release);
+    }
+    void processDeferredActions();
 
 private:
+    bool _isOtaInProgress() const {
+        return _runtimeOperationCoordinator != nullptr &&
+               _runtimeOperationCoordinator->status().operation == RuntimeOperation::OTA;
+    }
+    bool _publishedSinceBoot = false;
     void setupClient();
     void connect();
     void generateTopics();
+    void _publishRuntimeOperationState();
     void publishDiscoveryStep();
     void publishOneDiscovery(const char* type, const char* uid, const char* name, const char* state_topic, const char* unit, const char* icon, const char* dev_class, const char* extra);
     static void mqttCallbackStatic(char* topic, byte* payload, unsigned int length);
@@ -166,6 +188,8 @@ private:
     #ifdef MQTTS_ENABLED
     #if MQTTS_ENABLED == 1
     WiFiClientSecure _espClient;
+    String _tlsCa;
+    bool _tlsTrustReady = false;
     #else
     WiFiClient _espClient;
     #endif
@@ -206,7 +230,9 @@ private:
     int  _lastFailState = 0;
 
     static MQTTService* _instance;
-    static std::atomic<bool> _otaInProgress;
+    RuntimeOperationCoordinator* _runtimeOperationCoordinator = nullptr;
+    uint8_t _lastRuntimeOperation = 0xFF;
+    std::atomic<int8_t> _pendingMaintenance{-1};
 };
 
 #endif

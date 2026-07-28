@@ -3,6 +3,8 @@
 #include "services/SecurityMonitor.h"
 #include "debug.h"
 #include "secrets.h"
+#include "services/OtaTlsTrustPolicy.h"
+#include "services/TlsMemoryPolicy.h"
 #ifndef FW_VERSION
 #define FW_VERSION "unknown"
 #endif
@@ -40,7 +42,13 @@ void TelegramService::begin(Preferences* prefs) {
     chatId.toCharArray(_chatId, 20);
 
     if (_enabled && strlen(_token) > 10 && strlen(_chatId) > 0) {
-        _client.setInsecure();
+        _tlsCa = _prefs->getString("tg_tls_ca", "");
+        if (!otaTlsPemValid(_tlsCa.c_str()) || !tlsMemoryAllowsHandshake(ESP.getFreeHeap(), ESP.getMaxAllocHeap(), _tlsCa.length())) {
+            DBG("Telegram", "Direct mode blocked: TLS trust or heap unavailable");
+            _enabled = false;
+            return;
+        }
+        _client.setCACert(_tlsCa.c_str());
         _bot = new AsyncTelegram2(_client);
         _bot->setUpdateTime(5000);
         _bot->setTelegramToken(_token);
@@ -71,23 +79,36 @@ void TelegramService::telegramLoop() {
     for (;;) {
         // 1. Process outgoing message queue (non-blocking, 100ms wait)
         if (_sendQueue && xQueueReceive(_sendQueue, &item, pdMS_TO_TICKS(100)) == pdTRUE) {
+            if (item.requestId != 0) {
+                _testTracker.markSending(item.requestId);
+            }
             if (ETH.linkUp() && _bot) {
                 bool ok = sendMessageDirect(String(item.text));
                 if (!ok && item.retries < 3) {
                     item.retries++;
-                    xQueueSendToFront(_sendQueue, &item, pdMS_TO_TICKS(10));
-                    vTaskDelay(pdMS_TO_TICKS(3000));
+                    if (xQueueSendToFront(_sendQueue, &item, pdMS_TO_TICKS(10)) == pdTRUE) {
+                        vTaskDelay(pdMS_TO_TICKS(3000));
+                    } else {
+                        finishTest(item, TelegramTestState::FAILED);
+                    }
                 } else if (!ok) {
                     DBG("Telegram", "Message permanently dropped after %d retries", item.retries);
+                    finishTest(item, TelegramTestState::FAILED);
+                } else {
+                    finishTest(item, TelegramTestState::SUCCEEDED);
                 }
             } else {
                 // WiFi down — put back in queue for later
                 if (item.retries < 5) {
                     item.retries++;
-                    xQueueSendToFront(_sendQueue, &item, pdMS_TO_TICKS(10));
-                    vTaskDelay(pdMS_TO_TICKS(5000));
+                    if (xQueueSendToFront(_sendQueue, &item, pdMS_TO_TICKS(10)) == pdTRUE) {
+                        vTaskDelay(pdMS_TO_TICKS(5000));
+                    } else {
+                        finishTest(item, TelegramTestState::FAILED);
+                    }
                 } else {
                     DBG("Telegram", "Message dropped (offline) after %d retries", item.retries);
+                    finishTest(item, TelegramTestState::FAILED);
                 }
             }
             continue; // Prioritize sending over polling
@@ -110,6 +131,11 @@ void TelegramService::update() {
     // Polling and sending moved to background task — nothing to do here
 }
 
+bool TelegramService::tlsHandshakeAllowed() const {
+    return otaTlsPemValid(_tlsCa.c_str()) &&
+           tlsMemoryAllowsHandshake(ESP.getFreeHeap(), ESP.getMaxAllocHeap(), _tlsCa.length());
+}
+
 // Non-blocking: enqueue message for background task
 bool TelegramService::sendMessage(const String& text) {
     if (!_enabled || !_connected) {
@@ -127,7 +153,7 @@ bool TelegramService::sendMessage(const String& text) {
     item.text[sizeof(item.text) - 1] = '\0';
 
     if (xQueueSend(_sendQueue, &item, pdMS_TO_TICKS(50)) == pdTRUE) {
-        DBG("Telegram", "Queued: %.40s...", text.c_str());
+        DBG("Telegram", "Queued message (%u B)", (unsigned)text.length());
         return true;
     }
 
@@ -136,16 +162,50 @@ bool TelegramService::sendMessage(const String& text) {
     return false;
 }
 
-// Actual blocking send — called from background task or directly for diagnostics
+uint32_t TelegramService::enqueueTestMessage(const String& text) {
+    if (!_enabled || !_connected || !_sendQueue) return 0;
+
+    uint32_t requestId = _nextTestRequestId.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (requestId == 0) {
+        requestId = _nextTestRequestId.fetch_add(1, std::memory_order_relaxed) + 1;
+    }
+
+    if (!_testTracker.begin(requestId)) return 0;
+
+    TelegramQueueItem item;
+    strncpy(item.text, text.c_str(), sizeof(item.text) - 1);
+    item.text[sizeof(item.text) - 1] = '\0';
+    item.requestId = requestId;
+    if (xQueueSendToFront(_sendQueue, &item, 0) != pdTRUE) {
+        _testTracker.cancel(requestId);
+        return 0;
+    }
+    return requestId;
+}
+
+TelegramTestState TelegramService::getTestState(uint32_t requestId) const {
+    return _testTracker.get(requestId);
+}
+
+void TelegramService::finishTest(const TelegramQueueItem& item, TelegramTestState state) {
+    if (item.requestId == 0) return;
+    _testTracker.finish(item.requestId, state);
+}
+
+// Actual blocking send — owned exclusively by the Telegram background task.
 bool TelegramService::sendMessageDirect(const String& text) {
     if (!_bot || strlen(_chatId) == 0) return false;
+    if (!tlsHandshakeAllowed()) {
+        DBG("Telegram", "Send deferred: TLS trust or heap unavailable");
+        return false;
+    }
 
     if (!_sendMutex || xSemaphoreTake(_sendMutex, pdMS_TO_TICKS(2000)) != pdTRUE) {
         DBG("Telegram", "Mutex timeout, skipping send");
         return false;
     }
 
-    DBG("Telegram", "Sending: %.60s...", text.c_str());
+    DBG("Telegram", "Sending message (%u B)", (unsigned)text.length());
 
     int64_t chatIdNum = strtoll(_chatId, nullptr, 10);
 
@@ -184,6 +244,10 @@ bool TelegramService::sendAlert(const String& title, const String& details) {
 
 void TelegramService::handleNewMessages() {
     if (!_bot) return;
+    if (!tlsHandshakeAllowed()) {
+        DBG("Telegram", "Polling deferred: TLS trust or heap unavailable");
+        return;
+    }
 
     TBMessage msg;
     MessageType mt = _bot->getNewMessage(msg);
@@ -193,12 +257,12 @@ void TelegramService::handleNewMessages() {
         snprintf(chatIdBuf, sizeof(chatIdBuf), "%" PRId64, msg.chatId);
         String text = msg.text;
 
-        DBG("Telegram", "Received from %s: %s", chatIdBuf, text.c_str());
+        DBG("Telegram", "Received message (%u B)", (unsigned)text.length());
 
         if (strcmp(chatIdBuf, _chatId) == 0) {
             processCommand(text, String(chatIdBuf));
         } else {
-            DBG("Telegram", "Ignoring message from unknown chat: %s", chatIdBuf);
+            DBG("Telegram", "Ignoring message from unknown chat");
         }
     }
 }

@@ -16,8 +16,11 @@
 #include "services/LogService.h"
 #include "services/EventLog.h"
 #include "services/ConfigSnapshot.h"
+#include "services/ConfigImportValidation.h"
+#include "services/OtaTlsTrustPolicy.h"
 #include "services/AuthLockout.h"
 #include "services/metrics_text.h"
+#include "services/SensitiveDataRedaction.h"
 #ifdef USE_CSI
 #include "services/CSIService.h"
 #include "services/CsiHealthReasons.h"
@@ -33,6 +36,10 @@
 #include "constants.h"
 #include "web_interface.h"
 #include <esp_ota_ops.h>
+#include <esp_core_dump.h>
+#include <esp_partition.h>
+#include <memory>
+
 
 // Radar task handle (defined in main.cpp) — suspended during OTA to reduce
 // CPU/UART contention with flash writes.
@@ -46,19 +53,18 @@ extern std::atomic<bool> g_rebootInhibit;
 extern std::atomic<bool> g_otaRebootForce;
 extern std::atomic<bool> g_espotaPrepareRequested;
 extern std::atomic<bool> g_espotaMaintenance;
-extern std::atomic<bool> g_otaTransferActive;
 extern std::atomic<uint32_t> g_espotaMaintenanceSeconds;
 extern std::atomic<unsigned long> g_espotaMaintenanceUntilMs;
-extern std::atomic<uint8_t> g_otaRuntimeOwner;
-extern std::atomic<unsigned long> g_otaRuntimeLastProgressMs;
-extern std::atomic<uint32_t> g_otaRuntimeLastBytes;
-extern std::atomic<uint32_t> g_otaRuntimeTimeoutMs;
 extern std::atomic<bool> g_csiDataStarved;
 extern const char* otaRuntimeOwnerName(uint8_t owner);
 extern uint8_t otaRuntimeOwner();
+extern bool otaRuntimeTransferActive();
+extern uint32_t otaRuntimeLastProgressMs();
+extern uint32_t otaRuntimeLastBytes();
+extern uint32_t otaRuntimeTimeoutMs();
 extern bool otaRuntimeTryBegin(uint8_t owner, uint32_t timeoutMs);
 extern void otaRuntimeMarkProgress(uint32_t bytes);
-extern void otaRuntimeEnd(uint8_t owner);
+extern bool otaRuntimeEnd(uint8_t owner);
 extern void otaRuntimeRestoreServices(const char* reason, bool restartRadar);
 
 static constexpr uint8_t OTA_OWNER_NONE = 0;
@@ -69,8 +75,51 @@ static constexpr uint8_t OTA_OWNER_ESPOTA = 4;
 
 namespace WebRoutes {
 
+// Coredump partition je v obou custom tabulkách (16MB @0xFF0000, 8MB
+// @0x7F0000); arduino core zapisuje panic do flashe (ELF) sám — tady se
+// jen vyčítá. Deklarace tady kvůli použití v /api/health handleru.
+static bool coredumpPresent(size_t* size = nullptr);
+
+// Serialize doc once into an exactly-measured nothrow heap buffer and send
+// it with a known Content-Length. AsyncResponseStream grows a contiguous
+// cbuf while being written; on a fragmented heap the operator new inside
+// cbuf::resize throws bad_alloc and aborts the async_tcp task — root cause
+// of the 2026-07-16 panic on a 2.5-day uptime (/api/csi/events, ~11.5 KB).
+// A single upfront allocation fails gracefully with 503 instead.
+static void sendJsonBuffered(AsyncWebServerRequest* request, const JsonDocument& doc,
+                             uint16_t statusCode = 200, bool closeConnection = false,
+                             bool noStore = false) {
+    const size_t len = measureJson(doc);
+    char* raw = new (std::nothrow) char[len];
+    if (raw == nullptr) { request->send(503, "text/plain", "Low memory"); return; }
+    serializeJson(doc, raw, len);
+    std::shared_ptr<char> buf(raw, std::default_delete<char[]>());
+    AsyncWebServerResponse* response = request->beginResponse(
+        "application/json", len,
+        [buf, len](uint8_t* dst, size_t maxLen, size_t index) -> size_t {
+            if (index >= len) return 0;
+            size_t chunk = (maxLen < len - index) ? maxLen : (len - index);
+            const char* source = buf.get();
+            memcpy(dst, source + index, chunk);
+            return chunk;
+        });
+    response->setCode(statusCode);
+    if (closeConnection) response->addHeader("Connection", "close");
+    if (noStore) response->addHeader("Cache-Control", "no-store");
+    request->send(response);
+}
+
 // Static copy of dependencies - persists after setup() returns
 static Dependencies _deps;
+
+static String runtimeOperationConflictText() {
+    if (_deps.runtimeOperationCoordinator == nullptr) return "unknown";
+    RuntimeOperationStatus status = _deps.runtimeOperationCoordinator->status();
+    if (status.operation == RuntimeOperation::OTA) {
+        return String("ota/") + otaRuntimeOwnerName(status.ownerId);
+    }
+    return runtimeOperationText(status.operation);
+}
 
 // rc3: Auth instrumentation for /healthz diag endpoint. These are diagnostic
 // counters only — they are not used to make security decisions and contain no
@@ -153,11 +202,61 @@ bool checkAuthBasic(AsyncWebServerRequest *request) {
     return true;
 }
 
+// TLS trust anchors are deliberately write-only: operators can check whether a
+// usable CA is present, but neither diagnostics nor configuration exports can
+// disclose the PEM.
+static void registerTlsTrustRoute(const char* route, const char* preferenceKey,
+                                  const char* serviceName) {
+    _deps.server->on(route, HTTP_GET, [preferenceKey](AsyncWebServerRequest *request) {
+        if (!checkAuth(request)) return;
+        const String ca = _deps.preferences ? _deps.preferences->getString(preferenceKey, "") : "";
+        JsonDocument doc;
+        doc["configured"] = otaTlsPemValid(ca.c_str());
+        doc["ca_configured"] = ca.length() > 0;
+        sendJsonBuffered(request, doc);
+    });
+    _deps.server->on(route, HTTP_POST, [preferenceKey, serviceName](AsyncWebServerRequest *request) {
+        if (!checkAuthBasic(request)) return;
+        char* body = static_cast<char*>(request->_tempObject);
+        if (!body) { request->send(400, "text/plain", "Body required or too large"); return; }
+        JsonDocument doc;
+        DeserializationError err = deserializeJson(doc, body);
+        free(body);
+        request->_tempObject = nullptr;
+        if (err) { request->send(400, "text/plain", "Invalid JSON"); return; }
+        if (!_deps.preferences) { request->send(503, "text/plain", "Preferences unavailable"); return; }
+        if (doc["clear"] | false) {
+            if (!_deps.preferences->remove(preferenceKey)) {
+                request->send(500, "text/plain", "Could not clear TLS CA"); return;
+            }
+            request->send(200, "text/plain", String(serviceName) + " TLS trust cleared"); return;
+        }
+        const char* ca = doc["ca_pem"] | "";
+        if (!otaTlsPemValid(ca)) {
+            request->send(400, "text/plain", "'ca_pem' must be one PEM certificate (max 3072 bytes)"); return;
+        }
+        if (_deps.preferences->putString(preferenceKey, ca) != strlen(ca) ||
+            !_deps.preferences->getString(preferenceKey, "").equals(ca)) {
+            request->send(500, "text/plain", "Could not persist TLS CA"); return;
+        }
+        request->send(200, "text/plain", String(serviceName) + " TLS CA saved; reboot required");
+    }, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+        if (index == 0) {
+            if (total > OTA_TLS_CA_MAX_LEN + 128) { request->_tempObject = nullptr; return; }
+            request->_tempObject = malloc(total + 1);
+            if (request->_tempObject) static_cast<char*>(request->_tempObject)[total] = '\0';
+        }
+        if (request->_tempObject && index + len <= total)
+            memcpy(static_cast<char*>(request->_tempObject) + index, data, len);
+    });
+}
+
 // Pull-OTA URL whitelist: only private RFC1918 ranges and mDNS .local/.lan.
 // Trust anchor for OTA integrity is the required MD5 hash; the URL check
 // prevents accidental fetches from external mirrors and limits the blast
 // radius of a stolen admin password to the local network.
 static bool isPrivateLanUrl(const String& url) {
+    if (!otaTlsSupportedUrl(url.c_str())) return false;
     int s = url.indexOf("://");
     if (s < 0) return false;
     s += 3;
@@ -223,6 +322,7 @@ void setup(Dependencies& deps) {
     setupSystemRoutes();
     setupAlarmRoutes();
     setupLogRoutes();
+    setupCoredumpRoutes();
     setupSnapshotRoutes();
     setupWwwRoutes();
     setupCSIRoutes();
@@ -240,12 +340,9 @@ void setupTelemetryRoutes() {
         #if RADAR_OUT_PIN >= 0
         doc["out_pin"] = digitalRead(RADAR_OUT_PIN);
         #endif
-        // Stream directly to TCP instead of building a String first — avoids
-        // a duplicated heap allocation on the request path and the transient
-        // memory spike that caused curl (52) empty-reply failures under load.
-        AsyncResponseStream* response = request->beginResponseStream("application/json");
-        serializeJson(doc, *response);
-        request->send(response);
+        // Pre-sized response buffer avoids cbuf growth on a fragmented heap.
+        // sendJsonBuffered returns 503 rather than aborting async_tcp on OOM.
+        sendJsonBuffered(request, doc);
     });
 
     _deps.server->on("/api/health", HTTP_GET, [](AsyncWebServerRequest *request) {
@@ -265,6 +362,7 @@ void setupTelemetryRoutes() {
         doc["health_score"] = _deps.radar->getHealthScore();
         doc["radar_monitoring_disabled"] = _deps.securityMonitor->isRadarMonitoringDisabled();
         doc["csi_data_ok"] = !g_csiDataStarved.load();
+        doc["coredump_present"] = coredumpPresent();
         doc["free_heap"] = ESP.getFreeHeap();
         doc["min_heap"] = ESP.getMinFreeHeap();
         doc["chip_temp"] = temperatureRead();
@@ -323,6 +421,8 @@ void setupTelemetryRoutes() {
         csi["enabled"]  = _deps.config->csi_enabled;
         csi["active"]   = (_deps.csiService != nullptr) && _deps.csiService->isActive();
         if (_deps.csiService != nullptr) {
+            csi["wifi_scan_state"] = wifiScanStateText(_deps.csiService->getWifiScanState());
+            csi["capture_active"]  = _deps.csiService->isWifiCaptureActive();
             csi["threshold"]        = _deps.csiService->getThreshold();
             csi["idle_ready"]       = _deps.csiService->isIdleInitialized();
             csi["auto_cal_enabled"] = _deps.csiService->isAutoCalEnabled();
@@ -338,6 +438,9 @@ void setupTelemetryRoutes() {
             // csi2 stuck-motion state
             csi["stuck_motion_count"] = _deps.csiService->getStuckMotionCount();
             csi["stuck_raise_count"]  = _deps.csiService->getStuckRaiseCount();
+            csi["queue_drops"]        = _deps.csiService->getQueueDrops();
+            csi["ml_saturated"]       = _deps.csiService->isMlSaturated();
+            csi["ml_duty_pct"]        = _deps.csiService->getMlDutyPct();
             csi["base_threshold"]     = _deps.csiService->getBaseThreshold();
             // csi3 BSSID change diagnostics
             csi["bssid_change_count"] = _deps.csiService->getBssidChangeCount();
@@ -386,9 +489,7 @@ void setupTelemetryRoutes() {
         csi["active"]   = false;
         #endif
 
-        AsyncResponseStream* response = request->beginResponseStream("application/json");
-        serializeJson(doc, *response);
-        request->send(response);
+        sendJsonBuffered(request, doc);
     });
 
     _deps.server->on("/api/radar/learn-static", HTTP_POST, [](AsyncWebServerRequest *request) {
@@ -407,9 +508,7 @@ void setupTelemetryRoutes() {
         if (!checkAuth(request)) return;
         JsonDocument doc;
         _deps.radar->getLearnResultJson(doc);
-        AsyncResponseStream* response = request->beginResponseStream("application/json");
-        serializeJson(doc, *response);
-        request->send(response);
+        sendJsonBuffered(request, doc);
     });
 
     // Auto-create ignore_static_only zone from learn results
@@ -436,15 +535,18 @@ void setupTelemetryRoutes() {
             zoneName = zoneName.substring(0, 15); // fit AlertZone.name[16]
         }
 
-        // Parse existing zones
+        // Parse existing zones. BA-05: if the read lock times out, DO NOT fall
+        // back to "[]" — that would treat every existing zone as absent and, on
+        // the write below, overwrite the whole zone list with just this one new
+        // zone (silent data loss, inv #12). Fail closed with 503 instead.
         JsonDocument zonesDoc;
         String currentZones;
-        if (_deps.zonesMutex && xSemaphoreTake(*_deps.zonesMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-            currentZones = *_deps.zonesJson;
-            xSemaphoreGive(*_deps.zonesMutex);
-        } else {
-            currentZones = "[]";
+        if (!(_deps.zonesMutex && xSemaphoreTake(*_deps.zonesMutex, pdMS_TO_TICKS(100)) == pdTRUE)) {
+            request->send(503, "text/plain", "Zone config busy, retry");
+            return;
         }
+        currentZones = *_deps.zonesJson;
+        xSemaphoreGive(*_deps.zonesMutex);
         deserializeJson(zonesDoc, currentZones);
         JsonArray arr = zonesDoc.to<JsonArray>();
 
@@ -472,12 +574,16 @@ void setupTelemetryRoutes() {
         String newJson;
         serializeJson(zonesDoc, newJson);
 
-        // Schedule zones update (same mechanism as POST /api/zones)
-        if (_deps.zonesMutex && xSemaphoreTake(*_deps.zonesMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-            *_deps.pendingZonesJson = newJson;
-            *_deps.pendingZonesUpdate = true;
-            xSemaphoreGive(*_deps.zonesMutex);
+        // Schedule zones update (same mechanism as POST /api/zones). BA-05: if
+        // the write lock times out, report 503 — do not fall through to a
+        // "created" success below when nothing was actually queued.
+        if (!(_deps.zonesMutex && xSemaphoreTake(*_deps.zonesMutex, pdMS_TO_TICKS(100)) == pdTRUE)) {
+            request->send(503, "text/plain", "Zone config busy, retry");
+            return;
         }
+        *_deps.pendingZonesJson = newJson;
+        *_deps.pendingZonesUpdate = true;
+        xSemaphoreGive(*_deps.zonesMutex);
 
         DBG("WEB", "Auto-zone from learn: %s %d-%dcm (behavior=3)", zoneName.c_str(), minCm, maxCm);
 
@@ -487,9 +593,7 @@ void setupTelemetryRoutes() {
         respDoc["min_cm"] = minCm;
         respDoc["max_cm"] = maxCm;
         respDoc["alarm_behavior"] = 3;
-        AsyncResponseStream* response = request->beginResponseStream("application/json");
-        serializeJson(respDoc, *response);
-        request->send(response);
+        sendJsonBuffered(request, respDoc);
     });
 
     // T1: Prometheus text exposition pro Grafana/Prometheus mimo Home Assistant.
@@ -541,12 +645,243 @@ void setupTelemetryRoutes() {
             request->send(500, "text/plain", "metrics buffer overflow");
             return;
         }
-        AsyncResponseStream* response2 =
-            request->beginResponseStream("text/plain; version=0.0.4; charset=utf-8");
-        response2->print(buf);
+        // Known-length buffered response instead of beginResponseStream() —
+        // its AsyncResponseStream cbuf grows via a throwing operator new, the
+        // same bad_alloc/async_tcp-abort failure mode sendJsonBuffered() above
+        // was built to avoid (2026-07-16 panic RCA). Copy out of the static
+        // build buffer: the response is asynchronous and a later request may
+        // overwrite that buffer before this response has drained.
+        char* raw = new (std::nothrow) char[len];
+        if (raw == nullptr) { request->send(503, "text/plain", "Low memory"); return; }
+        memcpy(raw, buf, len);
+        std::shared_ptr<char> responseBuf(raw, std::default_delete<char[]>());
+        AsyncWebServerResponse* response2 = request->beginResponse(
+            "text/plain; version=0.0.4; charset=utf-8", len,
+            [responseBuf, len](uint8_t* dst, size_t maxLen, size_t index) -> size_t {
+                if (index >= len) return 0;
+                size_t chunk = (maxLen < len - index) ? maxLen : (len - index);
+                memcpy(dst, responseBuf.get() + index, chunk);
+                return chunk;
+            });
         request->send(response2);
     });
 }
+
+template <typename T>
+static bool configImportIntegerField(JsonObjectConst obj, const char* key,
+                                     T minValue, T maxValue,
+                                     const char*& badField, size_t& fieldCount) {
+    JsonVariantConst value = obj[key];
+    if (value.isNull()) return true;
+    fieldCount++;
+    if (!value.is<T>()) { badField = key; return false; }
+    const T parsed = value.as<T>();
+    if (parsed < minValue || parsed > maxValue) { badField = key; return false; }
+    return true;
+}
+
+static bool configImportBoolField(JsonObjectConst obj, const char* key,
+                                  const char*& badField, size_t& fieldCount) {
+    JsonVariantConst value = obj[key];
+    if (value.isNull()) return true;
+    fieldCount++;
+    if (!value.is<bool>()) { badField = key; return false; }
+    return true;
+}
+
+static bool configImportFloatField(JsonObjectConst obj, const char* key,
+                                   float minValue, float maxValue,
+                                   const char*& badField, size_t& fieldCount) {
+    JsonVariantConst value = obj[key];
+    if (value.isNull()) return true;
+    fieldCount++;
+    if (!value.is<float>()) { badField = key; return false; }
+    const float parsed = value.as<float>();
+    if (!isfinite(parsed) || parsed < minValue || parsed > maxValue) {
+        badField = key;
+        return false;
+    }
+    return true;
+}
+
+static bool configImportTextField(JsonObjectConst obj, const char* key,
+                                  size_t minLen, size_t maxLen, bool allowRedacted,
+                                  const char*& badField, size_t& fieldCount) {
+    JsonVariantConst value = obj[key];
+    if (value.isNull()) return true;
+    fieldCount++;
+    if (!value.is<const char*>()) { badField = key; return false; }
+    const char* text = value.as<const char*>();
+    if (allowRedacted && configImportValueIsRedacted(text)) return true;
+    if (!configImportTextFits(text, minLen, maxLen)) { badField = key; return false; }
+    return true;
+}
+
+static bool validateConfigImport(const JsonDocument& doc, const char*& badField) {
+    if (!doc.is<JsonObjectConst>()) { badField = "root"; return false; }
+    JsonObjectConst obj = doc.as<JsonObjectConst>();
+    size_t fields = 0;
+
+    if (!configImportTextField(obj, "mqtt_server", 0, 59, false, badField, fields) ||
+        !configImportTextField(obj, "mqtt_port", 1, 5, false, badField, fields) ||
+        !configImportTextField(obj, "mqtt_user", 0, 39, true, badField, fields) ||
+        !configImportTextField(obj, "mqtt_pass", 0, 39, true, badField, fields) ||
+        !configImportTextField(obj, "mqtt_id", 1, 39, false, badField, fields) ||
+        !configImportTextField(obj, "hostname", 1, 32, false, badField, fields) ||
+        !configImportTextField(obj, "auth_user", 4, 19, true, badField, fields) ||
+        !configImportTextField(obj, "auth_pass", 4, 19, true, badField, fields) ||
+        !configImportTextField(obj, "tg_token", 0, 127, true, badField, fields) ||
+        !configImportTextField(obj, "tg_chat", 0, 31, true, badField, fields) ||
+        !configImportTextField(obj, "static_ip", 0, 15, false, badField, fields) ||
+        !configImportTextField(obj, "static_mask", 0, 15, false, badField, fields) ||
+        !configImportTextField(obj, "static_gw", 0, 15, false, badField, fields) ||
+        !configImportTextField(obj, "static_dns", 0, 15, false, badField, fields) ||
+        !configImportTextField(obj, "sched_arm", 0, 5, false, badField, fields) ||
+        !configImportTextField(obj, "sched_disarm", 0, 5, false, badField, fields) ||
+        !configImportTextField(obj, "csi_ssid", 0, 32, false, badField, fields) ||
+        !configImportTextField(obj, "csi_pass", 0, 64, true, badField, fields) ||
+        !configImportTextField(obj, "zones", 0, 999, false, badField, fields)) return false;
+
+    JsonVariantConst mqttPort = obj["mqtt_port"];
+    if (!mqttPort.isNull() && !configImportPortValid(mqttPort.as<const char*>())) {
+        badField = "mqtt_port"; return false;
+    }
+    const char* ipKeys[] = {"static_ip", "static_mask", "static_gw", "static_dns"};
+    for (const char* key : ipKeys) {
+        JsonVariantConst value = obj[key];
+        if (!value.isNull() && !configImportIpv4OrEmptyValid(value.as<const char*>())) {
+            badField = key; return false;
+        }
+    }
+    const char* scheduleKeys[] = {"sched_arm", "sched_disarm"};
+    for (const char* key : scheduleKeys) {
+        JsonVariantConst value = obj[key];
+        if (!value.isNull() && !configImportScheduleValid(value.as<const char*>())) {
+            badField = key; return false;
+        }
+    }
+
+    if (!configImportBoolField(obj, "mqtt_en", badField, fields) ||
+        !configImportBoolField(obj, "led_en", badField, fields) ||
+        !configImportBoolField(obj, "radar_bt", badField, fields) ||
+        !configImportBoolField(obj, "tg_enabled", badField, fields) ||
+        !configImportBoolField(obj, "sec_am_en", badField, fields) ||
+        !configImportBoolField(obj, "sec_loit_en", badField, fields) ||
+        !configImportBoolField(obj, "sec_dis_rem", badField, fields) ||
+        !configImportBoolField(obj, "csi_en", badField, fields) ||
+        !configImportBoolField(obj, "fus_en", badField, fields) ||
+        !configImportBoolField(obj, "csi_ticmp", badField, fields) ||
+        !configImportBoolField(obj, "csi_ml_en", badField, fields)) return false;
+
+    if (!configImportIntegerField<uint32_t>(obj, "radar_min", 0, 13, badField, fields) ||
+        !configImportIntegerField<uint32_t>(obj, "radar_max", 1, 13, badField, fields) ||
+        !configImportIntegerField<uint32_t>(obj, "led_start", 0, 65535, badField, fields) ||
+        !configImportIntegerField<uint32_t>(obj, "hold_time", 1, 300000, badField, fields) ||
+        !configImportIntegerField<uint32_t>(obj, "chip_temp_interval", 0, 65535, badField, fields) ||
+        !configImportIntegerField<uint32_t>(obj, "auto_arm_min", 0, 65535, badField, fields) ||
+        !configImportIntegerField<uint32_t>(obj, "sec_antimask", 0, 0x7FFFFFFFu, badField, fields) ||
+        !configImportIntegerField<uint32_t>(obj, "sec_loiter", 0, 0x7FFFFFFFu, badField, fields) ||
+        !configImportIntegerField<uint32_t>(obj, "sec_hb", 0, 0x7FFFFFFFu, badField, fields) ||
+        !configImportIntegerField<uint32_t>(obj, "sec_pet", 0, 100, badField, fields) ||
+        !configImportIntegerField<uint32_t>(obj, "sec_entry_dl", 0, 3600000, badField, fields) ||
+        !configImportIntegerField<uint32_t>(obj, "sec_exit_dl", 0, 3600000, badField, fields) ||
+        !configImportIntegerField<uint32_t>(obj, "csi_win", 10, 200, badField, fields) ||
+        !configImportIntegerField<uint32_t>(obj, "csi_pubms", 100, 60000, badField, fields) ||
+        !configImportIntegerField<uint32_t>(obj, "csi_tport", 1, 65535, badField, fields) ||
+        !configImportIntegerField<uint32_t>(obj, "csi_tpps", 10, 500, badField, fields)) return false;
+
+    if (!configImportIntegerField<int32_t>(obj, "tz_offset", -50400, 50400, badField, fields) ||
+        !configImportIntegerField<int32_t>(obj, "dst_offset", -7200, 7200, badField, fields) ||
+        !configImportFloatField(obj, "radar_res", 0.20f, 0.75f, badField, fields) ||
+        !configImportFloatField(obj, "csi_thr", 0.001f, 100.0f, badField, fields) ||
+        !configImportFloatField(obj, "csi_hyst", 0.10f, 0.99f, badField, fields) ||
+        !configImportFloatField(obj, "csi_ml_thr", 0.05f, 0.95f, badField, fields)) return false;
+
+    JsonVariantConst radarRes = obj["radar_res"];
+    if (!radarRes.isNull() && !configImportRadarResolutionValid(radarRes.as<float>())) {
+        badField = "radar_res"; return false;
+    }
+    const uint32_t minGate = obj["radar_min"].isNull()
+        ? _deps.preferences->getUInt("radar_min", 0) : obj["radar_min"].as<uint32_t>();
+    const uint32_t maxGate = obj["radar_max"].isNull()
+        ? _deps.preferences->getUInt("radar_max", 13) : obj["radar_max"].as<uint32_t>();
+    if (minGate > maxGate) { badField = "radar_min/radar_max"; return false; }
+
+    JsonVariantConst zones = obj["zones"];
+    if (!zones.isNull()) {
+        JsonDocument zonesDoc;
+        if (deserializeJson(zonesDoc, zones.as<const char*>()) || !zonesDoc.is<JsonArray>()) {
+            badField = "zones"; return false;
+        }
+    }
+    if (fields == 0) { badField = "root"; return false; }
+    return true;
+}
+
+class ConfigImportWriter {
+public:
+    explicit ConfigImportWriter(Preferences* prefs) : _prefs(prefs) {}
+
+    bool putString(const char* key, const String& value) {
+        if (!ready(key)) return false;
+        const String before = _prefs->getString(key, "\x01");
+        if (before == value) return true;
+        const size_t written = _prefs->putString(key, value);
+        if ((value.length() > 0 && written != value.length()) ||
+            _prefs->getString(key, "\x01") != value) return fail(key);
+        return true;
+    }
+    bool putBool(const char* key, bool value) {
+        if (!ready(key)) return false;
+        const size_t written = _prefs->putBool(key, value);
+        return putScalar(key, written, sizeof(uint8_t), _prefs->getBool(key, !value) == value);
+    }
+    bool putUShort(const char* key, uint16_t value) {
+        if (!ready(key)) return false;
+        const size_t written = _prefs->putUShort(key, value);
+        return putScalar(key, written, sizeof(value),
+                         _prefs->getUShort(key, static_cast<uint16_t>(value ^ 0xFFFFu)) == value);
+    }
+    bool putUInt(const char* key, uint32_t value) {
+        if (!ready(key)) return false;
+        const size_t written = _prefs->putUInt(key, value);
+        return putScalar(key, written, sizeof(value),
+                         _prefs->getUInt(key, value ^ 0xFFFFFFFFu) == value);
+    }
+    bool putULong(const char* key, uint32_t value) {
+        if (!ready(key)) return false;
+        const size_t written = _prefs->putULong(key, value);
+        return putScalar(key, written, sizeof(value),
+                         _prefs->getULong(key, value ^ 0xFFFFFFFFu) == value);
+    }
+    bool putInt(const char* key, int32_t value) {
+        if (!ready(key)) return false;
+        const size_t written = _prefs->putInt(key, value);
+        return putScalar(key, written, sizeof(value),
+                         _prefs->getInt(key, value ^ INT32_MIN) == value);
+    }
+    bool putFloat(const char* key, float value) {
+        if (!ready(key)) return false;
+        const size_t written = _prefs->putFloat(key, value);
+        return putScalar(key, written, sizeof(value), _prefs->getFloat(key, NAN) == value);
+    }
+    const char* failedKey() const { return _failedKey; }
+
+private:
+    bool ready(const char* key) {
+        if (_failedKey != nullptr) return false;
+        if (_prefs == nullptr) return fail(key);
+        return true;
+    }
+    bool putScalar(const char* key, size_t written, size_t expected, bool readBackOk) {
+        if (_failedKey != nullptr) return false;
+        if (written != expected || !readBackOk) return fail(key);
+        return true;
+    }
+    bool fail(const char* key) { _failedKey = key; return false; }
+    Preferences* _prefs;
+    const char* _failedKey = nullptr;
+};
 
 void setupConfigRoutes() {
     // --- Global Config ---
@@ -578,9 +913,7 @@ void setupConfigRoutes() {
             stat.add(s[i]);
         }
 
-        AsyncResponseStream* response = request->beginResponseStream("application/json");
-        serializeJson(doc, *response);
-        request->send(response);
+        sendJsonBuffered(request, doc);
     });
 
     _deps.server->on(AsyncURIMatcher::exact("/api/config"), HTTP_POST, [](AsyncWebServerRequest *request) {
@@ -670,33 +1003,36 @@ void setupConfigRoutes() {
     _deps.server->on("/api/mqtt/config", HTTP_POST, [](AsyncWebServerRequest *request) {
         if (!checkAuth(request)) return;
 
+        // POST body only (2nd arg = true) — the broker password must never ride
+        // in the query string, where it leaks into logs / the /api/debug buffer.
+        // The whole form is read from the body so all fields stay together (S-0).
         bool en = true;
-        if (request->hasParam("enabled")) {
-             en = (request->getParam("enabled")->value() == "1");
+        if (request->hasParam("enabled", true)) {
+             en = (request->getParam("enabled", true)->value() == "1");
              _deps.preferences->putBool("mqtt_en", en);
              _deps.config->mqtt_enabled = en;
         }
 
-        if (request->hasParam("server")) {
-            String s = request->getParam("server")->value();
+        if (request->hasParam("server", true)) {
+            String s = request->getParam("server", true)->value();
             _deps.preferences->putString("mqtt_server", s);
             s.toCharArray(_deps.config->mqtt_server, 60);
 
-            if (request->hasParam("port")) {
-                String p = request->getParam("port")->value();
+            if (request->hasParam("port", true)) {
+                String p = request->getParam("port", true)->value();
                 _deps.preferences->putString("mqtt_port", p);
                 p.toCharArray(_deps.config->mqtt_port, 6);
             }
-            if (request->hasParam("user")) {
-                String u = request->getParam("user")->value();
+            if (request->hasParam("user", true)) {
+                String u = request->getParam("user", true)->value();
                 if (u != "***") { _deps.preferences->putString("mqtt_user", u); u.toCharArray(_deps.config->mqtt_user, 40); }
             }
-            if (request->hasParam("pass")) {
-                String pw = request->getParam("pass")->value();
+            if (request->hasParam("pass", true)) {
+                String pw = request->getParam("pass", true)->value();
                 if (pw != "***") { _deps.preferences->putString("mqtt_pass", pw); pw.toCharArray(_deps.config->mqtt_pass, 40); }
             }
 
-            String id = request->hasParam("id") ? request->getParam("id")->value() : String(_deps.config->mqtt_id);
+            String id = request->hasParam("id", true) ? request->getParam("id", true)->value() : String(_deps.config->mqtt_id);
             _deps.preferences->putString("mqtt_id", id);
             id.toCharArray(_deps.config->mqtt_id, 40);
         }
@@ -746,9 +1082,7 @@ void setupConfigRoutes() {
         doc["token"] = strlen(_deps.telegramBot->getToken()) > 0 ? "***" : "";
         doc["chat_id"] = strlen(_deps.telegramBot->getChatId()) > 0 ? "***" : "";
 
-        AsyncResponseStream* response = request->beginResponseStream("application/json");
-        serializeJson(doc, *response);
-        request->send(response);
+        sendJsonBuffered(request, doc);
     });
 
     _deps.server->on("/api/telegram/config", HTTP_POST, [](AsyncWebServerRequest *request) {
@@ -776,27 +1110,55 @@ void setupConfigRoutes() {
         if (enabled) *_deps.shouldReboot = true;
     });
 
-    _deps.server->on("/api/telegram/test", HTTP_POST, [](AsyncWebServerRequest *request) {
+    _deps.server->on(AsyncURIMatcher::exact("/api/telegram/test"), HTTP_POST, [](AsyncWebServerRequest *request) {
         if (!checkAuth(request)) return;
         String testMsg = "🔔 *Test Notifikace*\n";
         testMsg += "📡 " + String(_deps.config->mqtt_id) + "\n";
         testMsg += "🌐 " + ETH.localIP().toString() + "\n";
         testMsg += "🏷️ FW: " + String(_deps.fwVersion);
-        bool res = _deps.telegramBot->sendMessageDirect(testMsg);
+        uint32_t requestId = _deps.telegramBot->enqueueTestMessage(testMsg);
         JsonDocument resDoc;
-        resDoc["success"] = res;
-        if (!res) resDoc["error"] = "Send failed (DNS/TCP/TLS/token/chat_id)";
-        AsyncResponseStream* response = request->beginResponseStream("application/json");
-        serializeJson(resDoc, *response);
-        request->send(response);
+        resDoc["accepted"] = requestId != 0;
+        if (requestId != 0) {
+            resDoc["request_id"] = requestId;
+            resDoc["status"] = "queued";
+        } else {
+            resDoc["error"] = "Test already running or queue unavailable";
+        }
+        sendJsonBuffered(request, resDoc, requestId != 0 ? 202 : 409);
+    });
+
+    _deps.server->on(AsyncURIMatcher::exact("/api/telegram/test/status"), HTTP_GET, [](AsyncWebServerRequest *request) {
+        if (!checkAuth(request)) return;
+        if (!request->hasParam("id")) {
+            request->send(400, "application/json", "{\"error\":\"Missing request id\"}");
+            return;
+        }
+        uint32_t requestId = strtoul(request->getParam("id")->value().c_str(), nullptr, 10);
+        TelegramTestState state = _deps.telegramBot->getTestState(requestId);
+        if (state == TelegramTestState::UNKNOWN) {
+            request->send(404, "application/json", "{\"error\":\"Unknown request id\"}");
+            return;
+        }
+        JsonDocument resDoc;
+        resDoc["request_id"] = requestId;
+        resDoc["status"] = telegramTestStateText(state);
+        resDoc["done"] = telegramTestStateTerminal(state);
+        resDoc["success"] = state == TelegramTestState::SUCCEEDED;
+        sendJsonBuffered(request, resDoc);
     });
 
     // --- Auth Config ---
     _deps.server->on("/api/auth/config", HTTP_POST, [](AsyncWebServerRequest *request) {
         if (!checkAuth(request)) return;
-        if (request->hasParam("user") && request->hasParam("pass")) {
-            String user = request->getParam("user")->value();
-            String pass = request->getParam("pass")->value();
+        // BA-02: admin username/password are secrets — read them from the POST
+        // body (hasParam(name, true)), never the query string, so they don't
+        // land in access logs / proxy traces / browser history (inv #8). This is
+        // the same GET-query leak S-0 closed for mqtt-pin/mqtt_pass; auth/config
+        // was missed then. Frontend saveAuth() now posts a urlencoded body.
+        if (request->hasParam("user", true) && request->hasParam("pass", true)) {
+            String user = request->getParam("user", true)->value();
+            String pass = request->getParam("pass", true)->value();
             if (user.length() >= 4 && pass.length() >= 4) {
                 strncpy(_deps.config->auth_user, user.c_str(), sizeof(_deps.config->auth_user)-1);
                 strncpy(_deps.config->auth_pass, pass.c_str(), sizeof(_deps.config->auth_pass)-1);
@@ -866,7 +1228,7 @@ void setupConfigRoutes() {
         request->_tempObject = nullptr;
         request->send(200, "text/plain", "Zones received");
     }, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
-        if (!checkAuth(request)) return;
+        if (!index && !checkAuth(request)) return;
 
         if (index == 0) {
             if (total > 4096) {
@@ -915,7 +1277,7 @@ void setupConfigRoutes() {
         doc["tg_enabled"] = _deps.telegramBot ? _deps.telegramBot->isEnabled() : false;
         doc["tg_token"] = (_deps.telegramBot && strlen(_deps.telegramBot->getToken()) > 0) ? "***" : "";
         doc["tg_chat"] = (_deps.telegramBot && strlen(_deps.telegramBot->getChatId()) > 0)
-            ? String(_deps.telegramBot->getChatId()) : String("");
+            ? "***" : "";
 
         // Timezone
         doc["tz_offset"] = _deps.config->tz_offset;
@@ -964,9 +1326,7 @@ void setupConfigRoutes() {
             xSemaphoreGive(*_deps.zonesMutex);
         }
 
-        AsyncResponseStream* response = request->beginResponseStream("application/json");
-        serializeJson(doc, *response);
-        request->send(response);
+        sendJsonBuffered(request, doc);
     });
 
     _deps.server->on("/api/config/import", HTTP_POST, [](AsyncWebServerRequest *request) {
@@ -1002,72 +1362,108 @@ void setupConfigRoutes() {
                     return;
                 }
 
-                if (doc["mqtt_server"].is<const char*>()) _deps.preferences->putString("mqtt_server", doc["mqtt_server"].as<String>());
-                if (doc["mqtt_port"].is<const char*>()) _deps.preferences->putString("mqtt_port", doc["mqtt_port"].as<String>());
-                if (doc["mqtt_user"].is<const char*>() && doc["mqtt_user"].as<String>() != "***") _deps.preferences->putString("mqtt_user", doc["mqtt_user"].as<String>());
-                if (doc["mqtt_pass"].is<const char*>() && doc["mqtt_pass"].as<String>() != "***") _deps.preferences->putString("mqtt_pass", doc["mqtt_pass"].as<String>());
-                if (doc["mqtt_id"].is<const char*>()) _deps.preferences->putString("mqtt_id", doc["mqtt_id"].as<String>());
-                if (doc["mqtt_en"].is<bool>()) _deps.preferences->putBool("mqtt_en", doc["mqtt_en"].as<bool>());
-                if (doc["hostname"].is<const char*>()) _deps.preferences->putString("hostname", doc["hostname"].as<String>());
-                if (doc["auth_user"].is<const char*>() && doc["auth_user"].as<String>() != "***") _deps.preferences->putString("auth_user", doc["auth_user"].as<String>());
-                if (doc["auth_pass"].is<const char*>() && doc["auth_pass"].as<String>() != "***") _deps.preferences->putString("auth_pass", doc["auth_pass"].as<String>());
-                // bk_ssid/bk_pass removed — POE board has no WiFi
-                if (doc["radar_res"].is<float>()) _deps.preferences->putFloat("radar_res", doc["radar_res"].as<float>());
-                if (doc["radar_min"].is<unsigned int>()) _deps.preferences->putUInt("radar_min", doc["radar_min"].as<unsigned int>());
-                if (doc["radar_max"].is<unsigned int>()) _deps.preferences->putUInt("radar_max", doc["radar_max"].as<unsigned int>());
-                if (doc["led_en"].is<bool>()) _deps.preferences->putBool("led_en", doc["led_en"].as<bool>());
-                if (doc["led_start"].is<uint16_t>()) _deps.preferences->putUInt("led_start", doc["led_start"].as<uint16_t>());
-                if (doc["hold_time"].is<unsigned long>()) _deps.preferences->putULong("hold_time", doc["hold_time"].as<unsigned long>());
-                if (doc["chip_temp_interval"].is<uint16_t>()) _deps.preferences->putUShort("temp_intv", doc["chip_temp_interval"].as<uint16_t>());
-                if (doc["radar_bt"].is<bool>()) _deps.preferences->putBool("radar_bt", doc["radar_bt"].as<bool>());
+                const char* badField = nullptr;
+                if (!validateConfigImport(doc, badField)) {
+                    free(slab);
+                    request->_tempObject = nullptr;
+                    request->send(400, "text/plain", String("Invalid config field: ") + badField);
+                    return;
+                }
 
-                // Telegram — skip redacted token
-                if (doc["tg_enabled"].is<bool>()) _deps.preferences->putBool("tg_direct_en", doc["tg_enabled"].as<bool>());
-                if (doc["tg_token"].is<const char*>() && doc["tg_token"].as<String>() != "***") _deps.preferences->putString("tg_token", doc["tg_token"].as<String>());
-                if (doc["tg_chat"].is<const char*>()) _deps.preferences->putString("tg_chat", doc["tg_chat"].as<String>());
+                ConfigImportWriter writer(_deps.preferences);
+                bool ok = true;
+                auto writeString = [&](const char* jsonKey, const char* nvsKey, bool redacted = false) {
+                    if (!ok || doc[jsonKey].isNull()) return;
+                    String value = doc[jsonKey].as<String>();
+                    if (redacted && configImportValueIsRedacted(value.c_str())) return;
+                    ok = writer.putString(nvsKey, value);
+                };
+                auto writeBool = [&](const char* jsonKey, const char* nvsKey) {
+                    if (ok && !doc[jsonKey].isNull()) ok = writer.putBool(nvsKey, doc[jsonKey].as<bool>());
+                };
+                auto writeUShort = [&](const char* jsonKey, const char* nvsKey) {
+                    if (ok && !doc[jsonKey].isNull()) ok = writer.putUShort(nvsKey, doc[jsonKey].as<uint16_t>());
+                };
+                auto writeUInt = [&](const char* jsonKey, const char* nvsKey) {
+                    if (ok && !doc[jsonKey].isNull()) ok = writer.putUInt(nvsKey, doc[jsonKey].as<uint32_t>());
+                };
+                auto writeULong = [&](const char* jsonKey, const char* nvsKey) {
+                    if (ok && !doc[jsonKey].isNull()) ok = writer.putULong(nvsKey, doc[jsonKey].as<uint32_t>());
+                };
+                auto writeInt = [&](const char* jsonKey, const char* nvsKey) {
+                    if (ok && !doc[jsonKey].isNull()) ok = writer.putInt(nvsKey, doc[jsonKey].as<int32_t>());
+                };
+                auto writeFloat = [&](const char* jsonKey, const char* nvsKey) {
+                    if (ok && !doc[jsonKey].isNull()) ok = writer.putFloat(nvsKey, doc[jsonKey].as<float>());
+                };
 
-                // Timezone
-                if (doc["tz_offset"].is<int32_t>()) _deps.preferences->putInt("tz_offset", doc["tz_offset"].as<int32_t>());
-                if (doc["dst_offset"].is<int32_t>()) _deps.preferences->putInt("dst_offset", doc["dst_offset"].as<int32_t>());
+                // Non-connectivity settings first. If NVS fills, the currently
+                // working network and credentials remain unchanged.
+                writeFloat("radar_res", "radar_res");
+                writeUInt("radar_min", "radar_min");
+                writeUInt("radar_max", "radar_max");
+                writeBool("led_en", "led_en");
+                writeUInt("led_start", "led_start");
+                writeULong("hold_time", "hold_time");
+                writeUShort("chip_temp_interval", "temp_intv");
+                writeBool("radar_bt", "radar_bt");
+                writeBool("tg_enabled", "tg_direct_en");
+                writeString("tg_token", "tg_token", true);
+                writeString("tg_chat", "tg_chat", true);
+                writeInt("tz_offset", "tz_offset");
+                writeInt("dst_offset", "dst_offset");
+                writeString("sched_arm", "sched_arm");
+                writeString("sched_disarm", "sched_disarm");
+                writeUShort("auto_arm_min", "auto_arm_min");
+                writeULong("sec_antimask", "sec_antimask");
+                writeBool("sec_am_en", "sec_am_en");
+                writeULong("sec_loiter", "sec_loiter");
+                writeBool("sec_loit_en", "sec_loit_en");
+                writeULong("sec_hb", "sec_hb");
+                writeUInt("sec_pet", "sec_pet");
+                writeULong("sec_entry_dl", "sec_entry_dl");
+                writeULong("sec_exit_dl", "sec_exit_dl");
+                writeBool("sec_dis_rem", "sec_dis_rem");
+                writeBool("csi_en", "csi_en");
+                writeFloat("csi_thr", "csi_thr");
+                writeFloat("csi_hyst", "csi_hyst");
+                writeUShort("csi_win", "csi_win");
+                writeUShort("csi_pubms", "csi_pubms");
+                writeString("csi_ssid", "csi_ssid");
+                writeString("csi_pass", "csi_pass", true);
+                writeBool("fus_en", "fus_en");
+                writeUShort("csi_tport", "csi_tport");
+                writeBool("csi_ticmp", "csi_ticmp");
+                writeUInt("csi_tpps", "csi_tpps");
+                writeBool("csi_ml_en", "csi_ml_en");
+                writeFloat("csi_ml_thr", "csi_ml_thr");
+                writeString("zones", "zones_json");
 
-                // Static network
-                if (doc["static_ip"].is<const char*>()) _deps.preferences->putString("static_ip", doc["static_ip"].as<String>());
-                if (doc["static_mask"].is<const char*>()) _deps.preferences->putString("static_mask", doc["static_mask"].as<String>());
-                if (doc["static_gw"].is<const char*>()) _deps.preferences->putString("static_gw", doc["static_gw"].as<String>());
-                if (doc["static_dns"].is<const char*>()) _deps.preferences->putString("static_dns", doc["static_dns"].as<String>());
+                // Connectivity and access-control settings last. Write the
+                // static-IP activation key and username last within their groups.
+                writeBool("mqtt_en", "mqtt_en");
+                writeString("mqtt_server", "mqtt_server");
+                writeString("mqtt_port", "mqtt_port");
+                writeString("mqtt_user", "mqtt_user", true);
+                writeString("mqtt_pass", "mqtt_pass", true);
+                writeString("mqtt_id", "mqtt_id");
+                writeString("hostname", "hostname");
+                writeString("static_mask", "static_mask");
+                writeString("static_gw", "static_gw");
+                writeString("static_dns", "static_dns");
+                writeString("static_ip", "static_ip");
+                writeString("auth_pass", "auth_pass", true);
+                writeString("auth_user", "auth_user", true);
 
-                // Schedule
-                if (doc["sched_arm"].is<const char*>()) _deps.preferences->putString("sched_arm", doc["sched_arm"].as<String>());
-                if (doc["sched_disarm"].is<const char*>()) _deps.preferences->putString("sched_disarm", doc["sched_disarm"].as<String>());
-                if (doc["auto_arm_min"].is<uint16_t>()) _deps.preferences->putUShort("auto_arm_min", doc["auto_arm_min"].as<uint16_t>());
-
-                // Security
-                if (doc["sec_antimask"].is<unsigned long>()) _deps.preferences->putULong("sec_antimask", doc["sec_antimask"].as<unsigned long>());
-                if (doc["sec_am_en"].is<bool>()) _deps.preferences->putBool("sec_am_en", doc["sec_am_en"].as<bool>());
-                if (doc["sec_loiter"].is<unsigned long>()) _deps.preferences->putULong("sec_loiter", doc["sec_loiter"].as<unsigned long>());
-                if (doc["sec_loit_en"].is<bool>()) _deps.preferences->putBool("sec_loit_en", doc["sec_loit_en"].as<bool>());
-                if (doc["sec_hb"].is<unsigned long>()) _deps.preferences->putULong("sec_hb", doc["sec_hb"].as<unsigned long>());
-                if (doc["sec_pet"].is<unsigned int>()) _deps.preferences->putUInt("sec_pet", doc["sec_pet"].as<unsigned int>());
-                if (doc["sec_entry_dl"].is<unsigned long>()) _deps.preferences->putULong("sec_entry_dl", doc["sec_entry_dl"].as<unsigned long>());
-                if (doc["sec_exit_dl"].is<unsigned long>()) _deps.preferences->putULong("sec_exit_dl", doc["sec_exit_dl"].as<unsigned long>());
-                if (doc["sec_dis_rem"].is<bool>()) _deps.preferences->putBool("sec_dis_rem", doc["sec_dis_rem"].as<bool>());
-
-                // CSI runtime
-                if (doc["csi_en"].is<bool>()) _deps.preferences->putBool("csi_en", doc["csi_en"].as<bool>());
-                if (doc["csi_thr"].is<float>()) _deps.preferences->putFloat("csi_thr", doc["csi_thr"].as<float>());
-                if (doc["csi_hyst"].is<float>()) _deps.preferences->putFloat("csi_hyst", doc["csi_hyst"].as<float>());
-                if (doc["csi_win"].is<uint16_t>()) _deps.preferences->putUShort("csi_win", doc["csi_win"].as<uint16_t>());
-                if (doc["csi_pubms"].is<uint16_t>()) _deps.preferences->putUShort("csi_pubms", doc["csi_pubms"].as<uint16_t>());
-                if (doc["csi_ssid"].is<const char*>()) _deps.preferences->putString("csi_ssid", doc["csi_ssid"].as<String>());
-                if (doc["csi_pass"].is<const char*>() && doc["csi_pass"].as<String>() != "***") _deps.preferences->putString("csi_pass", doc["csi_pass"].as<String>());
-                if (doc["fus_en"].is<bool>()) _deps.preferences->putBool("fus_en", doc["fus_en"].as<bool>());
-                if (doc["csi_tport"].is<uint16_t>()) _deps.preferences->putUShort("csi_tport", doc["csi_tport"].as<uint16_t>());
-                if (doc["csi_ticmp"].is<bool>()) _deps.preferences->putBool("csi_ticmp", doc["csi_ticmp"].as<bool>());
-                if (doc["csi_tpps"].is<unsigned int>()) _deps.preferences->putUInt("csi_tpps", doc["csi_tpps"].as<unsigned int>());
-                if (doc["csi_ml_en"].is<bool>()) _deps.preferences->putBool("csi_ml_en", doc["csi_ml_en"].as<bool>());
-                if (doc["csi_ml_thr"].is<float>()) _deps.preferences->putFloat("csi_ml_thr", doc["csi_ml_thr"].as<float>());
-
-                if (doc["zones"].is<const char*>()) _deps.preferences->putString("zones_json", doc["zones"].as<String>());
+                if (!ok) {
+                    const char* failed = writer.failedKey() ? writer.failedKey() : "unknown";
+                    DBG("CONFIG", "Import NVS write/verify failed at key=%s", failed);
+                    if (_deps.systemLog) _deps.systemLog->error(String("Config import NVS failure at key=") + failed);
+                    free(slab);
+                    request->_tempObject = nullptr;
+                    request->send(500, "text/plain", String("Config write failed at field: ") + failed);
+                    return;
+                }
             } else {
                 free(slab);
                 request->_tempObject = nullptr;
@@ -1082,7 +1478,7 @@ void setupConfigRoutes() {
         request->send(200, "text/plain", "Config received, applying and rebooting...");
         *_deps.shouldReboot = true;
     }, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total){
-        if (!checkAuth(request)) return;
+        if (!index && !checkAuth(request)) return;
 
         // Slab layout: [status:1][payload:total+1]. Status 1 = oversize sentinel
         // so the main handler can return 413 instead of silently 200-rebooting.
@@ -1117,9 +1513,7 @@ void setupSecurityRoutes() {
         doc["loiter_alert"] = _deps.securityMonitor->isLoiterAlertEnabled();
         doc["heartbeat"] = _deps.securityMonitor->getHeartbeatInterval() / INTERVAL_TELEMETRY_IDLE_MS;
         doc["pet_immunity"] = _deps.radar->getMinMoveEnergy();
-        AsyncResponseStream* response = request->beginResponseStream("application/json");
-        serializeJson(doc, *response);
-        request->send(response);
+        sendJsonBuffered(request, doc);
     });
 
     _deps.server->on("/api/security/config", HTTP_POST, [](AsyncWebServerRequest *request) {
@@ -1169,27 +1563,58 @@ void setupSecurityRoutes() {
         String pin = _deps.preferences->getString("sec_mqtt_pin", "");
         doc["pin_set"] = pin.length() > 0;
         doc["pin_length"] = (int)pin.length();
-        AsyncResponseStream* response = request->beginResponseStream("application/json");
-        serializeJson(doc, *response);
-        request->send(response);
+        sendJsonBuffered(request, doc);
     });
     _deps.server->on("/api/security/mqtt-pin", HTTP_POST, [](AsyncWebServerRequest *request) {
         if (!checkAuth(request)) return;
-        if (!request->hasParam("pin")) {
-            request->send(400, "text/plain", "Missing 'pin' param (empty string to disable)");
+        // Read from POST body only — a PIN in the query string leaks into access
+        // logs / shell history / the /api/debug ring buffer (S-0).
+        if (!request->hasParam("pin", true)) {
+            request->send(400, "text/plain", "Missing 'pin' param (send in POST body; empty string to disable)");
             return;
         }
-        String pin = request->getParam("pin")->value();
+        String pin = request->getParam("pin", true)->value();
         if (pin.length() > 0 && pin.length() < 4) {
             request->send(400, "text/plain", "PIN must be empty (disable) or at least 4 characters");
             return;
         }
         _deps.preferences->putString("sec_mqtt_pin", pin);
-        request->send(200, "text/plain", pin.length() > 0 ? "MQTT PIN set" : "MQTT PIN disabled");
+        if (pin.length() == 0) {
+            request->send(200, "text/plain", "MQTT PIN disabled");
+            return;
+        }
+        // M-5: a PIN and Home Assistant alarm control are mutually exclusive. HA's
+        // alarm_control_panel discovery is code_*_required:false, so it publishes
+        // bare ARM/DISARM — which the PIN guard rejects. Warn if MQTT is enabled.
+        bool mqttOn = _deps.config != nullptr && _deps.config->mqtt_enabled;
+        request->send(200, "text/plain", mqttOn
+            ? "MQTT PIN set. WARNING: Home Assistant sends bare ARM/DISARM and will be REJECTED while a PIN is set — use the PIN OR HA alarm control, not both."
+            : "MQTT PIN set");
     });
 }
 
 void setupSystemRoutes() {
+    // O-2: one runtime-operation snapshot for every HTTP consumer.
+    _deps.server->on("/api/operation/status", HTTP_GET, [](AsyncWebServerRequest *request) {
+        if (!checkAuth(request)) return;
+        if (_deps.runtimeOperationCoordinator == nullptr) {
+            request->send(503, "application/json", "{\"error\":\"operation coordinator unavailable\"}");
+            return;
+        }
+
+        RuntimeOperationStatus status = _deps.runtimeOperationCoordinator->status();
+        JsonDocument doc;
+        doc["active"] = status.operation != RuntimeOperation::IDLE;
+        doc["operation"] = runtimeOperationText(status.operation);
+        doc["failure"] = runtimeOperationFailureText(status.failure);
+        doc["owner_id"] = static_cast<unsigned>(status.ownerId);
+        doc["last_progress_ms"] = status.lastProgressMs;
+        doc["timeout_ms"] = status.timeoutMs;
+        doc["elapsed_ms"] = status.operation != RuntimeOperation::IDLE
+            ? static_cast<uint32_t>(millis() - status.lastProgressMs) : 0;
+        sendJsonBuffered(request, doc);
+    });
+
     // rc3: Unauthenticated diagnostic endpoint — by design no checkAuth().
     // Purpose: be reachable when /api/* digest auth degrades (.161 pattern:
     // boot+~1h11min → 100% 401). Returns liveness + heap + auth counters so
@@ -1206,31 +1631,36 @@ void setupSystemRoutes() {
         doc["heap_min_ever"] = ESP.getMinFreeHeap();
         doc["auth_ok"]   = _authOkCount;
         doc["auth_fail"] = _authFailCount;
+        doc["notification_tls_blocked"] = _deps.notificationService &&
+            _deps.notificationService->isWebhookTlsBlocked();
         // Age in seconds since last successful / failed auth. -1 = never seen yet.
         doc["last_auth_ok_age_s"]   = (_lastAuthOkMs   == 0) ? -1 : (long)((now - _lastAuthOkMs)   / 1000);
         doc["last_auth_fail_age_s"] = (_lastAuthFailMs == 0) ? -1 : (long)((now - _lastAuthFailMs) / 1000);
-        AsyncResponseStream* response = request->beginResponseStream("application/json");
-        // Force fresh TCP per probe so observer can isolate connection-pool issues
-        response->addHeader("Connection", "close");
-        response->addHeader("Cache-Control", "no-store");
-        serializeJson(doc, *response);
-        request->send(response);
+        sendJsonBuffered(request, doc, 200, true, true);
     });
 
     // Exact match required — default BackwardCompatible matcher would shadow
     // /api/update/pull and /api/update/pull/status (matched as prefix), routing
     // their POSTs into the multipart upload handler below.
-    static volatile bool otaHttpRejected = false;
+    // Request-scoped OTA state. ESPAsyncWebServer frees a non-null _tempObject
+    // when a disconnected request is destroyed, including interrupted uploads.
+    enum class OtaHttpRequestState : uint8_t { OWNER, REJECTED, SUCCEEDED, FAILED };
+    struct OtaHttpRequestContext { OtaHttpRequestState state; };
     _deps.server->on(AsyncURIMatcher::exact("/api/update"), HTTP_POST, [](AsyncWebServerRequest *request) {
         if (!checkAuth(request)) return;
-        if (otaHttpRejected) {
-            otaHttpRejected = false;
-            AsyncWebServerResponse *response = request->beginResponse(409, "text/plain", "OTA already in progress");
+        OtaHttpRequestContext* context =
+            static_cast<OtaHttpRequestContext*>(request->_tempObject);
+        request->_tempObject = nullptr;
+        OtaHttpRequestState requestState = context
+            ? context->state : OtaHttpRequestState::FAILED;
+        free(context);
+        if (requestState == OtaHttpRequestState::REJECTED) {
+            AsyncWebServerResponse *response = request->beginResponse(409, "text/plain", "Runtime operation already in progress");
             response->addHeader("Connection", "close");
             request->send(response);
             return;
         }
-        bool success = !Update.hasError();
+        bool success = requestState == OtaHttpRequestState::SUCCEEDED;
         AsyncWebServerResponse *response = request->beginResponse(200, "text/plain", success ? "OK" : "FAIL");
         response->addHeader("Connection", "close");
         request->send(response);
@@ -1243,49 +1673,47 @@ void setupSystemRoutes() {
         // Basic auth only (not Digest) — Digest keeps nonce/body-hash state
         // that AsyncTCP on LAN8720A loses under backpressure, causing the
         // classic 64 KB stall. Basic is stateless.
-        static bool otaAuthorized = false;
         if (!index) {
-            otaAuthorized = false;
-            otaHttpRejected = false;
+            request->_tempObject = nullptr;
             if (!request->authenticate(_deps.config->auth_user, _deps.config->auth_pass)) {
                 DBG("OTA", "Upload auth failed");
                 request->requestAuthentication(nullptr, false);  // false = Basic
                 // Fix A: close the connection immediately so an unauthenticated
                 // client cannot stream the whole multi-MB image before the 401
-                // flushes — that drain is the 180s upload hang seen on lab2.
+                // flushes — that drain is the 180s upload hang seen on an 8 MB test node.
                 request->client()->close();
                 return;
             }
+            OtaHttpRequestContext* context = static_cast<OtaHttpRequestContext*>(
+                malloc(sizeof(OtaHttpRequestContext)));
+            if (!context) {
+                DBG("OTA", "Upload request state allocation failed");
+                return;
+            }
+            context->state = OtaHttpRequestState::FAILED;
+            request->_tempObject = context;
             if (!otaRuntimeTryBegin(OTA_OWNER_HTTP, 45000)) {
-                otaHttpRejected = true;
-                DBG("OTA", "Rejecting HTTP OTA; owner=%s", otaRuntimeOwnerName(otaRuntimeOwner()));
+                context->state = OtaHttpRequestState::REJECTED;
+                DBG("OTA", "Rejecting HTTP OTA; operation=%s", runtimeOperationConflictText().c_str());
                 if (_deps.systemLog) {
-                    _deps.systemLog->warn(String("HTTP OTA rejected; owner=") + otaRuntimeOwnerName(otaRuntimeOwner()));
+                    _deps.systemLog->warn(String("HTTP OTA rejected; operation=") + runtimeOperationConflictText());
                 }
                 return;
             }
-            otaAuthorized = true;
+            context->state = OtaHttpRequestState::OWNER;
             // rc7-fix1c: stale-session cleanup. If a previous OTA dropped
             // mid-stream (no `final=true` callback), Update lib still has
-            // _size>0, our setOtaInProgress flags are stuck, and radarTask
+            // _size>0, the prior runtime owner was not released, and radarTask
             // remains suspended. Clean up before starting fresh.
             if (Update.isRunning()) {
                 DBG("OTA", "Stale Update session detected — aborting");
                 Update.abort();
             }
-            // Re-arm the freeze flags. Idempotent if already false.
-#ifdef USE_CSI
-            CSIService::setOtaInProgress(false);
-#endif
-            MQTTService::setOtaInProgress(false);
+            // The successful coordinator claim is the sole CSI/MQTT freeze authority.
             uint32_t heapAtStart = ESP.getFreeHeap();
-#ifdef USE_CSI
-            CSIService::setOtaInProgress(true);
-#endif
             // csi10w: same treatment for MQTT. PubSubClient's blocking
             // WiFiClient.connect() on a failing reconnect was causing
             // non-deterministic upload stalls (42-90% completion).
-            MQTTService::setOtaInProgress(true);
             // Reduce runtime load so AsyncTCP receive buffer can keep draining
             // while Update.write() blocks on flash sector writes (~10–20 ms each).
             // eTaskState check — vTaskSuspend on already-suspended task is OK
@@ -1310,7 +1738,10 @@ void setupSystemRoutes() {
                 if (_deps.systemLog) _deps.systemLog->error("OTA begin: " + berr);
             }
         }
-        if (!otaAuthorized) return;
+        OtaHttpRequestContext* context =
+            static_cast<OtaHttpRequestContext*>(request->_tempObject);
+        if (!context || context->state != OtaHttpRequestState::OWNER ||
+            otaRuntimeOwner() != OTA_OWNER_HTTP) return;
         if (!Update.hasError()) {
             size_t wrote = Update.write(data, len);
             if (wrote != len) {
@@ -1341,6 +1772,7 @@ void setupSystemRoutes() {
                 // OTA success bypasses reboot inhibit so the slot swap completes.
                 g_otaRebootForce.store(true);
                 otaRuntimeEnd(OTA_OWNER_HTTP);
+                context->state = OtaHttpRequestState::SUCCEEDED;
                 *_deps.shouldReboot = true;
             } else {
                 Update.printError(Serial);
@@ -1348,6 +1780,7 @@ void setupSystemRoutes() {
                 Update.abort();
                 otaRuntimeRestoreServices("http_ota_failed", false);
                 otaRuntimeEnd(OTA_OWNER_HTTP);
+                context->state = OtaHttpRequestState::FAILED;
                 // Surface the failure outside the serial console so an operator
                 // pushing to a sealed unit notices instead of seeing only the
                 // generic 200 response from AsyncWebServer.
@@ -1360,9 +1793,59 @@ void setupSystemRoutes() {
                         String("at ") + String((unsigned)(index + len)) + " B: " + err);
                 }
             }
-            otaAuthorized = false;
         }
     });
+
+    // HTTPS pull uses an operator-provisioned CA. The PEM is write-only through
+    // this API; diagnostics and config exports intentionally expose status only.
+    _deps.server->on("/api/ota/trust", HTTP_GET, [](AsyncWebServerRequest *request) {
+        if (!checkAuth(request)) return;
+        const String ca = _deps.preferences ? _deps.preferences->getString("ota_tls_ca", "") : "";
+        JsonDocument doc;
+        doc["https_configured"] = otaTlsPemValid(ca.c_str());
+        doc["mode"] = otaTlsPemValid(ca.c_str()) ? "ca" : "none";
+        doc["ca_configured"] = ca.length() > 0;
+        sendJsonBuffered(request, doc);
+    });
+    _deps.server->on("/api/ota/trust", HTTP_POST, [](AsyncWebServerRequest *request) {
+        if (!checkAuthBasic(request)) return;
+        char* body = static_cast<char*>(request->_tempObject);
+        if (!body) { request->send(400, "text/plain", "Body required or too large"); return; }
+        JsonDocument doc;
+        DeserializationError err = deserializeJson(doc, body);
+        free(body);
+        request->_tempObject = nullptr;
+        if (err) { request->send(400, "text/plain", "Invalid JSON"); return; }
+        if (!_deps.preferences) { request->send(503, "text/plain", "Preferences unavailable"); return; }
+        if (doc["clear"] | false) {
+            if (!_deps.preferences->remove("ota_tls_ca")) {
+                request->send(500, "text/plain", "Could not clear OTA CA"); return;
+            }
+            request->send(200, "text/plain", "OTA HTTPS trust cleared"); return;
+        }
+        const char* ca = doc["ca_pem"] | "";
+        if (!otaTlsPemValid(ca)) {
+            request->send(400, "text/plain", "'ca_pem' must be one PEM certificate (max 3072 bytes)"); return;
+        }
+        if (_deps.preferences->putString("ota_tls_ca", ca) != strlen(ca) ||
+            !_deps.preferences->getString("ota_tls_ca", "").equals(ca)) {
+            request->send(500, "text/plain", "Could not persist OTA CA"); return;
+        }
+        request->send(200, "text/plain", "OTA HTTPS CA saved");
+    }, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+        if (index == 0) {
+            if (total > OTA_TLS_CA_MAX_LEN + 128) { request->_tempObject = nullptr; return; }
+            request->_tempObject = malloc(total + 1);
+            if (request->_tempObject) static_cast<char*>(request->_tempObject)[total] = '\0';
+        }
+        if (request->_tempObject && index + len <= total)
+            memcpy(static_cast<char*>(request->_tempObject) + index, data, len);
+    });
+
+    registerTlsTrustRoute("/api/mqtt/trust", "mqtt_tls_ca", "MQTTS");
+    registerTlsTrustRoute("/api/telegram/trust", "tg_tls_ca", "Telegram");
+    registerTlsTrustRoute("/api/discord/trust", "dc_tls_ca", "Discord webhook");
+    registerTlsTrustRoute("/api/webhook/trust", "gen_tls_ca", "Generic webhook");
 
     // Pull-based OTA — device fetches binary from a URL instead of receiving
     // it over HTTP POST. Bypasses AsyncTCP backpressure (no 64 KB stall).
@@ -1393,8 +1876,9 @@ void setupSystemRoutes() {
         // which produced the "empty reply, phase=idle" pull-OTA failure. Basic
         // is preemptive (sent on first request), so the body survives.
         if (!checkAuthBasic(request)) return;
-        if (otaPullInFlight || otaRuntimeOwner() != OTA_OWNER_NONE) {
-            request->send(409, "text/plain", String("OTA already in progress: ") + otaRuntimeOwnerName(otaRuntimeOwner()));
+        if (otaPullInFlight || (_deps.runtimeOperationCoordinator != nullptr &&
+            _deps.runtimeOperationCoordinator->status().operation != RuntimeOperation::IDLE)) {
+            request->send(409, "text/plain", String("Runtime operation already in progress: ") + runtimeOperationConflictText());
             return;
         }
         if (!request->_tempObject) {
@@ -1421,13 +1905,20 @@ void setupSystemRoutes() {
                 "or *.local/*.lan");
             return;
         }
+        const bool isHttps = otaTlsHttpsUrl(url);
+        const String otaCa = (_deps.preferences && isHttps)
+            ? _deps.preferences->getString("ota_tls_ca", "") : "";
+        if (isHttps && !otaTlsPemValid(otaCa.c_str())) {
+            request->send(409, "text/plain", "HTTPS trust is not configured; save a CA at /api/ota/trust first");
+            return;
+        }
         if (!isValidMd5Hex(md5)) {
             request->send(400, "text/plain", "'md5' is required and must be 32 hex characters");
             return;
         }
 
-        struct PullParams { String url; String auth; String md5; };
-        PullParams* p = new(std::nothrow) PullParams{ String(url), String(auth), String(md5) };
+        struct PullParams { String url; String auth; String md5; String ca; };
+        PullParams* p = new(std::nothrow) PullParams{ String(url), String(auth), String(md5), otaCa };
         if (!p) {
             request->send(500, "text/plain", "Out of memory");
             return;
@@ -1435,7 +1926,7 @@ void setupSystemRoutes() {
 
         if (!otaRuntimeTryBegin(OTA_OWNER_PULL, 300000)) {
             delete p;
-            request->send(409, "text/plain", String("OTA already in progress: ") + otaRuntimeOwnerName(otaRuntimeOwner()));
+            request->send(409, "text/plain", String("Runtime operation already in progress: ") + runtimeOperationConflictText());
             return;
         }
         otaPullInFlight = true;
@@ -1447,7 +1938,12 @@ void setupSystemRoutes() {
             _deps.preferences->putString("ota_phase", "accepted");
             _deps.preferences->putString("ota_msg", "");
             _deps.preferences->putInt("ota_err", 0);
-            _deps.preferences->putString("ota_url", p->url);
+            // Persist a redacted copy — p->url itself must stay intact, the
+            // fetch below still needs the real credentials.
+            char redactedUrl[600];
+            p->url.toCharArray(redactedUrl, sizeof(redactedUrl));
+            redactSensitiveText(redactedUrl, sizeof(redactedUrl));
+            _deps.preferences->putString("ota_url", redactedUrl);
             _deps.preferences->putUInt("ota_ts", (uint32_t)(millis() / 1000));
         }
         if (_deps.configSnapshot && _deps.preferences) {
@@ -1471,14 +1967,14 @@ void setupSystemRoutes() {
 
             // FIX: choose client by URL scheme (previously always WiFiClientSecure,
             // which failed on plain-HTTP URLs with a silent TLS-handshake stall).
-            bool isHttps = p->url.startsWith("https://");
+            bool isHttps = otaTlsHttpsUrl(p->url.c_str());
             WiFiClient*       plain = nullptr;
             WiFiClientSecure* secure = nullptr;
             WiFiClient*       client = nullptr;
             if (isHttps) {
                 secure = new(std::nothrow) WiFiClientSecure();
                 if (secure) {
-                    secure->setInsecure();
+                    secure->setCACert(p->ca.c_str());
                     secure->setTimeout(30000);
                     client = secure;
                 }
@@ -1528,9 +2024,7 @@ void setupSystemRoutes() {
             // and freeze CSI WiFi/lwIP manipulation for the duration of the pull.
             if (radarTaskHandle) vTaskSuspend(radarTaskHandle);
 #ifdef USE_CSI
-            CSIService::setOtaInProgress(true);
 #endif
-            MQTTService::setOtaInProgress(true);
             setPhase("fetching");
             otaRuntimeMarkProgress(0);
 
@@ -1647,10 +2141,8 @@ void setupSystemRoutes() {
         doc["ts_s"]     = prefs ? prefs->getUInt  ("ota_ts",    0)        : 0;
         doc["in_flight"]= otaPullInFlight || otaRuntimeOwner() == OTA_OWNER_PULL;
         doc["runtime_owner"] = otaRuntimeOwnerName(otaRuntimeOwner());
-        doc["runtime_last_bytes"] = g_otaRuntimeLastBytes.load();
-        AsyncResponseStream* response = request->beginResponseStream("application/json");
-        serializeJson(doc, *response);
-        request->send(response);
+        doc["runtime_last_bytes"] = otaRuntimeLastBytes();
+        sendJsonBuffered(request, doc);
     });
 
     // Debug log ring buffer — remote access to last 4KB of DBG() output
@@ -1676,26 +2168,26 @@ void setupSystemRoutes() {
         doc["espota_prepare_requested"] = g_espotaPrepareRequested.load();
         doc["espota_maintenance"] = g_espotaMaintenance.load();
         uint8_t owner = otaRuntimeOwner();
-        doc["ota_transfer_active"] = g_otaTransferActive.load();
+        uint32_t lastProgressMs = otaRuntimeLastProgressMs();
+        doc["ota_transfer_active"] = otaRuntimeTransferActive();
         doc["ota_owner"] = otaRuntimeOwnerName(owner);
         doc["ota_owner_id"] = owner;
-        doc["ota_last_progress_age_s"] = g_otaRuntimeLastProgressMs.load() == 0 ? -1 : (long)((now - g_otaRuntimeLastProgressMs.load()) / 1000);
-        doc["ota_last_bytes"] = g_otaRuntimeLastBytes.load();
-        doc["ota_timeout_ms"] = g_otaRuntimeTimeoutMs.load();
+        doc["ota_last_progress_age_s"] = lastProgressMs == 0 ? -1 : (long)((now - lastProgressMs) / 1000);
+        doc["ota_last_bytes"] = otaRuntimeLastBytes();
+        doc["ota_timeout_ms"] = otaRuntimeTimeoutMs();
         doc["maintenance_until_ms"] = until;
         doc["maintenance_remaining_s"] = (g_espotaMaintenance.load() && until != 0 && (long)(until - now) > 0) ? (uint32_t)((until - now) / 1000UL) : 0;
         doc["heap_free"] = ESP.getFreeHeap();
         doc["heap_largest"] = ESP.getMaxAllocHeap();
         doc["reboot_inhibit"] = g_rebootInhibit.load();
-        AsyncResponseStream* response = request->beginResponseStream("application/json");
-        serializeJson(doc, *response);
-        request->send(response);
+        sendJsonBuffered(request, doc);
     });
 
     _deps.server->on("/api/ota/espota/prepare", HTTP_POST, [](AsyncWebServerRequest *request) {
         if (!checkAuth(request)) return;
-        if (otaRuntimeOwner() != OTA_OWNER_NONE) {
-            request->send(409, "text/plain", String("OTA already in progress: ") + otaRuntimeOwnerName(otaRuntimeOwner()));
+        if (_deps.runtimeOperationCoordinator != nullptr &&
+            _deps.runtimeOperationCoordinator->status().operation != RuntimeOperation::IDLE) {
+            request->send(409, "text/plain", String("Runtime operation already in progress: ") + runtimeOperationConflictText());
             return;
         }
         uint32_t seconds = 120;
@@ -1705,7 +2197,7 @@ void setupSystemRoutes() {
         if (seconds < 30) seconds = 30;
         if (seconds > 600) seconds = 600;
         if (!otaRuntimeTryBegin(OTA_OWNER_ESPOTA_PREPARE, (seconds + 5) * 1000UL)) {
-            request->send(409, "text/plain", String("OTA already in progress: ") + otaRuntimeOwnerName(otaRuntimeOwner()));
+            request->send(409, "text/plain", String("Runtime operation already in progress: ") + runtimeOperationConflictText());
             return;
         }
         g_espotaMaintenanceSeconds.store(seconds);
@@ -1717,9 +2209,7 @@ void setupSystemRoutes() {
         doc["ip"] = ETH.localIP().toString();
         doc["espota_port"] = 3232;
         doc["message"] = "ESPOTA maintenance window requested";
-        AsyncResponseStream* response = request->beginResponseStream("application/json");
-        serializeJson(doc, *response);
-        request->send(response);
+        sendJsonBuffered(request, doc);
     });
 
     _deps.server->on("/api/restart", HTTP_POST, [](AsyncWebServerRequest *request) {
@@ -1729,7 +2219,7 @@ void setupSystemRoutes() {
                 "Reboot inhibit is ON. POST /api/reboot_inhibit {\"enabled\":false} to allow manual restarts.");
             return;
         }
-        if (_deps.mqttService) _deps.mqttService->publishMaintenance(true);
+        if (_deps.mqttService) _deps.mqttService->requestMaintenancePublish(true);
         request->send(200, "text/plain", "Rebooting...");
         *_deps.shouldReboot = true;
     });
@@ -1908,7 +2398,7 @@ void setupSystemRoutes() {
             request->send(500, "text/plain", "Radar command failed");
         }
     }, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
-        if (!checkAuth(request)) return;
+        if (!index && !checkAuth(request)) return;
 
         if (index == 0) {
             if (total > 512) return;
@@ -1940,9 +2430,7 @@ void setupSystemRoutes() {
         if (mode == 1) res = 0.50f;
         else if (mode == 2) res = 0.20f;
         doc["resolution"] = res;
-        AsyncResponseStream* response = request->beginResponseStream("application/json");
-        serializeJson(doc, *response);
-        request->send(response);
+        sendJsonBuffered(request, doc);
     });
 
     // Light Function/Threshold endpoints (Task #11)
@@ -1952,9 +2440,7 @@ void setupSystemRoutes() {
         doc["function"] = _deps.radar->getLightFunction();
         doc["threshold"] = _deps.radar->getLightThreshold();
         doc["current_level"] = _deps.radar->getLightLevel();
-        AsyncResponseStream* response = request->beginResponseStream("application/json");
-        serializeJson(doc, *response);
-        request->send(response);
+        sendJsonBuffered(request, doc);
     });
 
     _deps.server->on("/api/radar/light", HTTP_POST, [](AsyncWebServerRequest *request) {
@@ -1992,9 +2478,7 @@ void setupSystemRoutes() {
         if (!checkAuth(request)) return;
         JsonDocument doc;
         doc["duration"] = _deps.radar->getMaxGateDuration();
-        AsyncResponseStream* response = request->beginResponseStream("application/json");
-        serializeJson(doc, *response);
-        request->send(response);
+        sendJsonBuffered(request, doc);
     });
 
     _deps.server->on("/api/radar/timeout", HTTP_POST, [](AsyncWebServerRequest *request) {
@@ -2038,9 +2522,7 @@ void setupSystemRoutes() {
         if (_deps.radar->getRadarMacString(macStr)) {
             doc["mac"] = macStr;
         }
-        AsyncResponseStream* response = request->beginResponseStream("application/json");
-        serializeJson(doc, *response);
-        request->send(response);
+        sendJsonBuffered(request, doc);
     });
 
     _deps.server->on("/api/radar/bluetooth", HTTP_POST, [](AsyncWebServerRequest *request) {
@@ -2075,9 +2557,7 @@ void setupSystemRoutes() {
         if (_deps.radar->getRadarMacString(macStr)) {
             doc["mac"] = macStr;
         }
-        AsyncResponseStream* response = request->beginResponseStream("application/json");
-        serializeJson(doc, *response);
-        request->send(response);
+        sendJsonBuffered(request, doc);
     });
 
     _deps.server->on("/api/radar/bluetooth", HTTP_POST, [](AsyncWebServerRequest *request) {
@@ -2156,33 +2636,73 @@ void setupAlarmRoutes() {
                 }
             }
         }
-        AsyncResponseStream* response = request->beginResponseStream("application/json");
-        serializeJson(doc, *response);
-        request->send(response);
+        sendJsonBuffered(request, doc);
     });
 
-    _deps.server->on("/api/alarm/arm", HTTP_POST, [](AsyncWebServerRequest *request) {
+    // BA-11: map the real setArmed() outcome to HTTP + report the actual
+    // resulting state, so the operator is never told "Armed"/"Disarmed" when a
+    // state-lock timeout (BUSY) or a PENDING/TRIGGERED refusal (REJECTED) left
+    // the alarm unchanged.
+    auto sendArmResult = [](AsyncWebServerRequest *request, SetArmedResult r) {
+        const char* st = _deps.securityMonitor->getAlarmStateStr();
+        switch (r) {
+            case SetArmedResult::APPLIED:
+            case SetArmedResult::IDEMPOTENT:
+                request->send(200, "text/plain", String("state=") + st);
+                break;
+            case SetArmedResult::REJECTED:
+                request->send(409, "text/plain", String("Cannot change arm state while ") + st);
+                break;
+            case SetArmedResult::BUSY:
+                request->send(503, "text/plain", "Alarm state lock busy, retry");
+                break;
+        }
+    };
+
+    _deps.server->on("/api/alarm/arm", HTTP_POST, [sendArmResult](AsyncWebServerRequest *request) {
         if (!checkAuth(request)) return;
         bool immediate = request->hasParam("immediate") && request->getParam("immediate")->value() == "1";
-        _deps.securityMonitor->setArmed(true, immediate);
-        request->send(200, "text/plain", immediate ? "Armed (immediate)" : "Arming...");
+        sendArmResult(request, _deps.securityMonitor->setArmed(true, immediate));
     });
 
-    _deps.server->on("/api/alarm/disarm", HTTP_POST, [](AsyncWebServerRequest *request) {
+    _deps.server->on("/api/alarm/disarm", HTTP_POST, [sendArmResult](AsyncWebServerRequest *request) {
         if (!checkAuth(request)) return;
-        _deps.securityMonitor->setArmed(false);
-        request->send(200, "text/plain", "Disarmed");
+        sendArmResult(request, _deps.securityMonitor->setArmed(false));
     });
 
     _deps.server->on("/api/alarm/config", HTTP_POST, [](AsyncWebServerRequest *request) {
         if (!checkAuth(request)) return;
+        // BA-01: reject junk/negative/oversize before the *1000 conversion. A
+        // negative `entry_delay` fed through String::toInt() and stored in an
+        // unsigned long wrapped to ~4.29e9 ms (~49.7 days), pinning the alarm in
+        // PENDING/ARMING that whole time — a silent detection blackout (inv #5).
+        // Digits-only + explicit range makes the input layer strict.
+        auto parseBounded = [](const String& s, long maxVal, long& out) -> bool {
+            if (s.length() == 0 || s.length() > 6) return false;
+            for (size_t i = 0; i < s.length(); i++)
+                if (!isdigit((unsigned char)s[i])) return false;
+            long v = s.toInt();
+            if (v < 0 || v > maxVal) return false;
+            out = v;
+            return true;
+        };
         if (request->hasParam("entry_delay")) {
-            unsigned long val = request->getParam("entry_delay")->value().toInt() * 1000;
+            long sec;
+            if (!parseBounded(request->getParam("entry_delay")->value(), 3600, sec)) {
+                request->send(400, "text/plain", "entry_delay must be 0-3600 seconds");
+                return;
+            }
+            unsigned long val = (unsigned long)sec * 1000UL;
             _deps.securityMonitor->setEntryDelay(val);
             _deps.preferences->putULong("sec_entry_dl", val);
         }
         if (request->hasParam("exit_delay")) {
-            unsigned long val = request->getParam("exit_delay")->value().toInt() * 1000;
+            long sec;
+            if (!parseBounded(request->getParam("exit_delay")->value(), 3600, sec)) {
+                request->send(400, "text/plain", "exit_delay must be 0-3600 seconds");
+                return;
+            }
+            unsigned long val = (unsigned long)sec * 1000UL;
             _deps.securityMonitor->setExitDelay(val);
             _deps.preferences->putULong("sec_exit_dl", val);
         }
@@ -2192,11 +2712,74 @@ void setupAlarmRoutes() {
             _deps.preferences->putBool("sec_dis_rem", en);
         }
         if (request->hasParam("debounce_frames")) {
-            uint8_t val = (uint8_t)request->getParam("debounce_frames")->value().toInt();
-            _deps.securityMonitor->setAlarmDebounceFrames(val);
-            _deps.preferences->putUChar("sec_debounce", val);
+            long frames;
+            if (!parseBounded(request->getParam("debounce_frames")->value(), 60, frames)) {
+                request->send(400, "text/plain", "debounce_frames must be 0-60");
+                return;
+            }
+            _deps.securityMonitor->setAlarmDebounceFrames((uint8_t)frames);
+            _deps.preferences->putUChar("sec_debounce", (uint8_t)frames);
         }
         request->send(200, "text/plain", "Alarm config saved");
+    });
+}
+
+static bool coredumpPresent(size_t* size) {
+    size_t a = 0, s = 0;
+    if (esp_core_dump_image_get(&a, &s) != ESP_OK) return false;
+    if (size) *size = s;
+    return s > 0;
+}
+
+void setupCoredumpRoutes() {
+    _deps.server->on(AsyncURIMatcher::exact("/api/coredump"), HTTP_GET, [](AsyncWebServerRequest *request) {
+        if (!checkAuth(request)) return;
+        JsonDocument doc;
+        size_t size = 0;
+        bool present = coredumpPresent(&size);
+        doc["present"] = present;
+        doc["size"] = (uint32_t)size;
+        if (present) {
+            esp_core_dump_summary_t summary;
+            if (esp_core_dump_get_summary(&summary) == ESP_OK) {
+                doc["task"] = summary.exc_task;
+                char pc[11];
+                snprintf(pc, sizeof(pc), "0x%08x", (unsigned)summary.exc_pc);
+                doc["exc_pc"] = pc;
+                doc["core_dump_version"] = summary.core_dump_version;
+            }
+        }
+        sendJsonBuffered(request, doc);
+    });
+
+    // Basic auth: binární payload až 64 KB — digest má na AsyncTCP/LAN8720A
+    // známý problém s velkými odpověďmi (viz checkAuthBasic).
+    _deps.server->on("/api/coredump/download", HTTP_GET, [](AsyncWebServerRequest *request) {
+        if (!checkAuthBasic(request)) return;
+        size_t size = 0;
+        if (!coredumpPresent(&size)) { request->send(404, "text/plain", "No core dump"); return; }
+        const esp_partition_t* part = esp_partition_find_first(
+            ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_COREDUMP, nullptr);
+        if (!part) { request->send(500, "text/plain", "No coredump partition"); return; }
+        const size_t total = size;
+        AsyncWebServerResponse* response = request->beginResponse(
+            "application/octet-stream", total,
+            [part, total](uint8_t* buffer, size_t maxLen, size_t index) -> size_t {
+                if (index >= total) return 0;
+                size_t chunk = (maxLen < total - index) ? maxLen : (total - index);
+                if (esp_partition_read(part, index, buffer, chunk) != ESP_OK) return 0;
+                return chunk;
+            });
+        response->addHeader("Content-Disposition", "attachment; filename=coredump.bin");
+        request->send(response);
+    });
+
+    _deps.server->on("/api/coredump/erase", HTTP_POST, [](AsyncWebServerRequest *request) {
+        if (!checkAuth(request)) return;
+        if (esp_core_dump_image_erase() == ESP_OK)
+            request->send(200, "text/plain", "Core dump erased");
+        else
+            request->send(500, "text/plain", "Erase failed");
     });
 }
 
@@ -2205,9 +2788,7 @@ void setupLogRoutes() {
         if (!checkAuth(request)) return;
         JsonDocument doc;
         _deps.systemLog->getLogJSON(doc);
-        AsyncResponseStream* response = request->beginResponseStream("application/json");
-        serializeJson(doc, *response);
-        request->send(response);
+        sendJsonBuffered(request, doc);
     });
 
     _deps.server->on("/api/logs", HTTP_DELETE, [](AsyncWebServerRequest *request) {
@@ -2224,9 +2805,7 @@ void setupLogRoutes() {
         if (limit > 100) limit = 100; // cap
         JsonDocument doc;
         _deps.eventLog->getEventsJSON(doc, offset, limit, type);
-        AsyncResponseStream* response = request->beginResponseStream("application/json");
-        serializeJson(doc, *response);
-        request->send(response);
+        sendJsonBuffered(request, doc);
     });
 
     _deps.server->on("/api/events/clear", HTTP_POST, [](AsyncWebServerRequest *request) {
@@ -2242,18 +2821,42 @@ void setupLogRoutes() {
         _deps.eventLog->getEventsJSON(doc, 0, 500, -1);
         JsonArray arr = doc["events"].as<JsonArray>();
 
-        String csv = "timestamp,type,distance_cm,energy,message\r\n";
+        // Measure-then-allocate exact-size buffer instead of growing a String
+        // via +=: String::concat() fails silently on realloc failure, which
+        // would ship a truncated CSV as HTTP 200 under heap pressure — same
+        // rationale as sendJsonBuffered() above. Event count is already
+        // capped to 500 by the getEventsJSON() call.
+        static const char* CSV_HEADER = "timestamp,type,distance_cm,energy,message\r\n";
+        size_t total = strlen(CSV_HEADER);
         for (JsonObject obj : arr) {
-            char line[128];
-            snprintf(line, sizeof(line), "%u,%u,%u,%u,\"%s\"\r\n",
+            total += snprintf(nullptr, 0, "%u,%u,%u,%u,\"%s\"\r\n",
                 obj["ts"].as<uint32_t>(),
                 obj["type"].as<uint8_t>(),
                 obj["dist"].as<uint16_t>(),
                 obj["en"].as<uint8_t>(),
                 obj["msg"].as<const char*>());
-            csv += line;
         }
-        AsyncWebServerResponse *response = request->beginResponse(200, "text/csv", csv);
+        char* raw = new (std::nothrow) char[total + 1];
+        if (raw == nullptr) { request->send(503, "text/plain", "Low memory"); return; }
+        size_t pos = strlen(CSV_HEADER);
+        memcpy(raw, CSV_HEADER, pos);
+        for (JsonObject obj : arr) {
+            pos += snprintf(raw + pos, total + 1 - pos, "%u,%u,%u,%u,\"%s\"\r\n",
+                obj["ts"].as<uint32_t>(),
+                obj["type"].as<uint8_t>(),
+                obj["dist"].as<uint16_t>(),
+                obj["en"].as<uint8_t>(),
+                obj["msg"].as<const char*>());
+        }
+        std::shared_ptr<char> buf(raw, std::default_delete<char[]>());
+        AsyncWebServerResponse* response = request->beginResponse(
+            "text/csv", total,
+            [buf, total](uint8_t* dst, size_t maxLen, size_t index) -> size_t {
+                if (index >= total) return 0;
+                size_t chunk = (maxLen < total - index) ? maxLen : (total - index);
+                memcpy(dst, buf.get() + index, chunk);
+                return chunk;
+            });
         response->addHeader("Content-Disposition", "attachment; filename=\"events.csv\"");
         request->send(response);
     });
@@ -2270,9 +2873,7 @@ void setupLogRoutes() {
         doc["mac"] = ETH.macAddress();
         doc["link_speed"] = ETH.linkSpeed();
         doc["full_duplex"] = ETH.fullDuplex();
-        AsyncResponseStream* response = request->beginResponseStream("application/json");
-        serializeJson(doc, *response);
-        request->send(response);
+        sendJsonBuffered(request, doc);
     });
 
     _deps.server->on("/api/network/config", HTTP_POST, [](AsyncWebServerRequest *request) {
@@ -2318,9 +2919,7 @@ void setupLogRoutes() {
         JsonDocument doc;
         doc["tz_offset"] = _deps.config->tz_offset;
         doc["dst_offset"] = _deps.config->dst_offset;
-        AsyncResponseStream* response = request->beginResponseStream("application/json");
-        serializeJson(doc, *response);
-        request->send(response);
+        sendJsonBuffered(request, doc);
     });
 
     _deps.server->on("/api/timezone", HTTP_POST, [](AsyncWebServerRequest *request) {
@@ -2350,9 +2949,7 @@ void setupLogRoutes() {
         doc["arm_time"] = _deps.config->sched_arm_time;
         doc["disarm_time"] = _deps.config->sched_disarm_time;
         doc["auto_arm_minutes"] = _deps.config->auto_arm_minutes;
-        AsyncResponseStream* response = request->beginResponseStream("application/json");
-        serializeJson(doc, *response);
-        request->send(response);
+        sendJsonBuffered(request, doc);
     });
 
     _deps.server->on("/api/schedule", HTTP_POST, [](AsyncWebServerRequest *request) {
@@ -2459,7 +3056,7 @@ void setupWwwRoutes() {
 
 void setupSnapshotRoutes() {
     // GET /api/config/snapshots — list available snapshots
-    _deps.server->on("/api/config/snapshots", HTTP_GET, [](AsyncWebServerRequest *request) {
+    _deps.server->on(AsyncURIMatcher::exact("/api/config/snapshots"), HTTP_GET, [](AsyncWebServerRequest *request) {
         if (!checkAuth(request)) return;
         if (!_deps.configSnapshot) {
             request->send(503, "application/json", "{\"error\":\"snapshots unavailable\"}");
@@ -2467,9 +3064,7 @@ void setupSnapshotRoutes() {
         }
         JsonDocument doc;
         _deps.configSnapshot->getMetaJSON(doc);
-        AsyncResponseStream* response = request->beginResponseStream("application/json");
-        serializeJson(doc, *response);
-        request->send(response);
+        sendJsonBuffered(request, doc);
     });
 
     // GET /api/config/snapshots/:slot — view content of one slot (passwords masked)
@@ -2537,8 +3132,24 @@ static int csiModelOpHttp(CsiModelOp op, const char*& msg) {
         case CsiModelOp::NO_PREVIOUS:       msg = "No previous model";          return 404;
         case CsiModelOp::VALIDATION_FAILED: msg = "Model failed validation";    return 422;
         case CsiModelOp::STORE_FAILED:      msg = "NVS write/verify failed";    return 500;
+        case CsiModelOp::INCOMPATIBLE_AP:   msg = "Candidate BSSID incompatible with current AP — pass force=1 to override"; return 409;
     }
     msg = "Unknown"; return 500;
+}
+static int csiModelRequestHttp(CSIService* service, CsiModelCommand command,
+                               bool force, const char*& msg) {
+    CsiModelOp result = CsiModelOp::STORE_FAILED;
+    CsiModelRequestStatus status = service->requestModelOperation(
+        command, force, 2000, result);
+    if (status == CsiModelRequestStatus::BUSY) {
+        msg = "Another model operation is in progress";
+        return 409;
+    }
+    if (status == CsiModelRequestStatus::TIMED_OUT) {
+        msg = "Model operation timed out";
+        return 503;
+    }
+    return csiModelOpHttp(result, msg);
 }
 // Serialize one model slot into a JSON object (only meaningful fields when valid).
 static void csiSlotToJson(JsonObject o, const CsiSiteModel& m) {
@@ -2553,6 +3164,32 @@ static void csiSlotToJson(JsonObject o, const CsiSiteModel& m) {
     o["mean_variance"]   = m.meanVariance;
     o["std_variance"]    = m.stdVariance;
     o["max_variance"]    = m.maxVariance;
+}
+
+// Numeric mapping avoids conditional compilation against enum members that
+// differ between the two Arduino cores this project builds. Values 0-8 are
+// shared; the newer IDF adds the modes below them.
+static const char* wifiAuthText(uint8_t mode) {
+    switch (mode) {
+        case 0: return "open";
+        case 1: return "WEP";
+        case 2: return "WPA";
+        case 3: return "WPA2";
+        case 4: return "WPA/WPA2";
+        case 5: return "WPA2-EAP";
+        case 6: return "WPA3";
+        case 7: return "WPA2/WPA3";
+        case 8: return "WAPI";
+        case 9: return "OWE";
+        case 10: return "WPA3-EAP-192";
+        case 11: return "WPA3";
+        case 12: return "WPA3 mixed";
+        case 13: return "DPP";
+        case 14: return "WPA3-EAP";
+        case 15: return "WPA2/WPA3-EAP";
+        case 16: return "WPA-EAP";
+        default: return "unknown";
+    }
 }
 #endif
 void setupCSIRoutes() {
@@ -2634,9 +3271,7 @@ void setupCSIRoutes() {
             fusion["source"]     = _deps.securityMonitor->getFusionSourceStr();
         }
 
-        AsyncResponseStream* response = request->beginResponseStream("application/json");
-        serializeJson(doc, *response);
-        request->send(response);
+        sendJsonBuffered(request, doc);
     });
 
     // POST /api/csi/calibrate — sample idle variance and auto-set threshold
@@ -2651,7 +3286,10 @@ void setupCSIRoutes() {
             int d = request->getParam("duration_ms")->value().toInt();
             if (d >= 1000 && d <= 60000) dur = (uint32_t)d;
         }
-        _deps.csiService->calibrateThreshold(dur);
+        if (!_deps.csiService->calibrateThreshold(dur)) {
+            request->send(409, "text/plain", "Runtime operation already in progress");
+            return;
+        }
         request->send(200, "text/plain", "Calibration started");
     });
 
@@ -2686,8 +3324,13 @@ void setupCSIRoutes() {
         }
 
         if (request->hasParam("clear_model")) {
-            _deps.csiService->clearLearnedSiteModel();
-            request->send(200, "text/plain", "Learned site model cleared");
+            // BA-10: report the real NVS outcome — a STORE_FAILED means the model
+            // is still on flash and will resurrect on reboot, so a 200 "cleared"
+            // would be a lie (inv #6).
+            const char* msg = "";
+            int code = csiModelRequestHttp(_deps.csiService,
+                                           CsiModelCommand::CLEAR_ALL, false, msg);
+            request->send(code, "text/plain", msg);
             return;
         }
 
@@ -2705,6 +3348,10 @@ void setupCSIRoutes() {
         // replace_candidate=1 (mapped to HTTP 409 otherwise).
         bool replace = request->hasParam("replace_candidate");
         if (!_deps.csiService->startSiteLearning(durMs, replace)) {
+            if (_deps.csiService->getRuntimeOperation() != RuntimeOperation::IDLE) {
+                request->send(409, "text/plain", "Runtime operation already in progress");
+                return;
+            }
             request->send(409, "text/plain", "Candidate exists — pass replace_candidate=1 to overwrite");
             return;
         }
@@ -2722,13 +3369,15 @@ void setupCSIRoutes() {
         csiSlotToJson(doc["candidate"].to<JsonObject>(), _deps.csiService->modelCandidate());
         csiSlotToJson(doc["previous"].to<JsonObject>(),  _deps.csiService->modelPrevious());
         doc["runtime_model_generation"] = _deps.csiService->activeModelGeneration();
+        // M-2: report each slot's BSSID compatibility vs the current AP so the UI
+        // can warn before an apply and surface a model running on a roamed link.
+        doc["active"]["ap_compat"]    = csiModelCompatText(_deps.csiService->modelCompatibility(_deps.csiService->modelActive()));
+        doc["candidate"]["ap_compat"] = csiModelCompatText(_deps.csiService->modelCompatibility(_deps.csiService->modelCandidate()));
         // apply_required only when the candidate is genuinely newer than the active
         // model — after an apply, candidate==active and must not read as pending.
         doc["apply_required"] = _deps.csiService->hasCandidateModel() &&
             (_deps.csiService->modelCandidate().generation != _deps.csiService->modelActive().generation);
-        AsyncResponseStream* response = request->beginResponseStream("application/json");
-        serializeJson(doc, *response);
-        request->send(response);
+        sendJsonBuffered(request, doc);
     });
 
     // POST /api/csi/site_model/apply — activate the candidate (keeps previous for rollback)
@@ -2740,7 +3389,11 @@ void setupCSIRoutes() {
             return;
         }
         const char* msg = "";
-        int code = csiModelOpHttp(_deps.csiService->applyCandidateModel(), msg);
+        // M-2: force=1 overrides the AP-compatibility block for a candidate
+        // learned on a different BSSID (conscious operator decision).
+        bool force = request->hasParam("force") || request->hasParam("force", true);
+        int code = csiModelRequestHttp(_deps.csiService,
+                                       CsiModelCommand::APPLY, force, msg);
         request->send(code, "text/plain", msg);
     });
 
@@ -2749,7 +3402,8 @@ void setupCSIRoutes() {
         if (!checkAuth(request)) return;
         if (_deps.csiService == nullptr) { request->send(503, "text/plain", "CSI not available"); return; }
         const char* msg = "";
-        int code = csiModelOpHttp(_deps.csiService->rollbackSiteModel(), msg);
+        int code = csiModelRequestHttp(_deps.csiService,
+                                       CsiModelCommand::ROLLBACK, false, msg);
         request->send(code, "text/plain", msg);
     });
 
@@ -2758,7 +3412,8 @@ void setupCSIRoutes() {
         if (!checkAuth(request)) return;
         if (_deps.csiService == nullptr) { request->send(503, "text/plain", "CSI not available"); return; }
         const char* msg = "";
-        int code = csiModelOpHttp(_deps.csiService->clearCandidateModel(), msg);
+        int code = csiModelRequestHttp(_deps.csiService,
+                                       CsiModelCommand::CLEAR_CANDIDATE, false, msg);
         request->send(code, "text/plain", msg);
     });
 
@@ -2816,9 +3471,7 @@ void setupCSIRoutes() {
         doc["idle_amplitude_baseline"]  = m->idleAmplitudeBaseline;
         doc["bssid_hash"]      = csiBssidHash(m->bssid);   // anonymized, raw MAC never exported
         doc["model_crc"]       = m->checksum;
-        AsyncResponseStream* response = request->beginResponseStream("application/json");
-        serializeJson(doc, *response);
-        request->send(response);
+        sendJsonBuffered(request, doc);
     });
 
     // POST /api/csi/site_model/import?slot=candidate — P1.5. Import ALWAYS lands
@@ -2872,7 +3525,7 @@ void setupCSIRoutes() {
         int code = csiModelOpHttp(_deps.csiService->importCandidateModel(m), msg);
         request->send(code, "text/plain", msg);
     }, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
-        if (!checkAuth(request)) return;
+        if (!index && !checkAuth(request)) return;
         if (index == 0) {
             if (total > 4096) {
                 request->_tempObject = malloc(1);
@@ -2916,9 +3569,7 @@ void setupCSIRoutes() {
         doc["radar_present"]         = t.radarPresent;
         doc["active_generation"]     = t.activeGeneration;
         doc["uptime_ms"]             = t.uptimeMs;
-        AsyncResponseStream* response = request->beginResponseStream("application/json");
-        serializeJson(doc, *response);
-        request->send(response);
+        sendJsonBuffered(request, doc);
     });
 
     // GET /api/csi/health — P1.4 health reason flags (navrh 17.7). motion=false
@@ -2959,6 +3610,7 @@ void setupCSIRoutes() {
         in.radarAvailable       = (_deps.radar != nullptr) && _deps.radar->isRadarConnected();
         in.mqttExpected         = _deps.config->mqtt_enabled;
         in.mqttConnected        = (_deps.mqttService != nullptr) && _deps.mqttService->connected();
+        in.mlSaturated          = csi->isMlSaturated();
         in.clockValid           = clockValid;
 
         uint16_t flags = csiHealthReasons(in);
@@ -2975,9 +3627,7 @@ void setupCSIRoutes() {
                 if (flags & flag) reasons.add(csiHealthFlagStr(flag));
             }
         }
-        AsyncResponseStream* response = request->beginResponseStream("application/json");
-        serializeJson(doc, *response);
-        request->send(response);
+        sendJsonBuffered(request, doc);
     });
 
     // GET /api/csi/events?limit=100&after_seq=1700 — P1.3 diagnostic event ring
@@ -3028,9 +3678,7 @@ void setupCSIRoutes() {
             }
         }
         delete[] buf;
-        AsyncResponseStream* response = request->beginResponseStream("application/json");
-        serializeJson(doc, *response);
-        request->send(response);
+        sendJsonBuffered(request, doc);
     });
 
     // DELETE /api/csi/events — clear the diagnostic ring (seq stays monotonic)
@@ -3060,9 +3708,7 @@ void setupCSIRoutes() {
         doc["active_threshold"] = csi->getEffectiveThreshold();
         doc["shadow_threshold"] = csi->getShadowThreshold();
         doc["candidate_generation"] = csi->hasCandidateModel() ? csi->modelCandidate().generation : 0;
-        AsyncResponseStream* response = request->beginResponseStream("application/json");
-        serializeJson(doc, *response);
-        request->send(response);
+        sendJsonBuffered(request, doc);
     });
 
     // POST /api/csi/reset_baseline — clear idle baseline (use after moving sensor)
@@ -3087,8 +3733,113 @@ void setupCSIRoutes() {
         request->send(200, "text/plain", "Reconnect requested");
     });
 
+    // POST starts an asynchronous AP scan. CSI capture is suspended while the
+    // radio hops across channels; GET polls status/results. No BSSID is exposed.
+    _deps.server->on(AsyncURIMatcher::exact("/api/csi/wifi/scan"), HTTP_POST,
+        [](AsyncWebServerRequest *request) {
+        if (!checkAuthBasic(request)) return;
+        CSIService* csi = _deps.csiService;
+        if (csi == nullptr || !csi->isActive()) {
+            request->send(503, "application/json", "{\"status\":\"failed\",\"reason\":\"csi_inactive\"}");
+            return;
+        }
+
+        JsonDocument doc;
+        if (csi->getWifiScanState() == WifiScanState::RUNNING) {
+            doc["status"] = "running";
+            doc["elapsed_ms"] = csi->getWifiScanElapsedMs();
+            sendJsonBuffered(request, doc);
+            return;
+        }
+        if (csi->getRuntimeOperation() == RuntimeOperation::OTA) {
+            request->send(409, "application/json",
+                          "{\"status\":\"busy\",\"reason\":\"ota_in_progress\"}");
+            return;
+        }
+        if (csi->isSiteLearning()) {
+            request->send(409, "application/json",
+                          "{\"status\":\"busy\",\"reason\":\"site_learning_active\"}");
+            return;
+        }
+        if (csi->isCalibrating()) {
+            request->send(409, "application/json",
+                          "{\"status\":\"busy\",\"reason\":\"calibration_active\"}");
+            return;
+        }
+        WifiScanStartResult startResult = csi->startWifiScan();
+        if (startResult == WifiScanStartResult::BUSY) {
+            const char* reason = "operation_in_progress";
+            RuntimeOperation operation = csi->getRuntimeOperation();
+            if (csi->getRuntimeOperation() == RuntimeOperation::OTA || operation == RuntimeOperation::OTA) {
+                reason = "ota_in_progress";
+            } else if (csi->isSiteLearning()) {
+                reason = "site_learning_active";
+            } else if (csi->isCalibrating()) {
+                reason = "calibration_active";
+            } else if (operation == RuntimeOperation::WIFI_SCAN) {
+                reason = "wifi_scan_active";
+            }
+            doc["status"] = "busy";
+            doc["reason"] = reason;
+            sendJsonBuffered(request, doc, 409);
+            return;
+        }
+        if (startResult == WifiScanStartResult::FAILED) {
+            request->send(500, "application/json", "{\"status\":\"failed\",\"reason\":\"scan_start_failed\"}");
+            return;
+        }
+        doc["status"] = "running";
+        doc["disrupts_csi"] = true;
+        String body;
+        serializeJson(doc, body);
+        request->send(202, "application/json", body);
+    });
+
+    _deps.server->on(AsyncURIMatcher::exact("/api/csi/wifi/scan"), HTTP_GET,
+        [](AsyncWebServerRequest *request) {
+        if (!checkAuthBasic(request)) return;
+        CSIService* csi = _deps.csiService;
+        if (csi == nullptr) {
+            request->send(503, "application/json", "{\"status\":\"failed\",\"reason\":\"csi_unavailable\"}");
+            return;
+        }
+
+        WifiScanState state = csi->getWifiScanState();
+        JsonDocument doc;
+        doc["status"] = wifiScanStateText(state);
+        doc["disrupts_csi"] = true;
+        doc["capture_active"] = csi->isWifiCaptureActive();
+        doc["max_results"] = WifiScanResults::CAPACITY;
+        if (state == WifiScanState::RUNNING) {
+            doc["elapsed_ms"] = csi->getWifiScanElapsedMs();
+        } else {
+            doc["duration_ms"] = csi->getWifiScanDurationMs();
+            WifiScanFailureReason reason = csi->getWifiScanFailureReason();
+            if (reason != WifiScanFailureReason::NONE) {
+                doc["reason"] = wifiScanFailureText(reason);
+            }
+        }
+        if (state == WifiScanState::READY) {
+            WifiScanNetwork found[WifiScanResults::CAPACITY];
+            uint8_t count = csi->copyWifiScanResults(found, WifiScanResults::CAPACITY);
+            doc["count"] = count;
+            JsonArray networks = doc["networks"].to<JsonArray>();
+            for (uint8_t i = 0; i < count; i++) {
+                JsonObject item = networks.add<JsonObject>();
+                item["ssid"] = found[i].ssid;
+                item["rssi"] = found[i].rssi;
+                item["channel"] = found[i].channel;
+                item["auth_mode"] = found[i].authMode;
+                item["security"] = wifiAuthText(found[i].authMode);
+                item["secure"] = found[i].authMode != 0;
+                item["current"] = found[i].current;
+            }
+        }
+        sendJsonBuffered(request, doc);
+    });
+
     // GET /api/csi/wifi — returns configured SSID (never the password)
-    _deps.server->on("/api/csi/wifi", HTTP_GET, [](AsyncWebServerRequest *request) {
+    _deps.server->on(AsyncURIMatcher::exact("/api/csi/wifi"), HTTP_GET, [](AsyncWebServerRequest *request) {
         if (!checkAuth(request)) return;
         JsonDocument doc;
         const SystemConfig& cfg = _deps.configManager->getConfig();
@@ -3101,8 +3852,8 @@ void setupCSIRoutes() {
     });
 
     // POST /api/csi/wifi — save runtime SSID/pass to NVS (requires reboot to apply)
-    // Body: ssid=...&pass=...   OR   reset=1 (clears stored, falls back to compile-time)
-    _deps.server->on("/api/csi/wifi", HTTP_POST, [](AsyncWebServerRequest *request) {
+    // Body: ssid=...&pass=... [&clear_pass=1] OR reset=1 (compile-time fallback)
+    _deps.server->on(AsyncURIMatcher::exact("/api/csi/wifi"), HTTP_POST, [](AsyncWebServerRequest *request) {
         if (!checkAuth(request)) return;
         SystemConfig& cfg = _deps.configManager->getConfig();
         if (request->hasParam("reset", true) && request->getParam("reset", true)->value() == "1") {
@@ -3126,10 +3877,19 @@ void setupCSIRoutes() {
             request->send(400, "text/plain", "pass length 0-64");
             return;
         }
+        bool clearPass = request->hasParam("clear_pass", true) &&
+                         request->getParam("clear_pass", true)->value() == "1";
         strncpy(cfg.csi_ssid, ssid.c_str(), sizeof(cfg.csi_ssid) - 1);
         cfg.csi_ssid[sizeof(cfg.csi_ssid) - 1] = '\0';
-        strncpy(cfg.csi_pass, pass.c_str(), sizeof(cfg.csi_pass) - 1);
-        cfg.csi_pass[sizeof(cfg.csi_pass) - 1] = '\0';
+        // Empty password means "keep existing" as documented by the GUI.
+        // Open networks use explicit clear_pass=1, avoiding an accidental
+        // credential wipe when an operator edits only the SSID field.
+        if (clearPass) {
+            cfg.csi_pass[0] = '\0';
+        } else if (pass.length() > 0) {
+            strncpy(cfg.csi_pass, pass.c_str(), sizeof(cfg.csi_pass) - 1);
+            cfg.csi_pass[sizeof(cfg.csi_pass) - 1] = '\0';
+        }
         _deps.configManager->save();
         request->send(200, "application/json", "{\"saved\":true,\"reboot_required\":true}");
     });
@@ -3259,9 +4019,7 @@ void setupCSIRoutes() {
         JsonDocument doc;
         doc["ok"] = changed;
         doc["needs_restart"] = needsRestart;
-        AsyncResponseStream* response = request->beginResponseStream("application/json");
-        serializeJson(doc, *response);
-        request->send(response);
+        sendJsonBuffered(request, doc);
     });
 
 #else

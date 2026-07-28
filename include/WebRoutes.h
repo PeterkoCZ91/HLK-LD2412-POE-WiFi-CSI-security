@@ -9,6 +9,7 @@
 // Forward declarations
 class LD2412Service;
 class MQTTService;
+class RuntimeOperationCoordinator;
 class SecurityMonitor;
 class TelegramService;
 class NotificationService;
@@ -38,6 +39,7 @@ namespace WebRoutes {
         Preferences* preferences;
         LD2412Service* radar;
         MQTTService* mqttService;
+        RuntimeOperationCoordinator* runtimeOperationCoordinator;
         SecurityMonitor* securityMonitor;
         TelegramService* telegramBot;
         NotificationService* notificationService;
@@ -114,6 +116,11 @@ namespace WebRoutes {
      * @brief Setup log and event routes (/api/logs, /api/events)
      */
     void setupLogRoutes();
+
+    /**
+     * @brief Setup core dump routes (/api/coredump summary/download/erase)
+     */
+    void setupCoredumpRoutes();
 
     /**
      * @brief Setup config snapshot routes (/api/config/snapshots, /api/config/restore)

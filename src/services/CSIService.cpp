@@ -57,11 +57,30 @@ static float calculateMedian(float* arr, size_t size) {
 // ============================================================================
 
 constexpr uint8_t CSIService::SUBCARRIERS[12];
-std::atomic<bool> CSIService::_otaInProgress{false};
-
 void CSIService::_csiCallback(void* ctx, wifi_csi_info_t* info) {
-    if (ctx && info && info->buf && info->len > 0) {
-        static_cast<CSIService*>(ctx)->_processCSI(info);
+    // Běží na vysokoprioritním WiFi tasku (ppTask, core 0). Jen memcpy do
+    // fronty — plná pipeline tady vyhladověla IDLE0 a shodila task WDT
+    // (coredump, rc4 éra). Zpracování dělá csi_proc na core 1.
+    if (!ctx || !info || !info->buf || info->len == 0) return;
+    CSIService* self = static_cast<CSIService*>(ctx);
+    if (self->_csiFrameQueue == nullptr) return;
+    CsiFrame f;
+    f.len = (info->len > sizeof(f.buf)) ? (uint16_t)sizeof(f.buf) : (uint16_t)info->len;
+    memcpy(f.buf, info->buf, f.len);
+    if (xQueueSend(self->_csiFrameQueue, &f, 0) != pdTRUE) {
+        self->_csiQueueDrops.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+void CSIService::_csiProcTask(void* arg) {
+    CSIService* self = static_cast<CSIService*>(arg);
+    CsiFrame f;
+    for (;;) {
+        self->_processPendingModelOperation();
+        if (xQueueReceive(self->_csiFrameQueue, &f, pdMS_TO_TICKS(20)) == pdTRUE) {
+            self->_processCSI(f.buf, f.len);
+            self->_processPendingModelOperation();
+        }
     }
 }
 
@@ -103,6 +122,9 @@ void CSIService::_initWiFiForCSI(const char* ssid, const char* password) {
     WiFi.onEvent([this](WiFiEvent_t, WiFiEventInfo_t info){
         _lastDisconnectReason = info.wifi_sta_disconnected.reason;
     }, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
+    WiFi.onEvent([this](WiFiEvent_t, WiFiEventInfo_t){
+        _wifiScanDriverDone.store(true, std::memory_order_release);
+    }, ARDUINO_EVENT_WIFI_SCAN_DONE);
 
     WiFi.begin(ssid, password);
     Serial.printf("[CSI] Connecting WiFi to %s (HT20/11n) for CSI capture...\n", ssid);
@@ -131,7 +153,7 @@ void CSIService::_initWiFiForCSI(const char* ssid, const char* password) {
 // setup / generic task). LOCK_TCPIP_CORE() is non-reentrant; calling this from inside a
 // WiFi/lwIP event callback (which already runs on the TCPIP thread) would deadlock.
 void CSIService::_restoreEthDefaultNetif() {
-    if (_otaInProgress.load()) {
+    if (_isOtaInProgress()) {
         Serial.println("[CSI] restoreEthDefault: OTA in progress, skip");
         return;
     }
@@ -170,6 +192,12 @@ void CSIService::begin(const char* ssid, const char* password,
                        Preferences* prefs) {
     _mqtt = mqtt;
     _prefs = prefs;
+    if (_wifiScanMutex == nullptr) {
+        _wifiScanMutex = xSemaphoreCreateMutex();
+        if (_wifiScanMutex == nullptr) {
+            Serial.println("[CSI] WARNING: WiFi scan mutex allocation failed");
+        }
+    }
     strncpy(_topicPrefix, topicPrefix, sizeof(_topicPrefix) - 1);
 
     // Build MQTT topics
@@ -221,6 +249,20 @@ void CSIService::begin(const char* ssid, const char* password,
     csi_config.channel_filter_en = false;
 
     esp_wifi_set_csi_config(&csi_config);
+
+    // Worker pro CSI pipeline — vytvořit před registrací callbacku, jinak
+    // by první frame šel do neexistující fronty. Queue 8×258 B, task na
+    // core 1 (core 0 patří WiFi driveru).
+    if (_csiFrameQueue == nullptr) {
+        _csiFrameQueue = xQueueCreate(8, sizeof(CsiFrame));
+        if (_csiFrameQueue != nullptr &&
+            xTaskCreatePinnedToCore(_csiProcTask, "csi_proc", 8192, this, 2,
+                                    &_csiProcHandle, 1) != pdPASS) {
+            vQueueDelete(_csiFrameQueue);
+            _csiFrameQueue = nullptr;
+            Serial.println("[CSI] csi_proc task create failed — CSI disabled");
+        }
+    }
     esp_wifi_set_csi_rx_cb(_csiCallback, this);
     esp_wifi_set_csi(true);
 
@@ -233,7 +275,9 @@ void CSIService::begin(const char* ssid, const char* password,
     // csi-model: migrate the legacy single model into the active slot (once) and
     // mirror it into the runtime learned-* fields. This does NOT touch detection
     // _threshold — boot behavior stays identical to before; only apply/rollback
-    // switch detection. Legacy csi_lrn_* keys are left in place for FW downgrade.
+    // switch detection. Legacy csi_lrn_* keys are wiped once migration verified
+    // the active slot (M-4); they are no longer written, so a downgrade to a
+    // pre-slot firmware would boot without a learned model.
     _modelStore.attach(_prefs);
     _modelMgr.loadFromStore();
     if (!_modelMgr.active().valid && _siteModelReady) {
@@ -244,7 +288,8 @@ void CSIService::begin(const char* ssid, const char* password,
         lg.turb = _learnedIdleMeanTurb; lg.ph = _learnedIdleMeanPhase; lg.amp = _learnedIdleAmpBaseline;
         lg.n   = _learnedSampleCount;
         if (_modelMgr.migrateLegacy(lg) == CsiModelOp::OK) {
-            Serial.printf("[CSI] Migrated legacy model -> active slot gen=%lu\n",
+            _removeLegacyKeys();   // verified in the active slot — legacy copy no longer needed
+            Serial.printf("[CSI] Migrated legacy model -> active slot gen=%lu (legacy keys removed)\n",
                           (unsigned long)_modelMgr.active().generation);
         }
     }
@@ -486,9 +531,9 @@ void CSIService::_trafficGenTask(void* arg) {
 // CSI Packet Processing
 // ============================================================================
 
-void CSIService::_processCSI(wifi_csi_info_t* info) {
-    const int8_t* buf = info->buf;
-    int len = info->len;
+void CSIService::_processCSI(const int8_t* bufIn, uint16_t lenIn) {
+    const int8_t* buf = bufIn;
+    int len = lenIn;
 
     // --- Packet validation & normalization (ported from ESPectre) ---
 
@@ -962,6 +1007,7 @@ uint16_t CSIService::_computeCsiHealthFlags() const {
     in.radarAvailable     = true;    // external — excluded from the CSI-intrinsic subset
     in.mqttExpected       = false;   // external — excluded from the CSI-intrinsic subset
     in.mqttConnected      = true;
+    in.mlSaturated        = _mlSatGuard.saturated();
     return csiHealthReasons(in);
 }
 
@@ -1054,10 +1100,10 @@ void CSIService::_continuousLearnRefresh() {
 
     unsigned long now = millis();
     if (now - _lastLearnRefreshSaveMs > 600000UL) {  // 10 min
-        _saveLearnedModel(_learnedThreshold, _learnedMeanVar, _learnedStdVar,
-                          _learnedMaxVar, _learnedSampleCount);
         // EMA drifts ONLY the active slot; candidate/previous stay immutable.
+        // The slot is the source of truth now — no legacy csi_lrn_* write (M-4).
         _modelMgr.updateActiveEma(_learnedThreshold, _learnedMeanVar, _learnedStdVar);
+        if (_prefs) _prefs->putFloat("csi_thr", _learnedThreshold);  // config-path sync
         _lastLearnRefreshSaveMs = now;
     }
 }
@@ -1137,6 +1183,13 @@ void CSIService::_runMlInference() {
         uint8_t ic = _mlSmoothCount - mc;
         _mlMotion = !(ic >= SMOOTH_EXIT && _mlSmoothCount >= SMOOTH_EXIT);
     }
+
+    // v5.4.1 (navrh 1A): duty-cycle saturační hlídač. Krmí se finálním
+    // hlasem; když hlas visí na true >=95 % za 6 h, přestává se mu věřit —
+    // _mlProbability zůstává v telemetrii (diagnostika), ale fusion přes
+    // getMlMotionState() dostane false, dokud se hlas hodinu nechová.
+    _mlSatGuard.tick(_mlMotion, millis());
+    if (_mlSatGuard.saturated()) _mlMotion = false;
 }
 
 // ============================================================================
@@ -1163,6 +1216,28 @@ float CSIService::getCompositeScore() const {
 
     return 0.35f * turbDev + 0.25f * phaseDev +
            0.20f * _lastRatioTurb + 0.20f * getBreathingScore();
+}
+
+void CSIService::_publishDetectionSnapshot() {
+    CsiDetectionSnapshot snapshot;
+    snapshot.motion = _motionState;
+    snapshot.mlMotion = _mlMotion;
+    snapshot.mlEnabled = _mlEnabled;
+    snapshot.compositeScore = getCompositeScore();
+    snapshot.breathingScore = getBreathingScore();
+    snapshot.mlProbability = _mlProbability;
+    snapshot.mlThreshold = _mlThreshold;
+    snapshot.dataOk = _detectionDataOk;
+    _detectionSnapshot.publish(snapshot);
+}
+
+void CSIService::setDetectionDataOk(bool ok) {
+    _detectionDataOk = ok;
+    CsiDetectionSnapshot snapshot;
+    if (_detectionSnapshot.read(snapshot)) {
+        snapshot.dataOk = ok;
+        _detectionSnapshot.publish(snapshot);
+    }
 }
 
 // ============================================================================
@@ -1250,11 +1325,27 @@ void CSIService::_publishMQTT() {
 void CSIService::update() {
     if (!_active) return;
 
+    // A scan hops across channels, so CSI capture is suspended for its short
+    // duration. Poll before every early return to guarantee capture is restored
+    // even if WiFi disconnected or an OTA window opened while scanning.
+    _pollWifiScan();
+    uint32_t scanNow = millis();
+    if (getWifiScanState() != WifiScanState::RUNNING &&
+        _wifiScanCsiSuspended.load(std::memory_order_acquire) &&
+        scanNow - _wifiScanRestoreAttemptMs >= 1000) {
+        _wifiScanRestoreAttemptMs = scanNow;
+        if (_restoreCsiAfterWifiScan()) {  // retry a rare failed CSI restore
+            _finishWifiScanOperation();
+        }
+    }
+    _publishWifiScanMqtt();
+    if (getWifiScanState() == WifiScanState::RUNNING) return;
+
     // csi7b: Pause all WiFi/lwIP manipulation while an OTA transfer is active.
     // WiFi.reconnect(), netif_set_default() and raw_sendto traffic gen all risk
     // dropping the in-flight OTA TCP stream. Hooks in main.cpp / WebRoutes.cpp
     // set this flag at OTA start and clear it at end/error.
-    if (_otaInProgress.load()) return;
+    if (_isOtaInProgress()) return;
 
     // Force reconnect requested by user
     if (_reconnectRequested) {
@@ -1326,6 +1417,7 @@ void CSIService::update() {
         _lastPublishMs = now;
         _updateMotionState();
         _runMlInference();
+        _publishDetectionSnapshot();
         _continuousLearnRefresh();
 
         // Calibration sample collection
@@ -1346,6 +1438,7 @@ void CSIService::update() {
                                   _calibSamples, mean, _threshold);
                 }
                 _calibrating = false;
+                _finishCalibrationOperation();
             }
         }
 
@@ -1363,10 +1456,13 @@ void CSIService::update() {
                     Serial.printf("[CSI] Auto-cal: quiet env detected, waiting %us...\n",
                                   _autoCalQuietSeconds);
                 } else if ((now - _autoCalQuietStart) / 1000UL >= _autoCalQuietSeconds) {
-                    Serial.printf("[CSI] Auto-cal: quiet for %us — triggering recalibration\n",
-                                  _autoCalQuietSeconds);
-                    _autoCalDone = true;
-                    calibrateThreshold(10000);
+                    if (calibrateThreshold(10000)) {
+                        Serial.printf("[CSI] Auto-cal: quiet for %us — triggering recalibration\n",
+                                      _autoCalQuietSeconds);
+                        _autoCalDone = true;
+                    } else {
+                        _autoCalQuietStart = now;  // busy: retry after another quiet window
+                    }
                 }
             } else if (_autoCalQuietStart != 0) {
                 _autoCalQuietStart = 0;
@@ -1416,6 +1512,10 @@ void CSIService::update() {
                         _siteLearnM2Var = 0.0f;
                         _siteLearnMaxVar = 0.0f;
                         _siteLearnStartMs = millis();
+                        if (_runtimeOperationCoordinator != nullptr) {
+                            _runtimeOperationCoordinator->markProgress(
+                                RuntimeOperation::SITE_LEARNING, _siteLearnStartMs);
+                        }
                         _siteLearnBssidResetCount++;
                     }
                 }
@@ -1538,12 +1638,314 @@ void CSIService::forceReconnect() {
     _reconnectRequested = true;
 }
 
+void CSIService::_finishWifiScanOperation() {
+    if (_runtimeOperationCoordinator != nullptr) {
+        _runtimeOperationCoordinator->finish(RuntimeOperation::WIFI_SCAN);
+    }
+}
+
+void CSIService::_finishCalibrationOperation() {
+    if (_runtimeOperationCoordinator != nullptr) {
+        _runtimeOperationCoordinator->finish(RuntimeOperation::CALIBRATION);
+    }
+}
+
+void CSIService::_finishSiteLearningOperation(bool cancelled) {
+    if (_runtimeOperationCoordinator == nullptr) return;
+    if (cancelled) {
+        _runtimeOperationCoordinator->cancel(RuntimeOperation::SITE_LEARNING);
+    } else {
+        _runtimeOperationCoordinator->finish(RuntimeOperation::SITE_LEARNING);
+    }
+}
+
+void CSIService::_pollRuntimeOperationTimeouts(uint32_t nowMs) {
+    if (_runtimeOperationCoordinator == nullptr) return;
+    RuntimeOperationStatus timedOut;
+    if (_calibrating && _runtimeOperationCoordinator->checkTimeout(
+            RuntimeOperation::CALIBRATION, nowMs, &timedOut)) {
+        _calibrating = false;
+        Serial.println("[CSI] Calibration timed out — runtime claim released");
+    }
+    if (_siteLearningActive && _runtimeOperationCoordinator->checkTimeout(
+            RuntimeOperation::SITE_LEARNING, nowMs, &timedOut)) {
+        _siteLearningActive = false;
+        Serial.println("[CSI] Site learning timed out — runtime claim released");
+    }
+    if (_runtimeOperationCoordinator->checkTimeout(
+            RuntimeOperation::WIFI_SCAN, nowMs, &timedOut)) {
+        _wifiScanStartPending.store(false, std::memory_order_release);
+        if (getWifiScanState() == WifiScanState::RUNNING) esp_wifi_scan_stop();
+        _wifiScanDurationMs.store(getWifiScanElapsedMs(), std::memory_order_release);
+        _wifiScanFailure.store(static_cast<uint8_t>(WifiScanFailureReason::TIMEOUT),
+                               std::memory_order_release);
+        _wifiScanState.store(static_cast<uint8_t>(WifiScanState::FAILED),
+                             std::memory_order_release);
+        _wifiScanMqttDirty.store(true, std::memory_order_release);
+        _restoreCsiAfterWifiScan();
+        Serial.println("[CSI] WiFi scan timed out — runtime claim released");
+    }
+}
+WifiScanStartResult CSIService::startWifiScan() {
+    if (!_active || _wifiScanMutex == nullptr) {
+        return WifiScanStartResult::FAILED;
+    }
+    if (_isOtaInProgress() || _siteLearningActive || _calibrating) {
+        return WifiScanStartResult::BUSY;
+    }
+    if (_runtimeOperationCoordinator != nullptr &&
+        !_runtimeOperationCoordinator->tryBegin(
+            RuntimeOperation::WIFI_SCAN, millis(), 16000)) {
+        return WifiScanStartResult::BUSY;
+    }
+    if (xSemaphoreTake(_wifiScanMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        _finishWifiScanOperation();
+        return WifiScanStartResult::FAILED;
+    }
+
+    if (getWifiScanState() == WifiScanState::RUNNING) {
+        xSemaphoreGive(_wifiScanMutex);
+        _finishWifiScanOperation();
+        return WifiScanStartResult::BUSY;
+    }
+
+    WiFi.scanDelete();
+    _wifiScanResults.clear();
+    _wifiScanStartMs.store(millis(), std::memory_order_relaxed);
+    _wifiScanDurationMs.store(0, std::memory_order_release);
+    _wifiScanResultCount.store(0, std::memory_order_release);
+    _wifiScanFailure.store(static_cast<uint8_t>(WifiScanFailureReason::NONE),
+                           std::memory_order_release);
+    _wifiScanDriverDone.store(false, std::memory_order_release);
+    _wifiScanStartPending.store(false, std::memory_order_release);
+    _wifiScanStartAttempts = 0;
+
+    // Frames received while the STA visits foreign channels must never enter
+    // the detector/model baseline. The callback/config stay registered and are
+    // re-enabled by _pollWifiScan() after completion or timeout.
+    esp_err_t pauseErr = esp_wifi_set_csi(false);
+    if (pauseErr != ESP_OK) {
+        _wifiScanFailure.store(
+            static_cast<uint8_t>(WifiScanFailureReason::CSI_PAUSE_FAILED),
+            std::memory_order_release);
+        _wifiScanState.store(static_cast<uint8_t>(WifiScanState::FAILED),
+                             std::memory_order_release);
+        _wifiScanCaptureActive.store(true, std::memory_order_release);
+        _wifiScanMqttDirty.store(true, std::memory_order_release);
+        xSemaphoreGive(_wifiScanMutex);
+        _finishWifiScanOperation();
+        Serial.printf("[CSI] WiFi scan refused: failed to suspend CSI (0x%x)\n",
+                      pauseErr);
+        return WifiScanStartResult::FAILED;
+    }
+    // Publish RUNNING before exposing the suspended flag. update() observes
+    // both lock-free; the reverse order leaves a tiny window where it sees an
+    // old COMPLETE/FAILED state and immediately restores CSI mid-scan.
+    _wifiScanCaptureActive.store(false, std::memory_order_release);
+    _wifiScanState.store(static_cast<uint8_t>(WifiScanState::RUNNING),
+                         std::memory_order_release);
+    _wifiScanCsiSuspended.store(true, std::memory_order_release);
+    _wifiScanMqttDirty.store(true, std::memory_order_release);
+    // The AsyncWebServer callback may arrive while the STA is reconnecting.
+    // ESP-IDF rejects a scan started in that state. Cancel only an already
+    // disconnected/in-flight association, then let update() start the scan.
+    _wifiScanAutoReconnectSuspended.store(true, std::memory_order_release);
+    WiFi.setAutoReconnect(false);
+    bool connected = WiFi.status() == WL_CONNECTED;
+    if (!connected) WiFi.disconnect(false);
+    _wifiScanNextStartAttemptMs = millis() + (connected ? 0 : 350);
+    _wifiScanStartPending.store(true, std::memory_order_release);
+    xSemaphoreGive(_wifiScanMutex);
+    Serial.println("[CSI] WiFi AP scan queued");
+    return WifiScanStartResult::STARTED;
+}
+
+uint8_t CSIService::copyWifiScanResults(WifiScanNetwork* out, uint8_t capacity) {
+    if (_wifiScanMutex == nullptr || out == nullptr || capacity == 0) return 0;
+    if (xSemaphoreTake(_wifiScanMutex, pdMS_TO_TICKS(100)) != pdTRUE) return 0;
+    uint8_t count = _wifiScanResults.copyTo(out, capacity);
+    xSemaphoreGive(_wifiScanMutex);
+    return count;
+}
+
+bool CSIService::_restoreCsiAfterWifiScan() {
+    bool restored = true;
+    if (_wifiScanCsiSuspended.load(std::memory_order_acquire)) {
+        esp_err_t err = esp_wifi_set_csi(true);
+        if (err != ESP_OK) {
+            Serial.printf("[CSI] WARNING: Failed to restore CSI after scan: 0x%x\n", err);
+            restored = false;
+            _wifiScanCaptureActive.store(false, std::memory_order_release);
+        } else {
+            _wifiScanCsiSuspended.store(false, std::memory_order_release);
+            _wifiScanCaptureActive.store(true, std::memory_order_release);
+        }
+        _wifiScanMqttDirty.store(true, std::memory_order_release);
+    }
+
+    // Exclude the intentional capture gap from packet-rate health and resume
+    // Ethernet as the outbound default if the scan changed lwIP preference.
+    _windowPackets = 0;
+    _lastPublishMs = millis();
+    if (!_isOtaInProgress()) _restoreEthDefaultNetif();
+    if (_wifiScanAutoReconnectSuspended.exchange(false, std::memory_order_acq_rel)) {
+        WiFi.setAutoReconnect(true);
+        if (WiFi.status() != WL_CONNECTED) _reconnectRequested = true;
+    }
+    return restored;
+}
+
+void CSIService::_publishWifiScanMqtt() {
+    if (_mqtt == nullptr || !_mqtt->connected()) return;
+
+    WifiScanState state = getWifiScanState();
+    uint32_t now = millis();
+    uint32_t interval = (state == WifiScanState::RUNNING) ? 1000UL : 60000UL;
+    bool dirty = _wifiScanMqttDirty.exchange(false, std::memory_order_acq_rel);
+    if (!dirty && now - _wifiScanMqttPublishMs < interval) return;
+
+    uint32_t duration = (state == WifiScanState::RUNNING)
+        ? getWifiScanElapsedMs() : getWifiScanDurationMs();
+    WifiScanFailureReason reason = getWifiScanFailureReason();
+    char payload[192];
+    snprintf(payload, sizeof(payload),
+             "{\"state\":\"%s\",\"capture_active\":%s,\"duration_ms\":%lu,"
+             "\"result_count\":%u,\"reason\":\"%s\"}",
+             wifiScanStateText(state), isWifiCaptureActive() ? "true" : "false",
+             (unsigned long)duration, (unsigned)getWifiScanResultCount(),
+             wifiScanFailureText(reason));
+
+    if (_mqtt->publish(_mqtt->getTopics().csi_wifi_scan, payload, true)) {
+        _wifiScanMqttPublishMs = now;
+    } else {
+        // Retry the current snapshot after MQTT reconnect; do not intentionally
+        // enqueue historical scan transitions while the broker is offline.
+        _wifiScanMqttDirty.store(true, std::memory_order_release);
+    }
+}
+
+void CSIService::_pollWifiScan() {
+    if (getWifiScanState() != WifiScanState::RUNNING) return;
+
+    // Do not start a scan from the HTTP task while WiFi is in its reconnect
+    // transition. The main loop owns the delayed start and retries a busy
+    // driver a few times before reporting a real failure.
+    if (_wifiScanStartPending.load(std::memory_order_acquire)) {
+        uint32_t now = millis();
+        if (now < _wifiScanNextStartAttemptMs) return;
+
+        // Arduino-ESP32 derives a realistic async scan deadline from the
+        // per-channel dwell; 300 ms gives the complete band enough time.
+        int16_t result = WiFi.scanNetworks(true, false, false, 300);
+        if (result != WIFI_SCAN_FAILED) {
+            _wifiScanStartPending.store(false, std::memory_order_release);
+            _wifiScanDriverDone.store(false, std::memory_order_release);
+            Serial.println("[CSI] Asynchronous WiFi AP scan started");
+            return;
+        }
+
+        _wifiScanStartAttempts++;
+        if (_wifiScanStartAttempts < 5 && getWifiScanElapsedMs() < 5000) {
+            _wifiScanNextStartAttemptMs = now + 300;
+            Serial.printf("[CSI] WiFi scan driver busy; retry %u/5\n",
+                          (unsigned)_wifiScanStartAttempts);
+            return;
+        }
+
+        _wifiScanStartPending.store(false, std::memory_order_release);
+        _wifiScanFailure.store(static_cast<uint8_t>(WifiScanFailureReason::DRIVER_START_FAILED),
+                               std::memory_order_release);
+        _wifiScanDurationMs.store(getWifiScanElapsedMs(), std::memory_order_release);
+        bool restored = _restoreCsiAfterWifiScan();
+        if (!restored) {
+            _wifiScanFailure.store(static_cast<uint8_t>(WifiScanFailureReason::CSI_RESTORE_FAILED),
+                                   std::memory_order_release);
+        }
+        _wifiScanState.store(static_cast<uint8_t>(WifiScanState::FAILED),
+                             std::memory_order_release);
+        _wifiScanMqttDirty.store(true, std::memory_order_release);
+        if (restored) _finishWifiScanOperation();
+        Serial.println("[CSI] WiFi scan failed to start after retries");
+        return;
+    }
+
+    bool driverDone = _wifiScanDriverDone.load(std::memory_order_acquire);
+    bool timedOut = getWifiScanElapsedMs() > 15000;
+    if (!driverDone && !timedOut) return;
+
+    // WiFi.scanComplete() applies an additional max_ms_per_chan * 20 timeout
+    // which may expire before a connected STA receives WIFI_SCAN_DONE. Query it
+    // only after the real driver event so that wrapper timeout cannot abort a
+    // scan that is still making progress.
+    int16_t count = driverDone ? WiFi.scanComplete() : WIFI_SCAN_FAILED;
+    if (driverDone && count == WIFI_SCAN_RUNNING) return;
+
+    if (xSemaphoreTake(_wifiScanMutex, pdMS_TO_TICKS(100)) != pdTRUE) return;
+    if (getWifiScanState() != WifiScanState::RUNNING) {
+        xSemaphoreGive(_wifiScanMutex);
+        return;
+    }
+
+    if (timedOut && !driverDone) {
+        esp_wifi_scan_stop();
+        count = WIFI_SCAN_FAILED;
+        _wifiScanFailure.store(static_cast<uint8_t>(WifiScanFailureReason::TIMEOUT),
+                               std::memory_order_release);
+    }
+
+    _wifiScanResults.clear();
+    if (count >= 0) {
+        String currentSsid = (WiFi.status() == WL_CONNECTED) ? WiFi.SSID() : String();
+        for (int16_t i = 0; i < count; i++) {
+            String ssid = WiFi.SSID(i);
+            _wifiScanResults.add(
+                ssid.c_str(), WiFi.RSSI(i), WiFi.channel(i),
+                static_cast<uint8_t>(WiFi.encryptionType(i)),
+                currentSsid.length() > 0 && ssid == currentSsid);
+        }
+    }
+
+    uint8_t resultCount = _wifiScanResults.count();
+    WiFi.scanDelete();
+    _wifiScanResultCount.store(resultCount, std::memory_order_release);
+    _wifiScanDurationMs.store(getWifiScanElapsedMs(), std::memory_order_release);
+    bool restored = _restoreCsiAfterWifiScan();
+    WifiScanState state;
+    if (!restored) {
+        state = WifiScanState::FAILED;
+        _wifiScanFailure.store(
+            static_cast<uint8_t>(WifiScanFailureReason::CSI_RESTORE_FAILED),
+            std::memory_order_release);
+    } else if (count >= 0) {
+        state = WifiScanState::READY;
+        _wifiScanFailure.store(static_cast<uint8_t>(WifiScanFailureReason::NONE),
+                               std::memory_order_release);
+    } else {
+        state = WifiScanState::FAILED;
+        if (getWifiScanFailureReason() == WifiScanFailureReason::NONE) {
+            _wifiScanFailure.store(
+                static_cast<uint8_t>(WifiScanFailureReason::DRIVER_FAILED),
+                std::memory_order_release);
+        }
+    }
+    _wifiScanState.store(static_cast<uint8_t>(state), std::memory_order_release);
+    _wifiScanMqttDirty.store(true, std::memory_order_release);
+    if (restored) _finishWifiScanOperation();
+    xSemaphoreGive(_wifiScanMutex);
+
+    if (state == WifiScanState::READY) {
+        Serial.printf("[CSI] WiFi AP scan complete: %u unique SSIDs\n", resultCount);
+    } else {
+        Serial.println("[CSI] WiFi AP scan failed or timed out");
+    }
+}
+
 void CSIService::wifiDownForOta() {
     // Single-home to Ethernet for OTA. A CSI WiFi STA sharing the Ethernet subnet
     // makes the box dual-homed → ambiguous return path → espota auth/upload stalls.
     // Stop traffic gen and drop the AP association; keep STA mode + CSI config so a
     // later wifiUpAfterOta() (or a fresh boot) brings it straight back. update()'s
-    // reconnect loop is gated by _otaInProgress, and we disable auto-reconnect, so
+    // reconnect loop is gated by the runtime coordinator, and we disable auto-reconnect, so
     // WiFi stays down for the whole OTA window.
     _stopTrafficGen();
     WiFi.setAutoReconnect(false);
@@ -1559,15 +1961,22 @@ void CSIService::wifiUpAfterOta() {
     Serial.println("[CSI] WiFi STA restore requested after OTA window");
 }
 
-void CSIService::calibrateThreshold(uint32_t durationMs) {
+bool CSIService::calibrateThreshold(uint32_t durationMs) {
     if (durationMs < 1000) durationMs = 1000;
     if (durationMs > 60000) durationMs = 60000;
+    uint32_t now = millis();
+    if (_runtimeOperationCoordinator != nullptr &&
+        !_runtimeOperationCoordinator->tryBegin(
+            RuntimeOperation::CALIBRATION, now, durationMs + 5000UL)) {
+        return false;
+    }
     _calibrating = true;
-    _calibStartMs = millis();
+    _calibStartMs = now;
     _calibDurationMs = durationMs;
     _calibVarSum = 0.0f;
     _calibSamples = 0;
     Serial.printf("[CSI] Calibration started — sampling %u ms (keep area still)\n", durationMs);
+    return true;
 }
 
 float CSIService::getCalibrationProgress() const {
@@ -1615,6 +2024,13 @@ bool CSIService::startSiteLearning(uint32_t durationMs, bool replaceCandidate) {
         Serial.println("[CSI] Site learning refused: candidate exists (pass replace_candidate=1)");
         return false;
     }
+    uint32_t now = millis();
+    if (_runtimeOperationCoordinator != nullptr &&
+        !_runtimeOperationCoordinator->tryBegin(
+            RuntimeOperation::SITE_LEARNING, now, durationMs + 60000UL)) {
+        return false;
+    }
+
     if (_modelMgr.hasCandidate() && replaceCandidate) {
         _modelMgr.clearCandidate();
     }
@@ -1623,7 +2039,7 @@ bool CSIService::startSiteLearning(uint32_t durationMs, bool replaceCandidate) {
     _varHist.reset();
 
     _siteLearningActive = true;
-    _siteLearnStartMs = millis();
+    _siteLearnStartMs = now;
     _siteLearnDurationMs = durationMs;
     _siteLearnAccepted = 0;
     _siteLearnRejectedMotion = 0;
@@ -1641,10 +2057,11 @@ bool CSIService::startSiteLearning(uint32_t durationMs, bool replaceCandidate) {
 void CSIService::stopSiteLearning() {
     if (!_siteLearningActive) return;
     _siteLearningActive = false;
+    _finishSiteLearningOperation(true);
     Serial.println("[CSI] Site learning stopped");
 }
 
-void CSIService::clearLearnedSiteModel() {
+CsiModelOp CSIService::clearLearnedSiteModel() {
     stopSiteLearning();
 
     _siteModelReady = false;
@@ -1657,19 +2074,24 @@ void CSIService::clearLearnedSiteModel() {
     _learnedIdleMeanPhase = 0.0f;
     _learnedIdleAmpBaseline = 0.0f;
 
-    if (_prefs) {
-        _prefs->remove("csi_lrn_ok");
-        _prefs->remove("csi_lrn_thr");
-        _prefs->remove("csi_lrn_mu");
-        _prefs->remove("csi_lrn_std");
-        _prefs->remove("csi_lrn_max");
-        _prefs->remove("csi_lrn_n");
-        _prefs->remove("csi_lrn_turb");
-        _prefs->remove("csi_lrn_ph");
-        _prefs->remove("csi_lrn_amp");
+    _removeLegacyKeys();
+
+    // Wipe the three-slot model store (active/candidate/previous) too — the
+    // legacy csi_lrn_* removal above does not touch it, so without this the
+    // active model survives in NVS+RAM and is reloaded on reboot (bug M-1).
+    // BA-10: propagate the erase result so the API reports 500 instead of a
+    // false "cleared" when NVS erase fails and the model would resurrect.
+    CsiModelOp r = _modelMgr.factoryClear();
+    // Drop adaptive-P95/smoothing buffers so stale short-term state doesn't
+    // survive a clear and bias the runtime-fallback threshold.
+    _resetShortTermState();
+    if (r == CsiModelOp::OK) {
+        _scheduleModelStatePublish(ModelPublishEvent::ALL_CLEARED);
     }
 
-    Serial.println("[CSI] Learned site model cleared");
+    Serial.printf("[CSI] Learned site model cleared (store=%s)\n",
+                  r == CsiModelOp::OK ? "ok" : "STORE_FAILED");
+    return r;
 }
 
 float CSIService::getSiteLearningProgress() const {
@@ -1713,21 +2135,21 @@ void CSIService::_loadLearnedModel() {
                   _learnedThreshold, (unsigned long)_learnedSampleCount);
 }
 
-void CSIService::_saveLearnedModel(float threshold, float meanVar, float stdVar, float maxVar, uint32_t samples) {
+// M-4: wipe the legacy single-model NVS keys. Called once after a successful
+// migration into the active slot, and on an explicit clear. The three-slot store
+// (csi_model_*) is the sole model persistence now — legacy keys are no longer
+// written, so downgrade to a pre-slot firmware would find no learned model.
+void CSIService::_removeLegacyKeys() {
     if (!_prefs) return;
-
-    _prefs->putBool("csi_lrn_ok", true);
-    _prefs->putFloat("csi_lrn_thr", threshold);
-    _prefs->putFloat("csi_lrn_mu", meanVar);
-    _prefs->putFloat("csi_lrn_std", stdVar);
-    _prefs->putFloat("csi_lrn_max", maxVar);
-    _prefs->putUInt("csi_lrn_n", samples);
-    _prefs->putFloat("csi_lrn_turb", _idleMeanTurb);
-    _prefs->putFloat("csi_lrn_ph", _idleMeanPhase);
-    _prefs->putFloat("csi_lrn_amp", _idleAmpBaseline);
-
-    // Keep existing config path in sync so threshold survives reboot and UI edits.
-    _prefs->putFloat("csi_thr", threshold);
+    _prefs->remove("csi_lrn_ok");
+    _prefs->remove("csi_lrn_thr");
+    _prefs->remove("csi_lrn_mu");
+    _prefs->remove("csi_lrn_std");
+    _prefs->remove("csi_lrn_max");
+    _prefs->remove("csi_lrn_n");
+    _prefs->remove("csi_lrn_turb");
+    _prefs->remove("csi_lrn_ph");
+    _prefs->remove("csi_lrn_amp");
 }
 
 float CSIService::_computeSiteLearningThreshold() const {
@@ -1756,6 +2178,7 @@ void CSIService::_finalizeSiteLearning() {
     if (_siteLearnAccepted < 30) {
         Serial.printf("[CSI] Site learning aborted: only %lu quiet samples\n",
                       (unsigned long)_siteLearnAccepted);
+        _finishSiteLearningOperation();
         return;
     }
 
@@ -1800,6 +2223,7 @@ void CSIService::_finalizeSiteLearning() {
     CsiModelOp r = _modelMgr.finalizeCandidate(cand);
     if (r != CsiModelOp::OK) {
         Serial.printf("[CSI] Candidate finalize failed (op=%d) — active unchanged\n", (int)r);
+        _finishSiteLearningOperation();
         return;
     }
 
@@ -1818,7 +2242,7 @@ void CSIService::_finalizeSiteLearning() {
     csiQualitySeal(q);
     _lastQuality = q;
     _hasQuality  = true;
-    _publishModelState("candidate_ready");
+    _scheduleModelStatePublish(ModelPublishEvent::CANDIDATE_READY);
 
     Serial.printf(
         "[CSI] Site learning -> CANDIDATE gen=%lu quiet=%lu rejected(m/r)=%lu/%lu thr=%.6f (active unchanged)\n",
@@ -1828,6 +2252,7 @@ void CSIService::_finalizeSiteLearning() {
         (unsigned long)_siteLearnRejectedRadar,
         threshold
     );
+    _finishSiteLearningOperation();
 }
 
 // ---- csi-model: runtime application of slots ------------------------------
@@ -1858,6 +2283,29 @@ void CSIService::_publishModelState(const char* event) {
         snprintf(topic, sizeof(topic), "%s/model/event", _topicPrefix);
         _mqtt->publish(topic, event, false);
     }
+}
+
+void CSIService::processDeferredActions() {
+    // Called unconditionally from loop(), including when csi_enabled was
+    // toggled off but the user has not rebooted yet. Keep shared runtime claims
+    // from being stranded in that interval.
+    _pollRuntimeOperationTimeouts(millis());
+    ModelPublishEvent event = static_cast<ModelPublishEvent>(
+        _pendingModelPublish.exchange(static_cast<uint8_t>(ModelPublishEvent::NONE),
+                                      std::memory_order_acq_rel));
+    if (event == ModelPublishEvent::NONE) return;
+
+    const char* eventText = nullptr;
+    switch (event) {
+        case ModelPublishEvent::CANDIDATE_READY:     eventText = "candidate_ready"; break;
+        case ModelPublishEvent::APPLIED:             eventText = "applied"; break;
+        case ModelPublishEvent::ROLLEDBACK:          eventText = "rolledback"; break;
+        case ModelPublishEvent::CANDIDATE_CLEARED:  eventText = "candidate_cleared"; break;
+        case ModelPublishEvent::CANDIDATE_IMPORTED: eventText = "candidate_imported"; break;
+        case ModelPublishEvent::ALL_CLEARED:         eventText = "cleared"; break;
+        case ModelPublishEvent::NONE: return;
+    }
+    _publishModelState(eventText);
 }
 
 void CSIService::_applyActiveToRuntime() {
@@ -1900,11 +2348,18 @@ void CSIService::_switchDetectionToActive() {
     if (_prefs) _prefs->putFloat("csi_thr", a.threshold);
 }
 
-CsiModelOp CSIService::applyCandidateModel() {
+CsiModelOp CSIService::applyCandidateModel(bool force) {
+    // M-2: a candidate learned on a different AP would apply a mismatched idle
+    // fingerprint — block it unless the operator consciously overrides (force=1).
+    if (!force && _modelMgr.hasCandidate() &&
+        modelCompatibility(_modelMgr.candidate()) == CsiModelCompat::INCOMPATIBLE) {
+        Serial.println("[CSI] Apply blocked — candidate BSSID incompatible with current AP (pass force=1)");
+        return CsiModelOp::INCOMPATIBLE_AP;
+    }
     CsiModelOp r = _modelMgr.applyCandidate();
     if (r == CsiModelOp::OK) {
         _switchDetectionToActive();
-        _publishModelState("applied");
+        _scheduleModelStatePublish(ModelPublishEvent::APPLIED);
         Serial.printf("[CSI] Applied candidate -> active gen=%lu thr=%.5f\n",
                       (unsigned long)_modelMgr.active().generation, _modelMgr.active().threshold);
     }
@@ -1915,7 +2370,7 @@ CsiModelOp CSIService::rollbackSiteModel() {
     CsiModelOp r = _modelMgr.rollback();
     if (r == CsiModelOp::OK) {
         _switchDetectionToActive();
-        _publishModelState("rolledback");
+        _scheduleModelStatePublish(ModelPublishEvent::ROLLEDBACK);
         Serial.printf("[CSI] Rolled back -> active gen=%lu thr=%.5f\n",
                       (unsigned long)_modelMgr.active().generation, _modelMgr.active().threshold);
     }
@@ -1924,8 +2379,48 @@ CsiModelOp CSIService::rollbackSiteModel() {
 
 CsiModelOp CSIService::clearCandidateModel() {
     CsiModelOp r = _modelMgr.clearCandidate();
-    if (r == CsiModelOp::OK) _publishModelState("candidate_cleared");
+    if (r == CsiModelOp::OK) _scheduleModelStatePublish(ModelPublishEvent::CANDIDATE_CLEARED);
     return r;
+}
+
+CsiModelOp CSIService::_executeModelCommand(CsiModelCommand command, bool force) {
+    switch (command) {
+        case CsiModelCommand::APPLY:           return applyCandidateModel(force);
+        case CsiModelCommand::ROLLBACK:        return rollbackSiteModel();
+        case CsiModelCommand::CLEAR_CANDIDATE: return clearCandidateModel();
+        case CsiModelCommand::CLEAR_ALL:       return clearLearnedSiteModel();
+    }
+    return CsiModelOp::STORE_FAILED;
+}
+
+void CSIService::_processPendingModelOperation() {
+    CsiModelCommand command;
+    bool force = false;
+    if (!_modelCommandSlot.claim(command, force)) return;
+    _modelCommandSlot.complete(_executeModelCommand(command, force));
+}
+
+CsiModelRequestStatus CSIService::requestModelOperation(CsiModelCommand command,
+                                                        bool force,
+                                                        uint32_t timeoutMs,
+                                                        CsiModelOp& result) {
+    if (!_active || _csiProcHandle == nullptr) {
+        result = _executeModelCommand(command, force);
+        return CsiModelRequestStatus::COMPLETED;
+    }
+    if (!_modelCommandSlot.submit(command, force)) {
+        return CsiModelRequestStatus::BUSY;
+    }
+
+    uint32_t started = millis();
+    do {
+        if (_modelCommandSlot.poll(result)) return CsiModelRequestStatus::COMPLETED;
+        delay(1);
+    } while ((uint32_t)(millis() - started) < timeoutMs);
+
+    _modelCommandSlot.abandon();
+    if (_modelCommandSlot.poll(result)) return CsiModelRequestStatus::COMPLETED;
+    return CsiModelRequestStatus::TIMED_OUT;
 }
 
 // P1.5: land an imported model as CANDIDATE only. A fresh generation makes it
@@ -1938,7 +2433,7 @@ CsiModelOp CSIService::importCandidateModel(const CsiSiteModel& src) {
     if (ep > 1600000000u) cand.createdAt = ep;   // stamp import time when clock is synced
     CsiModelOp r = _modelMgr.finalizeCandidate(cand);
     if (r == CsiModelOp::OK) {
-        _publishModelState("candidate_imported");
+        _scheduleModelStatePublish(ModelPublishEvent::CANDIDATE_IMPORTED);
         Serial.printf("[CSI] Imported candidate gen=%lu thr=%.5f (apply required)\n",
                       (unsigned long)_modelMgr.candidate().generation, _modelMgr.candidate().threshold);
     }

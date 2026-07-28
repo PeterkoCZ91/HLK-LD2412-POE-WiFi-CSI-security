@@ -34,6 +34,7 @@ static constexpr uint8_t PRE_TRIGGER_WINDOW = 10;
 
 // Alarm trigger event — published atomically to MQTT alarm/event
 struct AlarmTriggerEvent {
+    uint64_t event_id;     // stable for this queued event; used by MQTT dedup
     char reason[24];     // "entry_delay" | "immediate" | "entry_delay_expired" | "disarmed"
     char zone[16];
     char prev_zone[16];   // rc2: previous zone (entry-path forensics)
@@ -80,6 +81,12 @@ enum class ZoneState {
     EXITED
 };
 
+// BA-11: outcome of setArmed() so callers (HTTP/MQTT/Telegram) can report the
+// real result instead of blindly claiming success. BUSY = the 500 ms state
+// mutex timed out and nothing changed; REJECTED = arm refused because the alarm
+// is PENDING/TRIGGERED; IDEMPOTENT = already in the requested state.
+enum class SetArmedResult : uint8_t { APPLIED, IDEMPOTENT, REJECTED, BUSY };
+
 class SecurityMonitor {
 public:
     SecurityMonitor();
@@ -113,7 +120,7 @@ public:
     bool isFusionActive() const { return _csiService != nullptr; }
     // CSI data freshness (fed from main's starvation detector). When stale,
     // fusion must not let frozen variance/ML values out-vote a live radar.
-    void setCsiDataOk(bool ok) { _csiDataOk = ok; }
+    void setCsiDataOk(bool ok);
     bool isFusionPresence() const { return _fusionPresence; }
     float getFusionConfidence() const { return _fusionConfidence; }
     const char* getFusionSourceStr() const;
@@ -126,7 +133,7 @@ public:
     void setPetImmunity(uint8_t energy) { _petImmunityThreshold = energy; }
 
     // Armed/Disarmed
-    void setArmed(bool armed, bool immediate = false, bool homeMode = false);
+    SetArmedResult setArmed(bool armed, bool immediate = false, bool homeMode = false);
     bool isArmed() const { return _alarmState == AlarmState::ARMED || _alarmState == AlarmState::ARMING || _alarmState == AlarmState::PENDING || _alarmState == AlarmState::TRIGGERED; }
     bool isHomeMode() const { return _homeMode; }
     AlarmState getAlarmState() const { return _alarmState; }
@@ -321,6 +328,8 @@ private:
     AlarmTriggerEvent _pendingEvents[ALARM_QUEUE_SIZE];
     uint8_t _pendingEventHead = 0;
     uint8_t _pendingEventCount = 0;
+    uint32_t _alarmEventBootId = 0;
+    uint32_t _nextAlarmEventId = 1;
     AlarmTriggerEvent _lastAlarmEvent;
     bool _lastAlarmEventValid = false;
     void enqueueAlarmEvent();

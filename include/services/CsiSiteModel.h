@@ -92,6 +92,37 @@ inline bool csiModelChecksumValid(const CsiSiteModel& m) {
     return m.checksum == csiModelChecksum(m);
 }
 
+// --- Model/AP (BSSID) compatibility (M-2) -----------------------------------
+// A model learned on one AP describes that link's idle fingerprint; applying it
+// against a different BSSID can silently keep false confidence or lose
+// sensitivity. Callers surface this and gate a conscious apply — detection
+// itself is never blocked by it (fail-safe).
+enum class CsiModelCompat : uint8_t { COMPATIBLE, INCOMPATIBLE, UNKNOWN };
+
+inline bool csiBssidAllZero(const uint8_t b[6]) {
+    for (int i = 0; i < 6; i++) if (b[i] != 0) return false;
+    return true;
+}
+
+// UNKNOWN when either side has no BSSID recorded (legacy model / AP not yet
+// associated) — must be treated as "cannot verify", not as a hard mismatch.
+inline CsiModelCompat csiModelCompatibility(const CsiSiteModel& m, const uint8_t currentBssid[6]) {
+    if (currentBssid == nullptr || csiBssidAllZero(m.bssid) || csiBssidAllZero(currentBssid))
+        return CsiModelCompat::UNKNOWN;
+    for (int i = 0; i < 6; i++)
+        if (m.bssid[i] != currentBssid[i]) return CsiModelCompat::INCOMPATIBLE;
+    return CsiModelCompat::COMPATIBLE;
+}
+
+inline const char* csiModelCompatText(CsiModelCompat c) {
+    switch (c) {
+        case CsiModelCompat::COMPATIBLE:   return "compatible";
+        case CsiModelCompat::INCOMPATIBLE: return "incompatible";
+        case CsiModelCompat::UNKNOWN:      return "unknown";
+    }
+    return "unknown";
+}
+
 // --- Validation -------------------------------------------------------------
 
 enum class CsiModelValidity {

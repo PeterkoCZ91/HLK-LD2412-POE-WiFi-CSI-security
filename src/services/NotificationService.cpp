@@ -1,9 +1,12 @@
 #ifndef LITE_BUILD
 #include "services/NotificationService.h"
 #include "services/TelegramService.h"
+#include "services/OtaTlsTrustPolicy.h"
+#include "services/TlsMemoryPolicy.h"
 #include "debug.h"
 #include <ArduinoJson.h>
 #include <ETH.h>
+#include <WiFiClientSecure.h>
 
 // cppcheck-suppress uninitMemberVar ; globální singleton (zero-init), membery nastavuje begin()
 NotificationService::NotificationService() {}
@@ -33,7 +36,7 @@ void NotificationService::begin(Preferences* prefs, const char* deviceName) {
     if (_config.enabled && hasWebhook) {
         _webhookQueue = xQueueCreate(WEBHOOK_QUEUE_SIZE, sizeof(WebhookRequest));
         if (_webhookQueue) {
-            xTaskCreatePinnedToCore(webhookTaskFunc, "webhook_task", 8192, this, 1, &_webhookTask, 0);
+            xTaskCreatePinnedToCore(webhookTaskFunc, "webhook_task", 16384, this, 1, &_webhookTask, 0);
             DBG("Notif", "Webhook background task started");
         }
     }
@@ -62,7 +65,6 @@ void NotificationService::webhookTaskFunc(void* param) {
 void NotificationService::processWebhookQueue() {
     static constexpr uint8_t MAX_RETRIES = 3;
     WebhookRequest req;
-    HTTPClient http;
 
     for (;;) {
         if (xQueueReceive(_webhookQueue, &req, pdMS_TO_TICKS(1000)) != pdTRUE) continue;
@@ -79,38 +81,53 @@ void NotificationService::processWebhookQueue() {
             continue;
         }
 
-        http.setTimeout(3000);
         bool sent = false;
+        const uint8_t blockedBit = req.type == WebhookType::DISCORD ? 0x01 : 0x02;
+        const char* trustKey = req.type == WebhookType::DISCORD ? "dc_tls_ca" : "gen_tls_ca";
+        String tlsCa = _prefs ? _prefs->getString(trustKey, "") : "";
+        if (!otaTlsHttpsUrl(req.url) || !otaTlsPemValid(tlsCa.c_str()) ||
+            !tlsMemoryAllowsHandshake(ESP.getFreeHeap(), ESP.getMaxAllocHeap(), tlsCa.length())) {
+            _tlsBlockedMask.fetch_or(blockedBit, std::memory_order_relaxed);
+            DBG("Notif", "Webhook blocked: HTTPS trust or heap unavailable (retry %d)", req.retries);
+        } else {
+            _tlsBlockedMask.fetch_and(static_cast<uint8_t>(~blockedBit), std::memory_order_relaxed);
+            WiFiClientSecure client;
+            client.setCACert(tlsCa.c_str());
+            HTTPClient http;
+            http.setTimeout(3000);
+            http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
+            if (!http.begin(client, req.url)) {
+                DBG("Notif", "Webhook connection setup failed (retry %d)", req.retries);
+            } else {
 
-        if (req.type == WebhookType::DISCORD) {
-            http.begin(req.url);
-            http.addHeader("Content-Type", "application/json");
+                if (req.type == WebhookType::DISCORD) {
+                    http.addHeader("Content-Type", "application/json");
 
-            JsonDocument doc;
-            JsonArray embeds = doc["embeds"].to<JsonArray>();
-            JsonObject embed = embeds.add<JsonObject>();
-            embed["title"] = req.title;
-            embed["description"] = req.payload;
-            embed["color"] = 15158332;
-            JsonObject footer = embed["footer"].to<JsonObject>();
-            footer["text"] = "LD2412 Security Node";
+                    JsonDocument doc;
+                    JsonArray embeds = doc["embeds"].to<JsonArray>();
+                    JsonObject embed = embeds.add<JsonObject>();
+                    embed["title"] = req.title;
+                    embed["description"] = req.payload;
+                    embed["color"] = 15158332;
+                    JsonObject footer = embed["footer"].to<JsonObject>();
+                    footer["text"] = "LD2412 Security Node";
 
-            String payload;
-            serializeJson(doc, payload);
+                    String payload;
+                    serializeJson(doc, payload);
 
-            int httpCode = http.POST(payload);
-            sent = (httpCode == 200 || httpCode == 204);
-            if (!sent) DBG("Notif", "Discord failed: HTTP %d (retry %d)", httpCode, req.retries);
-            http.end();
+                    int httpCode = http.POST(payload);
+                    sent = (httpCode == 200 || httpCode == 204);
+                    if (!sent) DBG("Notif", "Discord failed: HTTP %d (retry %d)", httpCode, req.retries);
 
-        } else if (req.type == WebhookType::GENERIC) {
-            http.begin(req.url);
-            http.addHeader("Content-Type", "application/json");
+                } else if (req.type == WebhookType::GENERIC) {
+                    http.addHeader("Content-Type", "application/json");
 
-            int httpCode = http.POST(req.payload);
-            sent = (httpCode >= 200 && httpCode < 300);
-            if (!sent) DBG("Notif", "Webhook failed: HTTP %d (retry %d)", httpCode, req.retries);
-            http.end();
+                    int httpCode = http.POST(req.payload);
+                    sent = (httpCode >= 200 && httpCode < 300);
+                    if (!sent) DBG("Notif", "Webhook failed: HTTP %d (retry %d)", httpCode, req.retries);
+                }
+                http.end();
+            }
         }
 
         if (sent) {

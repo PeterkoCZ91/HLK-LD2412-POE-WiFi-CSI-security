@@ -186,6 +186,46 @@ void test_rollback_without_previous_fails() {
     TEST_ASSERT_EQUAL(CsiModelOp::NO_PREVIOUS, mgr.rollback());
 }
 
+// ---- M-3: failure-injection + reboot-recovery for apply/rollback -----------
+// The invariant: an NVS write fail at ANY step of apply/rollback must leave the
+// *stored* active model unchanged — verified by re-loading (reboot), not just by
+// reading RAM, since RAM is committed only after all writes verify.
+void test_apply_active_write_failure_keeps_active_across_reboot() {
+    FakeCsiModelStore s; CsiModelManager mgr(s);
+    CsiSiteModel a = goodModel(); a.generation = 4; s.writeSlot(CsiModelSlot::ACTIVE, a);
+    mgr.loadFromStore();
+    mgr.finalizeCandidate(candGen(5));
+    s.failSlotMask = (1 << (int)CsiModelSlot::ACTIVE);   // active written last — fails
+    TEST_ASSERT_EQUAL(CsiModelOp::STORE_FAILED, mgr.applyCandidate());
+    TEST_ASSERT_EQUAL_UINT32(4, mgr.active().generation);   // RAM
+    s.failSlotMask = 0; mgr.loadFromStore();                // reboot
+    TEST_ASSERT_EQUAL_UINT32(4, mgr.active().generation);   // stored active untouched
+}
+void test_rollback_active_write_failure_keeps_active_across_reboot() {
+    FakeCsiModelStore s; CsiModelManager mgr(s);
+    CsiSiteModel a = goodModel(); a.generation = 4; s.writeSlot(CsiModelSlot::ACTIVE, a);
+    mgr.loadFromStore();
+    mgr.finalizeCandidate(candGen(5));
+    mgr.applyCandidate();   // active=5, previous=4
+    s.failSlotMask = (1 << (int)CsiModelSlot::ACTIVE);
+    TEST_ASSERT_EQUAL(CsiModelOp::STORE_FAILED, mgr.rollback());
+    TEST_ASSERT_EQUAL_UINT32(5, mgr.active().generation);   // RAM
+    s.failSlotMask = 0; mgr.loadFromStore();                // reboot
+    TEST_ASSERT_EQUAL_UINT32(5, mgr.active().generation);   // failed rollback didn't change stored active
+}
+void test_rollback_previous_write_failure_keeps_active_across_reboot() {
+    FakeCsiModelStore s; CsiModelManager mgr(s);
+    CsiSiteModel a = goodModel(); a.generation = 4; s.writeSlot(CsiModelSlot::ACTIVE, a);
+    mgr.loadFromStore();
+    mgr.finalizeCandidate(candGen(5));
+    mgr.applyCandidate();   // active=5, previous=4
+    s.failSlotMask = (1 << (int)CsiModelSlot::PREVIOUS);
+    TEST_ASSERT_EQUAL(CsiModelOp::STORE_FAILED, mgr.rollback());
+    TEST_ASSERT_EQUAL_UINT32(5, mgr.active().generation);   // RAM
+    s.failSlotMask = 0; mgr.loadFromStore();                // reboot
+    TEST_ASSERT_EQUAL_UINT32(5, mgr.active().generation);   // must NOT be half-rolled-back to 4
+}
+
 // ---- Task 7: clear candidate ----------------------------------------------
 void test_clear_candidate_keeps_active_previous() {
     FakeCsiModelStore s; CsiModelManager mgr(s);
@@ -197,6 +237,107 @@ void test_clear_candidate_keeps_active_previous() {
     TEST_ASSERT_FALSE(mgr.hasCandidate());
     TEST_ASSERT_EQUAL_UINT32(5, mgr.active().generation);
     TEST_ASSERT_EQUAL_UINT32(4, mgr.previous().generation);
+}
+
+// BA-10: clearCandidate() must not report OK when the NVS erase fails — same
+// guard factoryClear already has (Codex #1). Otherwise RAM drops the candidate
+// while it survives in NVS and resurrects on the next loadFromStore().
+void test_clear_candidate_erase_failure_reports_and_keeps() {
+    FakeCsiModelStore s; CsiModelManager mgr(s);
+    CsiSiteModel a = goodModel(); a.generation = 4; s.writeSlot(CsiModelSlot::ACTIVE, a);
+    mgr.loadFromStore();
+    mgr.finalizeCandidate(candGen(5));
+    mgr.applyCandidate();                                       // candidate slot valid
+    s.eraseFailSlotMask = (1 << (int)CsiModelSlot::CANDIDATE);  // NVS erase of CANDIDATE fails
+    TEST_ASSERT_EQUAL(CsiModelOp::STORE_FAILED, mgr.clearCandidate());
+    TEST_ASSERT_TRUE(mgr.hasCandidate());                      // NOT falsely marked cleared
+}
+
+// ---- M-1: factory clear wipes all three slots ------------------------------
+void test_factory_clear_wipes_all_slots() {
+    FakeCsiModelStore s; CsiModelManager mgr(s);
+    CsiSiteModel a = goodModel(); a.generation = 4; s.writeSlot(CsiModelSlot::ACTIVE, a);
+    mgr.loadFromStore();
+    mgr.finalizeCandidate(candGen(5));
+    mgr.applyCandidate();   // active=5, previous=4, candidate=5 valid
+    TEST_ASSERT_EQUAL(CsiModelOp::OK, mgr.factoryClear());
+    TEST_ASSERT_FALSE(mgr.active().valid);
+    TEST_ASSERT_FALSE(mgr.hasCandidate());
+    TEST_ASSERT_FALSE(mgr.hasPrevious());
+}
+void test_factory_clear_prevents_rollback_resurrection() {
+    FakeCsiModelStore s; CsiModelManager mgr(s);
+    CsiSiteModel a = goodModel(); a.generation = 4; s.writeSlot(CsiModelSlot::ACTIVE, a);
+    mgr.loadFromStore();
+    mgr.finalizeCandidate(candGen(5));
+    mgr.applyCandidate();   // previous=4 valid
+    mgr.factoryClear();
+    TEST_ASSERT_EQUAL(CsiModelOp::NO_PREVIOUS, mgr.rollback());
+    TEST_ASSERT_FALSE(mgr.active().valid);   // model did NOT come back
+}
+void test_factory_clear_idempotent_on_empty() {
+    FakeCsiModelStore s; CsiModelManager mgr(s);
+    TEST_ASSERT_EQUAL(CsiModelOp::OK, mgr.factoryClear());
+    TEST_ASSERT_FALSE(mgr.active().valid);
+}
+void test_factory_clear_survives_reload() {
+    FakeCsiModelStore s; CsiModelManager mgr(s);
+    CsiSiteModel a = goodModel(); a.generation = 4; s.writeSlot(CsiModelSlot::ACTIVE, a);
+    mgr.loadFromStore();
+    mgr.factoryClear();
+    mgr.loadFromStore();   // simulate reboot: store slots were erased
+    TEST_ASSERT_FALSE(mgr.active().valid);   // no resurrection from NVS
+}
+void test_ema_noop_after_factory_clear() {
+    FakeCsiModelStore s; CsiModelManager mgr(s);
+    CsiSiteModel a = goodModel(); a.generation = 4; s.writeSlot(CsiModelSlot::ACTIVE, a);
+    mgr.loadFromStore();
+    mgr.factoryClear();
+    TEST_ASSERT_EQUAL(CsiModelOp::NO_CANDIDATE, mgr.updateActiveEma(0.007f, 0.0025f, 0.0006f));
+    TEST_ASSERT_FALSE(mgr.active().valid);
+}
+// Codex #1: a failed NVS erase must NOT be reported as a successful clear —
+// otherwise RAM says "empty" while the slot survives in NVS and the model
+// resurrects on the next loadFromStore() (the very bug M-1 fixes).
+void test_factory_clear_erase_failure_reports_and_keeps_model() {
+    FakeCsiModelStore s; CsiModelManager mgr(s);
+    CsiSiteModel a = goodModel(); a.generation = 4; s.writeSlot(CsiModelSlot::ACTIVE, a);
+    mgr.loadFromStore();
+    s.eraseFailSlotMask = (1 << (int)CsiModelSlot::ACTIVE);   // NVS erase of ACTIVE fails
+    TEST_ASSERT_EQUAL(CsiModelOp::STORE_FAILED, mgr.factoryClear());
+    TEST_ASSERT_TRUE(mgr.active().valid);    // NOT falsely marked cleared
+    mgr.loadFromStore();                     // reboot sim: slot still in NVS
+    TEST_ASSERT_TRUE(mgr.active().valid);    // model survives — RAM never lied
+}
+
+// ---- M-2: model/AP (BSSID) compatibility -----------------------------------
+void test_model_compat_matching_bssid() {
+    CsiSiteModel m = goodModel();
+    uint8_t bssid[6] = {0xAA,0xBB,0xCC,0xDD,0xEE,0x01};
+    for (int i = 0; i < 6; i++) m.bssid[i] = bssid[i];
+    csiModelSeal(m);
+    TEST_ASSERT_EQUAL(CsiModelCompat::COMPATIBLE, csiModelCompatibility(m, bssid));
+}
+void test_model_compat_different_bssid() {
+    CsiSiteModel m = goodModel();
+    uint8_t a[6] = {0xAA,0xBB,0xCC,0xDD,0xEE,0x01};
+    uint8_t b[6] = {0xAA,0xBB,0xCC,0xDD,0xEE,0x02};   // last byte differs
+    for (int i = 0; i < 6; i++) m.bssid[i] = a[i];
+    csiModelSeal(m);
+    TEST_ASSERT_EQUAL(CsiModelCompat::INCOMPATIBLE, csiModelCompatibility(m, b));
+}
+void test_model_compat_unknown_when_model_has_no_bssid() {
+    CsiSiteModel m = goodModel();   // bssid all-zero (legacy / never recorded)
+    uint8_t b[6] = {0xAA,0xBB,0xCC,0xDD,0xEE,0x01};
+    TEST_ASSERT_EQUAL(CsiModelCompat::UNKNOWN, csiModelCompatibility(m, b));
+}
+void test_model_compat_unknown_when_current_bssid_zero() {
+    CsiSiteModel m = goodModel();
+    uint8_t a[6] = {0xAA,0xBB,0xCC,0xDD,0xEE,0x01};
+    uint8_t zero[6] = {0,0,0,0,0,0};   // current AP not yet known
+    for (int i = 0; i < 6; i++) m.bssid[i] = a[i];
+    csiModelSeal(m);
+    TEST_ASSERT_EQUAL(CsiModelCompat::UNKNOWN, csiModelCompatibility(m, zero));
 }
 
 // ---- Task 8: legacy migration ---------------------------------------------
@@ -277,7 +418,21 @@ int main(int, char**) {
     RUN_TEST(test_apply_active_write_failure_keeps_active);
     RUN_TEST(test_rollback_swaps_active_and_previous);
     RUN_TEST(test_rollback_without_previous_fails);
+    RUN_TEST(test_apply_active_write_failure_keeps_active_across_reboot);
+    RUN_TEST(test_rollback_active_write_failure_keeps_active_across_reboot);
+    RUN_TEST(test_rollback_previous_write_failure_keeps_active_across_reboot);
     RUN_TEST(test_clear_candidate_keeps_active_previous);
+    RUN_TEST(test_clear_candidate_erase_failure_reports_and_keeps);
+    RUN_TEST(test_factory_clear_wipes_all_slots);
+    RUN_TEST(test_factory_clear_prevents_rollback_resurrection);
+    RUN_TEST(test_factory_clear_idempotent_on_empty);
+    RUN_TEST(test_factory_clear_survives_reload);
+    RUN_TEST(test_ema_noop_after_factory_clear);
+    RUN_TEST(test_factory_clear_erase_failure_reports_and_keeps_model);
+    RUN_TEST(test_model_compat_matching_bssid);
+    RUN_TEST(test_model_compat_different_bssid);
+    RUN_TEST(test_model_compat_unknown_when_model_has_no_bssid);
+    RUN_TEST(test_model_compat_unknown_when_current_bssid_zero);
     RUN_TEST(test_migrate_legacy_creates_active);
     RUN_TEST(test_migrate_noop_when_active_exists);
     RUN_TEST(test_ema_updates_only_active);

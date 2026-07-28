@@ -1,6 +1,8 @@
 #include "services/ConfigSnapshot.h"
+#include "services/SensitiveDataRedaction.h"
 #include "debug.h"
 #include <time.h>
+#include <cstring>
 
 // -------------------------------------------------------------------------
 // NVS keys to snapshot
@@ -232,11 +234,19 @@ bool ConfigSnapshot::getSnapshotJSON(JsonDocument& doc, int slot) {
     f.close();
     if (err) return false;
 
-    // Mask sensitive keys in-place
+    // Mask sensitive keys in-place. "user" alone isn't a sensitive token
+    // (isSensitiveKeyName doesn't flag it), but auth_user/mqtt_user is half a
+    // credential pair — /api/config/export masks both explicitly, match it here.
     if (doc["cfg"].is<JsonObject>()) {
         JsonObject cfg = doc["cfg"].as<JsonObject>();
-        if (!cfg["mqtt_pass"].isNull())  cfg["mqtt_pass"]  = "***";
-        if (!cfg["auth_pass"].isNull())  cfg["auth_pass"]  = "***";
+        for (JsonPair pair : cfg) {
+            const char* key = pair.key().c_str();
+            if (isSensitiveKeyName(key) ||
+                std::strcmp(key, "auth_user") == 0 ||
+                std::strcmp(key, "mqtt_user") == 0) {
+                pair.value().set("***");
+            }
+        }
     }
     return true;
 }

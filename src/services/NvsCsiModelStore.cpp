@@ -35,7 +35,12 @@ bool NvsCsiModelStore::readSlot(CsiModelSlot slot, CsiSiteModel& out) {
 }
 
 bool NvsCsiModelStore::eraseSlot(CsiModelSlot slot) {
-    return _prefs ? _prefs->remove(_slotKey(slot)) : false;
+    if (!_prefs) return false;
+    // Idempotent: an already-absent key is "erased" — return success so a clean
+    // factoryClear() of empty candidate/previous slots doesn't report STORE_FAILED
+    // (Preferences::remove() returns false for a missing key).
+    if (!_prefs->isKey(_slotKey(slot))) return true;
+    return _prefs->remove(_slotKey(slot));
 }
 
 uint32_t NvsCsiModelStore::lastGeneration() {

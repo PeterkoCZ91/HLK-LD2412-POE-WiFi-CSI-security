@@ -3,7 +3,7 @@
 [![PlatformIO](https://img.shields.io/badge/PlatformIO-ESP32-orange?logo=platformio)](https://platformio.org/)
 [![ESP32](https://img.shields.io/badge/MCU-ESP32--WROOM--32-blue?logo=espressif)](https://www.espressif.com/)
 [![License](https://img.shields.io/badge/License-GPL--3.0-blue)](LICENSE)
-[![Version](https://img.shields.io/badge/Version-5.3.1--poe--wifi-blue)]()
+[![Version](https://img.shields.io/badge/Version-5.4.1--poe--wifi-blue)]()
 [![Discussions](https://img.shields.io/badge/GitHub-Discussions-purple?logo=github)](https://github.com/PeterkoCZ91/HLK-LD2412-POE-WiFi-CSI-security/discussions)
 
 **Dual-sensor intrusion detection system** — ESP32 + HLK-LD2412 24 GHz mmWave radar + **WiFi CSI (Channel State Information) passive motion detection** over **wired Ethernet with Power over Ethernet**. Full alarm state machine, zone management, Home Assistant integration, Telegram bot, and a dark-mode web dashboard. No cloud required.
@@ -11,9 +11,11 @@
 WiFi CSI detection algorithms based on [ESPectre](https://github.com/francescopace/espectre) by Francesco Pace (GPLv3).
 
 > [!NOTE]
-> **v5.4.0** — link-relative CSI threshold floor: the old fixed 0.005 floor sat above real walking peaks on strong WiFi links, masking motion by design. The threshold now floors at 3× the link's own learned quiet baseline instead, and the adaptive P95 estimate can lower the effective threshold instead of only raising it. Also fixes ML motion votes saturating on packet-starved links, corrects the alarm forensic `var_ratio` to divide by the effective (not the legacy static) threshold, and switches the CSI traffic generator's default target from UDP:7 to ICMP (some ISP routers throttle UDP:7 as a DDoS heuristic). Adds a runtime NBVI toggle (`POST /api/csi?nbvi=0|1`) and a planned-maintenance MQTT signal so HA can tell a planned reboot/OTA from a real offline/tamper event. Validated across a multi-day lab soak. See [CHANGELOG](CHANGELOG.md#540-poe-wifi---2026-07-15).
+> **v5.4.1** — reliability-first release. A **core-dump read-out API** (`GET /api/coredump` + `/download` + `POST /api/coredump/erase`) turned three previously undiagnosable field crashes into same-day fixes; adds **system-log persistence across panic/reset** and an **ML-saturation guard** (`ml_saturated`). Lands the full reliability roadmap: model-lifecycle correctness (atomic `clear_model`/rollback, BSSID-gated candidate apply) and disarm-PIN hardening (Release A); a **single runtime operation coordinator** with unified status (`GET /api/operation/status`, retained `security/<device>/system/operation`, HA sensor) that serializes OTA / WiFi scan / calibration / site-learning and fails closed on conflict (Release B); and security hardening — **central log/export secret redaction** and **per-service TLS trust management** (write-only CA PEM in NVS via `/api/{ota,mqtt,telegram,discord,webhook}/trust`, every HTTPS client fail-closed) (Release C). Plus a **nearby-WiFi scan** in the CSI dashboard (`POST /api/csi/wifi/scan`). Validated across a multi-day lab soak; 213/213 native tests. See [CHANGELOG](CHANGELOG.md#541-poe-wifi---2026-07-27).
 
 > [!TIP]
+> **v5.4.0** — link-relative CSI threshold floor: the old fixed 0.005 floor sat above real walking peaks on strong WiFi links, masking motion by design. The threshold now floors at 3× the link's own learned quiet baseline instead, and the adaptive P95 estimate can lower the effective threshold instead of only raising it. Also fixes ML motion votes saturating on packet-starved links, corrects the alarm forensic `var_ratio` to divide by the effective (not the legacy static) threshold, and switches the CSI traffic generator's default target from UDP:7 to ICMP (some ISP routers throttle UDP:7 as a DDoS heuristic). Adds a runtime NBVI toggle (`POST /api/csi?nbvi=0|1`) and a planned-maintenance MQTT signal so HA can tell a planned reboot/OTA from a real offline/tamper event. See [CHANGELOG](CHANGELOG.md#540-poe-wifi---2026-07-15).
+>
 > **v5.3.1** — first-night fixes for the v5.3.0 diagnostic event ring: `HEALTH_CHANGE` events are now debounced (a boundary-oscillating `packet_rate_unstable` flag no longer floods the 256-slot event ring and evicts real motion edges), and health is now evaluated even when the CSI window is empty, so a starved link is reported instead of logging nothing. See [CHANGELOG](CHANGELOG.md).
 >
 > **v5.3.0** — CSI diagnostics (P1): five read-only forensics features that answer *"why didn't the alarm fire?"* without external second-by-second logging. **Decision trace** (`/api/csi/decision`) explains the last motion verdict; **health reasons** (`/api/csi/health`) tell a quiet room from a starved link (motion=false ≠ healthy); a **RAM event ring** (`/api/csi/events`) keeps the last 256 edges/spikes/disagreements; **shadow evaluation** (`/api/csi/shadow`) runs a candidate model in parallel with **no alarm effect** so it can be watched 24–72 h before apply; and **model export/import** (`/api/csi/site_model/export|import`) moves a validated model between nodes (import lands as candidate only). See [CHANGELOG](CHANGELOG.md).
@@ -389,6 +391,24 @@ Any HA automation consuming this topic **must** implement its own timeout
 rather than trusting the retained value indefinitely — otherwise a failed
 update silently disables your offline/tamper alerting.
 
+### WiFi-Scan and CSI-Capture MQTT State
+
+CSI builds publish one retained diagnostic snapshot on
+`security/<device>/csi/wifi_scan`:
+
+```json
+{"state":"complete","capture_active":true,"duration_ms":7342,"result_count":8,"reason":""}
+```
+
+`state` is `idle`, `running`, `complete` or `failed`. During a scan,
+`capture_active` is `false` and the duration is refreshed once per second;
+completion and typed failures are published immediately. Device availability
+stays online because MQTT continues over Ethernet. HA auto-discovery exposes
+this as the diagnostic entities **CSI WiFi Scan** and **CSI Capture Active**.
+
+The MQTT payload deliberately contains no SSIDs, BSSIDs or credentials. Nearby
+network details are available only through the authenticated HTTP API and GUI.
+
 ### Site Learning Workflow (CSI)
 
 **Site learning** builds a long-term quiet-room baseline that the CSI detector uses to set its motion threshold. It is the single most important step for low false-positive operation in your specific environment.
@@ -558,6 +578,7 @@ All endpoints require Digest auth except where noted.
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | GET | `/api/health` | Uptime, Ethernet info, MQTT, heap, CSI status, reset history |
+| GET | `/api/operation/status` | Runtime operation coordinator snapshot: current operation (idle / OTA / WiFi scan / calibration / site-learning), owner and typed failure reason. Mirrored to a retained MQTT `security/<device>/system/operation` topic + an HA "Runtime Operation" sensor |
 | GET | `/metrics` | Prometheus text exposition — heap, chip temp, radar health, ETH/MQTT state, alarm state, fusion confidence, CSI stats. **Basic auth**. See [Prometheus Metrics](#prometheus-metrics) |
 | GET | `/healthz` | Unauthenticated liveness probe — heap + uptime. Use for external monitoring when auth may be degraded. |
 | GET | `/api/telemetry` | Radar state, distance, energy, UART stats |
@@ -573,7 +594,7 @@ All endpoints require Digest auth except where noted.
 | POST | `/api/alarm/disarm` | Disarm system |
 | GET/POST | `/api/alarm/config` | Entry/exit delay, debounce frames, disarm reminder |
 | GET/POST | `/api/security/config` | Anti-masking, loitering, heartbeat, pet immunity |
-| POST | `/api/security/mqtt-pin` | Set or clear the MQTT alarm PIN (`?pin=1234`; omit value to clear) |
+| POST | `/api/security/mqtt-pin` | Set or clear the MQTT alarm PIN (POST body `pin=1234`; empty value to clear — sent in the request body, not the query string, so the PIN never lands in logs). **Mutually exclusive with Home Assistant alarm control:** HA's `alarm_control_panel` sends bare `ARM`/`DISARM` (no code), which the PIN guard rejects — use a PIN *or* HA control, not both |
 | GET/POST | `/api/schedule` | Scheduled arm/disarm times |
 | GET/POST | `/api/timezone` | Timezone and DST offset |
 
@@ -584,7 +605,10 @@ All endpoints require Digest auth except where noted.
 | GET | `/api/events` | Paginated event log (`?offset=&limit=&type=`) |
 | GET | `/api/events/csv` | Download events as CSV |
 | POST | `/api/events/clear` | Clear event history |
-| GET/DELETE | `/api/logs` | Structured log query / clear |
+| GET/DELETE | `/api/logs` | Structured log query / clear (entries restored from before a crash carry `"prev": true`) |
+| GET | `/api/coredump` | Core dump summary (present, size, crashed task, PC) |
+| GET | `/api/coredump/download` | Download raw core dump (`espcoredump.py info_corefile -t raw`) |
+| POST | `/api/coredump/erase` | Erase stored core dump |
 
 ### Radar
 
@@ -611,20 +635,21 @@ All endpoints require Digest auth except where noted.
 | GET/POST | `/api/csi` | CSI metrics, config, diagnostics (incl. site learning, MLP, NBVI, adaptive threshold, `ht_ltf_seen`); `POST ?nbvi=0\|1` toggles NBVI subcarrier auto-selection at runtime (diagnostic/A-B use, not persisted across reboot) |
 | POST | `/api/csi/calibrate` | Auto-calibrate CSI threshold |
 | POST | `/api/csi/site_learning` | Start long-term site-learning baseline (`?duration_s=...` or `?duration_h=...`, default 48 h); stop with `?stop=1`; discard model with `?clear_model=1`; `action=start\|stop` aliases accepted, other `action` values → 400 |
-| GET | `/api/csi/site_model` | Active/candidate/previous model slots + runtime generation + `apply_required` |
-| POST | `/api/csi/site_model/apply` | Activate the candidate (keeps the old active as `previous` for rollback) |
+| GET | `/api/csi/site_model` | Active/candidate/previous model slots + runtime generation + `apply_required` + per-slot `ap_compat` (`compatible`/`incompatible`/`unknown` vs the current AP BSSID) |
+| POST | `/api/csi/site_model/apply` | Activate the candidate (keeps the old active as `previous` for rollback). A candidate learned on a different AP is rejected with `409`; pass `?force=1` to override consciously |
 | POST | `/api/csi/site_model/rollback` | Swap active ↔ previous |
 | DELETE | `/api/csi/site_model/candidate` | Discard the candidate; active/previous untouched |
 | GET | `/api/csi/model/quality` | Last candidate's quality report (p50–p99, mean/std/max, clamp reason) |
 | GET | `/api/csi/site_model/export` | **P1.5** Export a slot (`?slot=active\|candidate\|previous`) as portable, validated JSON — schema/algo-compat, model fields, generation, anonymized BSSID fingerprint, CRC. No raw MAC or credentials |
 | POST | `/api/csi/site_model/import` | **P1.5** Import a model (`?slot=candidate` only) — lands as a validated **candidate**, requires explicit apply; never writes active |
 | GET | `/api/csi/decision` | **P1.2** Decision trace: why the last motion verdict was reached (reason, thresholds, smoothing votes, breathing hold, ML/radar) |
-| GET | `/api/csi/health` | **P1.4** Sensor health reasons + 0–100 score (`no_ht_ltf`, `packet_rate_low/unstable`, `wifi_roamed`, `model_missing/stale`, `learning_contaminated`, `radar_unavailable`, `mqtt_disconnected`, `clock_invalid`) — motion=false ≠ healthy |
+| GET | `/api/csi/health` | **P1.4** Sensor health reasons + 0–100 score (`no_ht_ltf`, `packet_rate_low/unstable`, `wifi_roamed`, `model_missing/stale`, `learning_contaminated`, `radar_unavailable`, `mqtt_disconnected`, `clock_invalid`, `ml_saturated`) — motion=false ≠ healthy |
 | GET/DELETE | `/api/csi/events` | **P1.3** RAM diagnostic event ring (`?limit=100&after_seq=N`) — motion edges, variance spikes, model disagreements; DELETE clears it |
 | GET | `/api/csi/shadow` | **P1.1** Shadow-evaluation status (candidate verdict computed in parallel) — **diagnostic only, no alarm effect** |
 | POST | `/api/csi/reset_baseline` | Reset CSI idle baselines |
 | POST | `/api/csi/reconnect` | Force WiFi reconnect for CSI |
-| GET/POST | `/api/csi/wifi` | Read configured SSID / set runtime SSID + password (NVS-persisted, requires reboot) |
+| GET/POST | `/api/csi/wifi` | Read configured SSID / set runtime SSID + password (NVS-persisted, requires reboot; omitted/empty password preserves the current one, `clear_pass=1` clears it) |
+| GET/POST | `/api/csi/wifi/scan` | Start an asynchronous 2.4 GHz AP scan / poll up to 20 unique SSIDs sorted by RSSI, including channel and security. CSI capture pauses briefly; blocked during OTA, calibration and site learning. BSSIDs are not exposed |
 
 The P1 diagnostics are also surfaced read-only in the dashboard's **CSI tab → "CSI DIAGNOSTIKA (P1)"** panel (health score + reasons, last decision, shadow agree/disagree, event-ring fill).
 
@@ -651,12 +676,14 @@ The `note`, `active`, `shadow`, `agree`, `disagree`, `active_thr`, `shadow_thr` 
 | GET/POST | `/api/config` | Full system configuration |
 | GET/POST | `/api/mqtt/config` | MQTT server/port/user/pass/id |
 | GET/POST | `/api/telegram/config` | Telegram bot token and chat id |
-| POST | `/api/telegram/test` | Send a test Telegram message |
+| POST | `/api/telegram/test` | Enqueue a test Telegram message (async — returns `202`, then poll `/api/telegram/test/status`) |
+| GET | `/api/telegram/test/status` | Poll the result of the last enqueued Telegram test (`pending` / `ok` / `failed`) |
 | POST | `/api/auth/config` | Change web admin user/password |
 | GET/POST | `/api/network/config` | Static IP and DNS |
-| GET | `/api/config/export` | Download JSON snapshot of all settings |
+| GET | `/api/config/export` | Download settings JSON; credentials and Telegram chat ID are `***`-redacted |
 | POST | `/api/config/import` | Upload JSON to restore settings (reboots) |
 | GET | `/api/config/snapshots` | List NVS config snapshots |
+| GET | `/api/config/snapshots/:slot` | Inspect one snapshot with credential values redacted |
 | POST | `/api/config/restore` | Restore a named snapshot |
 | POST | `/api/preset` | Apply a named preset |
 | POST | `/api/update` | Multipart OTA firmware upload; fallback only, prefer Pull OTA for field devices |
@@ -664,6 +691,7 @@ The `note`, `active`, `shadow`, `agree`, `disagree`, `active_thr`, `shadow_thr` 
 | GET | `/api/update/pull/status` | Last pull-OTA phase + error + runtime owner info (NVS-backed, survives reboot) |
 | GET | `/api/ota/status` | OTA runtime owner, espota maintenance window, timeout/progress diagnostics |
 | POST | `/api/ota/espota/prepare` | Open bounded espota maintenance window (`?seconds=120`) |
+| GET/POST | `/api/ota/trust` · `/api/mqtt/trust` · `/api/telegram/trust` · `/api/discord/trust` · `/api/webhook/trust` | Per-service TLS trust management: `GET` reports whether a CA PEM is stored (never returns it); `POST` installs/rotates a write-only CA PEM in NVS (≤3072 B). All HTTPS clients fail **closed** without a valid CA |
 | POST | `/api/restart` | Soft reboot |
 | GET/POST | `/api/reboot_inhibit` | Stability-test reboot inhibit — GET reports state, POST `{"enabled":bool}` toggles (NVS-persisted; OTA always bypasses) |
 | POST | `/api/bluetooth/start` | Enable BLE config mode |
@@ -833,11 +861,13 @@ A: No. There is no microphone, no camera, and no cloud endpoint. CSI is processe
 A: HA auto-discovery publishes a device with the following entities (names prefixed by your `device_id`):
 - `binary_sensor.<id>_presence` — radar presence (on/off)
 - `binary_sensor.<id>_csi_motion` — CSI motion detected
+- `binary_sensor.<id>_csi_capture_active` — CSI capture running (diagnostic)
 - `sensor.<id>_distance` — radar distance in cm
 - `sensor.<id>_moving_energy` / `_static_energy` — radar energy levels
 - `sensor.<id>_alarm_state` — DISARMED / ARMING / ARMED / PENDING / TRIGGERED
 - `sensor.<id>_fusion_source` — `radar`, `csi`, `ml`, `radar+csi`, `csi+ml`, `all`
 - `sensor.<id>_fusion_confidence` — 0.0 – 1.0
+- `sensor.<id>_csi_wifi_scan` — WiFi scan state and diagnostic attributes
 - `sensor.<id>_rssi`, `_packets_per_sec`, `_chip_temp`, `_uptime`, `_heap`
 - `switch.<id>_arm`, `switch.<id>_engineering_mode`
 - `button.<id>_calibrate`, `button.<id>_restart`
@@ -911,7 +941,7 @@ A: Yes. Each device gets a unique `device_id` (auto-derived from MAC) so HA disc
 | v5.3.0-poe-wifi | **CSI diagnostics (P1):** five read-only forensics features answering *"why didn't the alarm fire?"* — decision trace (`/api/csi/decision`), health reasons + 0–100 score (`/api/csi/health`, motion=false ≠ healthy), a 256-slot RAM event ring (`/api/csi/events`), shadow evaluation of a candidate model with **no alarm effect** (`/api/csi/shadow`), and model export/import between nodes (`/api/csi/site_model/export\|import`, import lands as candidate only). Detection, alarm and MQTT control behavior unchanged. |
 | v5.3.1-poe-wifi | **Event-ring first-night fixes:** `HEALTH_CHANGE` events debounced (`CsiHealthDebounce`, ~10-tick hold) so a boundary-oscillating `packet_rate_unstable` flag no longer floods the 256-slot ring and evicts real motion edges; health transitions now evaluated even when the CSI window is empty, so a starved link is reported instead of logging nothing. Detection/alarm/API behavior unchanged. |
 | v5.4.0-poe-wifi | **Detection-sensitivity release.** Link-relative variance floor replaces the fixed `0.005` that masked real walking peaks on strong WiFi links (`csiModelRelativeFloor()`, `max(1e-4, 3× the link's own learned quiet-mean variance)`); adaptive P95 may now *lower* the effective threshold, not only raise it; hysteresis default 0.7 → 0.5. **Fixes:** ML motion vote gated by the packet-rate floor (`csiMlVoteTrusted()` — no more `ml_probability` saturation on a starved link) and alarm forensic `var_ratio` divided by the effective (not the legacy static) threshold. **Traffic gen** defaults to ICMP (ISP routers throttle UDP:7 as a DDoS heuristic). **Added:** runtime NBVI toggle (`POST /api/csi?nbvi=0\|1`) and a retained planned-maintenance MQTT topic (`security/<device>/maintenance`) so HA can distinguish a planned reboot/OTA from a real offline/tamper event. |
-| v5.3.1-poe-wifi | **Event-ring fixes** found running v5.3.0 overnight on two nodes: `HEALTH_CHANGE` events are now debounced (a boundary-oscillating `packet_rate_unstable` flag had been evicting real motion edges from the 256-slot ring), and health is evaluated even when the CSI capture window is empty, so a starved link is reported instead of logging nothing. |
+| v5.4.1-poe-wifi | **Crash-forensics + reliability-first release.** Core-dump read-out API (`GET /api/coredump`), system-log persistence across panic/reset, ML-saturation guard (`ml_saturated`). Full reliability roadmap: model-lifecycle correctness + disarm-PIN hardening (Release A); a single `RuntimeOperationCoordinator` serializing OTA / WiFi scan / calibration / site-learning with unified status (`GET /api/operation/status`, retained `security/<device>/system/operation`, HA sensor, fail-closed `409` on conflict) (Release B); central log/export secret redaction + per-service TLS trust management (write-only CA PEM in NVS via `/api/{ota,mqtt,telegram,discord,webhook}/trust`, all HTTPS fail-closed) (Release C). Nearby-WiFi scan in the CSI dashboard (`POST /api/csi/wifi/scan`). 213/213 native tests, all five shipped builds green. |
 
 ---
 

@@ -18,7 +18,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        env: [esp32_poe, esp32_poe_csi]
+        # Cover every shipped artifact: radar-only, IDF4 CSI (16/8 MB) and the
+        # IDF5 CSI stack (16/8 MB). A green build on one env does not imply the
+        # others — #ifdef USE_CSI and the IDF4/IDF5 platform split diverge.
+        env:
+          - esp32_poe
+          - esp32_poe_csi
+          - esp32_poe_csi_8mb
+          - esp32_poe_csi_idf5
+          - esp32_poe_csi_idf5_8mb
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -52,9 +60,41 @@ jobs:
       - name: Build ${{ matrix.env }}
         run: pio run -e ${{ matrix.env }}
 
+      # C-3: soft flash/RAM budget. The linker already hard-fails on partition
+      # or IRAM overflow; this trips earlier so creep toward the OTA ceiling or
+      # a sudden size regression fails CI before the next OTA image won't fit.
+      # Re-runs `pio run` (up-to-date after the build above) only to reprint the
+      # partition-relative memory-usage percentages, which `--target size` omits.
+      - name: Size budget ${{ matrix.env }}
+        run: bash tools/check_size_budget.sh ${{ matrix.env }}
+
       - name: Firmware size report
         if: always()
         run: pio run -e ${{ matrix.env }} --target size 2>&1 | tail -40 || true
+
+      # C-2: one unambiguous manifest per artifact. The version is read from the
+      # *binary* (not platformio.ini) so it reflects what was actually compiled —
+      # this is what surfaces per-env version drift (e.g. an IDF5 env pinned to an
+      # older FW_VERSION than its IDF4 sibling).
+      - name: Firmware manifest
+        if: success()
+        run: |
+          BIN=.pio/build/${{ matrix.env }}/firmware.bin
+          VER=$(strings "$BIN" | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+[A-Za-z0-9.-]*-poe-wifi' | head -1)
+          {
+            echo "env=${{ matrix.env }}"
+            echo "version=${VER:-UNKNOWN}"
+            echo "git=${GITHUB_SHA::12}"
+            echo "flash_bytes=$(stat -c%s "$BIN")"
+            echo "sha256=$(sha256sum "$BIN" | cut -d' ' -f1)"
+          } | tee "manifest-${{ matrix.env }}.txt"
+
+      - name: Upload manifest
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: manifest-${{ matrix.env }}
+          path: manifest-${{ matrix.env }}.txt
 
   native-tests:
     name: native unit tests
@@ -98,3 +138,21 @@ jobs:
 
       - name: Run cppcheck
         run: bash tools/run_cppcheck.sh
+
+  web-js:
+    name: web GUI JS syntax
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # C-3: the dashboard JS is embedded in a C++ raw string literal, so the
+      # compiler never parses it — a syntax error builds green and only breaks
+      # in the browser. Parse every <script> block with `node --check`.
+      - name: Check embedded GUI JavaScript syntax
+        run: bash tools/check_web_js.sh

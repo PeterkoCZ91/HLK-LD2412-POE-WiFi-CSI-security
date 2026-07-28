@@ -150,21 +150,27 @@ bool EventLog::writeEventToDisk(const LogEvent& evt) {
         if (!f) return false;
     }
 
-    // Calculate write position
-    uint32_t writeIdx;
-    if (_diskCount < DISK_CAPACITY) {
-        writeIdx = (_diskHead + _diskCount) % DISK_CAPACITY;
-        _diskCount++;
-    } else {
-        writeIdx = _diskHead;
-        _diskHead = (_diskHead + 1) % DISK_CAPACITY;
-    }
+    // Calculate write position WITHOUT mutating ring state yet — BA-13: only
+    // advance head/count/sequence after the bytes are verified on disk. Before,
+    // the counters advanced first and seek()/write() returns were ignored, so a
+    // short write (full/failing LittleFS) still returned success and
+    // flushToDisk() marked the security event flushed while it was missing.
+    bool willWrap = (_diskCount >= DISK_CAPACITY);
+    uint32_t writeIdx = willWrap ? _diskHead : (_diskHead + _diskCount) % DISK_CAPACITY;
 
     size_t offset = HEADER_SIZE + writeIdx * EVENT_SIZE;
-    f.seek(offset);
-    f.write((const uint8_t*)&evt, EVENT_SIZE);
+    if (!f.seek(offset)) {
+        f.close();
+        return false;
+    }
+    size_t written = f.write((const uint8_t*)&evt, EVENT_SIZE);
     f.close();
+    if (written != EVENT_SIZE) {
+        return false;   // ring state untouched → event stays dirty and is retried
+    }
 
+    if (willWrap) _diskHead = (_diskHead + 1) % DISK_CAPACITY;
+    else          _diskCount++;
     _diskSequence++;
     return true;
 }

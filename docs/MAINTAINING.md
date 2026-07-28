@@ -45,6 +45,20 @@ Public docs should not depend on live access to the deployed ESP32. If the devic
 
 That keeps the repository current even when the live device is unavailable.
 
+## Runtime Diagnostic Redaction
+
+All runtime text sent through `DBG()` or `LogService` is redacted before it
+reaches Serial, the debug ring, RTC persistence, or LittleFS. Credential-like
+key segments (`pass`, `password`, `token`, `secret`, `credentials`, `pin`,
+`webhook`, and `apikey`) and URI userinfo are masked centrally.
+
+Do not log message bodies, chat IDs, Bluetooth passkeys, or configured WiFi SSIDs.
+Configuration and snapshot diagnostic endpoints must mask credential values. A
+redacted config export uses `***`; importing that marker preserves the existing
+secret or identifier. Recovery snapshots remain unredacted on LittleFS so they
+can restore NVS, but their authenticated diagnostic API representation is masked.
+Authentication is not a substitute for redaction.
+
 ## Security Scrub Before Push
 
 Before publishing, check that no tracked file contains:

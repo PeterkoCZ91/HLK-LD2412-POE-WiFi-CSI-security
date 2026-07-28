@@ -5,7 +5,9 @@
 #include <WiFiClientSecure.h>
 #include <AsyncTelegram2.h>
 #include <Preferences.h>
+#include <atomic>
 #include "LD2412Service.h"
+#include "services/TelegramTestState.h"
 
 class SecurityMonitor;
 
@@ -13,6 +15,7 @@ class SecurityMonitor;
 struct TelegramQueueItem {
     char text[512];
     uint8_t retries = 0;
+    uint32_t requestId = 0;
 };
 
 class TelegramService {
@@ -28,9 +31,8 @@ public:
     // Send messages (non-blocking — enqueues to background task)
     bool sendMessage(const String& text);
     bool sendAlert(const String& title, const String& details = "");
-
-    // Blocking send — returns real result (for diagnostics/test endpoint)
-    bool sendMessageDirect(const String& text);
+    uint32_t enqueueTestMessage(const String& text);
+    TelegramTestState getTestState(uint32_t requestId) const;
 
     // Configuration
     void setEnabled(bool enabled);
@@ -46,6 +48,9 @@ private:
     // Background task function
     static void telegramTaskFunc(void* param);
     void telegramLoop();
+    bool sendMessageDirect(const String& text);
+    bool tlsHandshakeAllowed() const;
+    void finishTest(const TelegramQueueItem& item, TelegramTestState state);
     void handleNewMessages();
     void processCommand(const String& command, const String& chatId);
 
@@ -58,6 +63,7 @@ private:
 
     char _token[50];
     char _chatId[20];
+    String _tlsCa;
     bool _enabled;
     bool _connected;
 
@@ -72,6 +78,8 @@ private:
     SemaphoreHandle_t _sendMutex = nullptr;
     static constexpr size_t QUEUE_SIZE = 32; // alarm bursts produce 5+ messages, 16 was tight
     uint16_t _droppedMessages = 0;
+    std::atomic<uint32_t> _nextTestRequestId{0};
+    TelegramTestTracker _testTracker;
 };
 
 #endif

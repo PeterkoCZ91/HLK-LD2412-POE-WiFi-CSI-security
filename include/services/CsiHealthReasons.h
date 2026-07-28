@@ -21,10 +21,11 @@ enum CsiHealthFlag : uint16_t {
     CSI_HEALTH_RADAR_UNAVAILABLE     = 1u << 7,  // LD2412 radar not reporting
     CSI_HEALTH_MQTT_DISCONNECTED     = 1u << 8,  // MQTT enabled but not connected (reporting only)
     CSI_HEALTH_CLOCK_INVALID         = 1u << 9,  // wall clock not synced — timestamps/staleness unreliable
+    CSI_HEALTH_ML_SATURATED          = 1u << 10, // ml_motion duty-cycle pinned true — vote untrusted (foreign-site model)
 };
 
 // Highest reason bit index in use — bump when adding flags.
-static constexpr uint8_t CSI_HEALTH_FLAG_COUNT = 10;
+static constexpr uint8_t CSI_HEALTH_FLAG_COUNT = 11;
 
 // Snapshot of everything needed to judge sensor health. Filled by the caller
 // from CSIService / LD2412 / MQTT state; the classifier stays pure.
@@ -42,6 +43,7 @@ struct CsiHealthInputs {
     bool  mqttExpected        = false;  // MQTT configured/enabled
     bool  mqttConnected       = false;
     bool  clockValid          = false;
+    bool  mlSaturated         = false;  // CsiMlSaturationGuard verdict
 };
 
 // Derive the set of active health-reason flags. No-HT-LTF is only meaningful
@@ -58,6 +60,7 @@ inline uint16_t csiHealthReasons(const CsiHealthInputs& in) {
     if (!in.radarAvailable)                         f |= CSI_HEALTH_RADAR_UNAVAILABLE;
     if (in.mqttExpected && !in.mqttConnected)       f |= CSI_HEALTH_MQTT_DISCONNECTED;
     if (!in.clockValid)                             f |= CSI_HEALTH_CLOCK_INVALID;
+    if (in.mlSaturated)                             f |= CSI_HEALTH_ML_SATURATED;
     return f;
 }
 
@@ -75,6 +78,7 @@ inline uint8_t csiHealthPenalty(CsiHealthFlag flag) {
         case CSI_HEALTH_RADAR_UNAVAILABLE:     return 30;
         case CSI_HEALTH_MQTT_DISCONNECTED:     return 10;
         case CSI_HEALTH_CLOCK_INVALID:         return 5;
+        case CSI_HEALTH_ML_SATURATED:          return 10;
         default:                               return 0;
     }
 }
@@ -103,6 +107,7 @@ inline const char* csiHealthFlagStr(CsiHealthFlag flag) {
         case CSI_HEALTH_RADAR_UNAVAILABLE:     return "radar_unavailable";
         case CSI_HEALTH_MQTT_DISCONNECTED:     return "mqtt_disconnected";
         case CSI_HEALTH_CLOCK_INVALID:         return "clock_invalid";
+        case CSI_HEALTH_ML_SATURATED:          return "ml_saturated";
         default:                               return "unknown";
     }
 }

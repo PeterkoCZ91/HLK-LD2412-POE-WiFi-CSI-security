@@ -8,7 +8,7 @@
 
 #include "services/ICsiModelStore.h"
 
-enum class CsiModelOp { OK, NO_CANDIDATE, NO_PREVIOUS, VALIDATION_FAILED, STORE_FAILED };
+enum class CsiModelOp { OK, NO_CANDIDATE, NO_PREVIOUS, VALIDATION_FAILED, STORE_FAILED, INCOMPATIBLE_AP };
 
 // Legacy single-model NVS layout (csi_lrn_*) migrated into an active slot once.
 struct CsiLegacyModel {
@@ -72,17 +72,42 @@ public:
         if (!_prev.valid) return CsiModelOp::NO_PREVIOUS;
         CsiSiteModel newActive = _prev;   newActive.valid = true; csiModelSeal(newActive);
         CsiSiteModel newPrev   = _active; newPrev.valid = true;   csiModelSeal(newPrev);
-        if (!_store.writeSlot(CsiModelSlot::ACTIVE, newActive))   return CsiModelOp::STORE_FAILED;
+        // Write ACTIVE last (like applyCandidate): if the PREVIOUS write fails the
+        // stored active is untouched, so a reboot after a failed rollback never
+        // surfaces a half-swapped active. (M-3: writing ACTIVE first left the NVS
+        // active rolled back even when rollback() reported STORE_FAILED.)
         if (!_store.writeSlot(CsiModelSlot::PREVIOUS, newPrev))   return CsiModelOp::STORE_FAILED;
+        if (!_store.writeSlot(CsiModelSlot::ACTIVE, newActive))   return CsiModelOp::STORE_FAILED;
         _active = newActive; _prev = newPrev;
         return CsiModelOp::OK;
     }
 
     CsiModelOp clearCandidate() {
         if (!_cand.valid) return CsiModelOp::NO_CANDIDATE;
-        _store.eraseSlot(CsiModelSlot::CANDIDATE);
+        // BA-10: only drop the RAM copy if the NVS erase actually succeeded —
+        // same guard factoryClear() has. Otherwise RAM says "no candidate"
+        // while the slot survives in NVS and resurrects on loadFromStore().
+        if (!_store.eraseSlot(CsiModelSlot::CANDIDATE)) return CsiModelOp::STORE_FAILED;
         _cand.valid = false;
         return CsiModelOp::OK;
+    }
+
+    // Factory-clear all three slots (active/candidate/previous). Wipes previous
+    // too so a later rollback() cannot resurrect a cleared model. Generation
+    // counter is left untouched (stays monotonic). CSIService applies the runtime
+    // fallback (configured threshold) after this returns.
+    //
+    // A slot's RAM valid flag is cleared ONLY if its NVS erase succeeded — so if
+    // the erase fails, RAM keeps saying the model is present (matching NVS) rather
+    // than lying about a clear that a reboot would undo. Returns STORE_FAILED if
+    // any erase failed (the store treats an already-absent key as success, so a
+    // clean idempotent clear still returns OK).
+    CsiModelOp factoryClear() {
+        bool ok = true;
+        if (_store.eraseSlot(CsiModelSlot::ACTIVE))    _active.valid = false; else ok = false;
+        if (_store.eraseSlot(CsiModelSlot::CANDIDATE)) _cand.valid   = false; else ok = false;
+        if (_store.eraseSlot(CsiModelSlot::PREVIOUS))  _prev.valid   = false; else ok = false;
+        return ok ? CsiModelOp::OK : CsiModelOp::STORE_FAILED;
     }
 
     // EMA continuous refresh touches ONLY the active slot (best-effort persist).

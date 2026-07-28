@@ -242,11 +242,15 @@ curl -I http://LAN_HOST_IP:8001/firmware-vX.Y.Z-poe-wifi-csi.bin
 3. Start Pull OTA with MD5:
 
 ```bash
-curl -sS --digest -u USER:PASS \
+curl -sS --basic -u USER:PASS \
   -H 'Content-Type: application/json' \
   -d '{"url":"http://LAN_HOST_IP:8001/firmware-vX.Y.Z-poe-wifi-csi.bin","md5":"32_HEX_MD5"}' \
   http://DEVICE_IP/api/update/pull
 ```
+
+The Pull OTA POST buffers a request body and therefore needs preemptive Basic
+credentials on the first request. A Digest challenge/retry may return an empty
+reply without starting a new transfer.
 
 4. Poll status:
 

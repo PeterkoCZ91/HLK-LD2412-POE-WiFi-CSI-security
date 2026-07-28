@@ -2,6 +2,196 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.4.1-poe-wifi] - 2026-07-27
+
+Crash-forensics + reliability-first release. Core-dump read-out over the API
+turned three previously undiagnosable field crashes into root-caused fixes
+within a day; on top of that, this release lands the full reliability-first
+roadmap — model-lifecycle correctness and disarm-PIN hardening (Release A), a
+single runtime operation coordinator with unified HTTP/MQTT/HA status
+(Release B), and security hardening: log/export secret redaction plus
+per-service TLS trust management (Release C). Validated across a multi-day lab
+soak. All items ship with native tests (213/213 passing).
+
+### Added
+
+- **Nearby WiFi scan in the CSI dashboard and API**: `POST
+  /api/csi/wifi/scan` starts an asynchronous scan and `GET` polls up to 20
+  unique SSIDs sorted by signal strength, with channel and security details.
+  CSI capture is suspended while the radio hops channels, and scans are blocked
+  during OTA, calibration and site learning so detector/model data cannot be
+  contaminated. Selecting a result fills the runtime WiFi configuration form.
+  A retained `security/<device>/csi/wifi_scan` status now reports scan state,
+  capture activity, duration, result count and typed failures; HA auto-discovery
+  adds diagnostic scan-state and CSI-capture entities. Neighbor SSIDs remain
+  local to the authenticated HTTP API and are never published over MQTT.
+- **Core dump read-out API**: `GET /api/coredump` (summary: crashed task,
+  exception PC), `GET /api/coredump/download` (raw ELF dump for
+  `espcoredump.py info_corefile -t raw`), `POST /api/coredump/erase`;
+  `coredump_present` flag in `/api/health`. The coredump flash partition and
+  the panic-time writer were already in place — only readout was missing.
+- **System log persistence across panic/software reset** (RTC noinit RAM
+  mirror with CRC validation, pure `LogRing.h` core + native tests).
+  Restored entries carry `"prev": true` in `/api/logs`.
+- **ML saturation guard** (`CsiMlSaturationGuard`): the MLP ships with
+  foreign-site weights/scaler and on some links pins `ml_probability` ≈ 1.0
+  around the clock, silently defeating the fusion's radar false-positive
+  suppression (which requires CSI *and* ML to disagree). A per-minute
+  duty-cycle watchdog distrusts the vote after ≥95 % motion-duty over 6 h
+  (recovers after 1 h under 50 %). New health reason `ml_saturated`,
+  `ml_duty_pct` in `/api/health`.
+
+### Fixed
+
+- **`bad_alloc` crash serving large JSON** (`async_tcp` abort after ~2.5
+  days uptime, root-caused from the first field core dump):
+  `AsyncResponseStream` grows a contiguous buffer while writing;
+  `/api/csi/events` and `/api/events` now serialize into one
+  exactly-measured nothrow allocation and answer `503 Low memory` instead
+  of crashing on a fragmented heap.
+- **Task-watchdog panic in the WiFi task**: the whole CSI pipeline ran
+  per-packet inside the WiFi driver's RX callback (core 0) and could starve
+  IDLE0. The callback now only copies the frame into a queue; a dedicated
+  `csi_proc` task (core 1) does the processing. `queue_drops` counter in
+  `/api/health`.
+- **Null-pointer crash on radar-less nodes**: the one-shot gate-config
+  verification (40 s after boot) drove the LD2412 UART handshake even when
+  radar init had failed (`LoadProhibited` in `getAckNonBlocking`). Skipped
+  when the radar is not connected.
+- **Dead Man's Switch restart loop**: the 3-restart cap + degraded mode
+  never engaged because the restart counter reset seconds after every boot
+  (`_lastPublish` is initialized to `millis()`, so "publish not stale" holds
+  without any real publish). The counter now resets only after a genuine
+  publish since boot (`publishedSinceBoot`), ending the endless ~31.5 min
+  reboot cycle during broker outages.
+- `/api/coredump` registered with an exact URI matcher so it does not
+  shadow `/api/coredump/download`.
+- **Pull OTA deploy helper false success**: use preemptive Basic authentication
+  for the body-buffering Pull OTA endpoint, reject an empty acceptance response,
+  and keep waiting while `/api/version` still reports the pre-reboot firmware
+  instead of failing immediately or trusting a stale persisted OTA phase.
+- **Offline alarms could be evicted by telemetry, and stalled operations
+  never timed out.** A buffered alarm event now has eviction priority over
+  routine telemetry in the offline MQTT ring (a long broker outage during an
+  intrusion can no longer drop the retained `alarm/event`), and the operation
+  coordinator's calibration / site-learning / WiFi-scan timeout poll is ticked
+  unconditionally, so a stuck claim self-releases instead of requiring a
+  reboot.
+- **Buffered alarm events are de-duplicated** so a reconnect replay cannot
+  deliver the same alarm twice.
+- **HTTP OTA upload request ownership is isolated** — a second concurrent
+  upload can no longer stomp the in-flight image; rejected uploads are refused
+  up front.
+- **CSI model operations apply at frame boundaries and publish coherent
+  detection snapshots**, so an apply/rollback/clear cannot be observed
+  mid-frame or produce a torn detection read.
+- **Blocking network operations moved off the async web handler.** The
+  Telegram connectivity test and Pull OTA no longer block the AsyncWebServer
+  task (they enqueue and the client polls status), preventing web-server
+  stalls and watchdog resets.
+- **Ethernet link up/down events are traced** in diagnostics to help
+  root-cause dual-home / link-flap OTA failures.
+- **CSI WiFi controls repaired**: the AP switch posts credentials in the
+  request body, the Security tab no longer crashes on removed RSSI fields, and
+  the Czech section labels are restored.
+
+### Reliability & security hardening (Release A)
+
+Batch from an independent reliability-first roadmap review: model-lifecycle
+correctness and disarm-PIN hardening, layered on top of the crash-forensics
+work above. All items ship with native tests (176/176 passing).
+
+- **`clear_model` now erases the active model, not just legacy keys.** The
+  handler called a legacy-only clear that never touched the
+  active/candidate/previous slots in `CsiModelManager`, so the API answered
+  `200 "cleared"` while the model driving detection survived in NVS and was
+  reloaded on the next boot — the only working reset was a hardware
+  factory-reset. `factoryClear()` now wipes all three slots (including
+  `previous`, so a rollback cannot resurrect a cleared model) and reports
+  `STORE_FAILED` instead of a false OK when an NVS erase fails. Detection
+  stays fail-safe after a clear (falls back to the configured/relative-floor
+  threshold, never a blind zero).
+- **Model rollback could half-swap across a reboot.** `rollback()` wrote the
+  ACTIVE slot first, so a failure writing PREVIOUS left a half-rolled-back
+  active in NVS that survived the next boot despite the call returning
+  `STORE_FAILED`. ACTIVE is now written last (matching `apply()`), and new
+  failure-injection + reboot-recovery tests assert state after a simulated
+  `loadFromStore`, not just RAM.
+- **Candidate model apply is gated on AP (BSSID) compatibility.**
+  `applyCandidateModel()` blocks an INCOMPATIBLE candidate (`HTTP 409`,
+  `force=1` to override); `/api/csi/site_model` reports `ap_compat` for the
+  active and candidate slots. Fail-safe: the gate is on *apply* only —
+  live detection keeps running, and an UNKNOWN/legacy BSSID does not block.
+
+### Security (Release A)
+
+- **Disarm PIN and MQTT password moved out of GET query strings into the
+  authenticated POST body** (`hasParam(name, true)`); the frontend `api()`
+  helper gained an `inBody` path. HW-verified on the bench (query `?pin=`
+  → `400`, body → `200`).
+- **MQTT disarm PIN is now rate-limited** by reusing the existing
+  `AuthLockout` (5 failures/60 s → 30 s lockout, doubling). Only PIN-bearing
+  ARM/DISARM commands count; bare commands and local detection/siren are
+  untouched.
+- **MQTT payloads are no longer logged verbatim.** `handleMessage()` logged
+  the raw payload — including `CMD:<pin>` — into the 4 KB debug ring buffer
+  readable over `GET /api/debug` even in non-debug builds. It now logs the
+  topic and payload length only, closing an auth-gated disarm-PIN leak.
+- **HA `alarm_control_panel` and a configured MQTT PIN are mutually
+  exclusive**, now documented and warned about (POST response + boot log +
+  README), since HA sends bare commands the PIN gate would reject.
+
+### Reliability & operations (Release B)
+
+- **Single runtime operation coordinator.** OTA (HTTP upload + Pull), WiFi
+  scan, calibration and site-learning now share one atomic claim lifecycle
+  (`RuntimeOperationCoordinator`) with typed failure reasons, an owner id and a
+  per-operation wrap-safe watchdog that force-releases a stalled claim.
+  Starting a second operation while one holds the runtime fails closed
+  (`HTTP 409`, naming the real blocking operation). CSI/MQTT read the
+  coordinator directly; the old service-local OTA flags were removed.
+- **Unified operation status across HTTP, MQTT and HA.** `GET
+  /api/operation/status` returns a common snapshot (current operation, owner,
+  failure reason); a retained `security/<device>/system/operation` topic
+  publishes transitions; HA auto-discovery adds a diagnostic **Runtime
+  Operation** sensor. OTA conflicts now report the actual operation instead of
+  `none`.
+
+### Security — redaction & TLS trust (Release C)
+
+- **Central secret redaction for logs and exports.** One policy masks
+  credential-like keys and URI userinfo before anything reaches the serial
+  console, the `/api/debug` ring, the RTC/LittleFS log mirror, `/api/logs`, the
+  config snapshot/export or the diagnostic APIs — Telegram bodies/chat IDs, BLE
+  SSID/passkey, MQTT/auth passwords and the disarm PIN no longer appear on any
+  diagnostic surface. Config import treats a redacted `***` value as "keep
+  existing", so an exported-then-imported config round-trips without wiping
+  credentials.
+- **Per-service TLS trust management, no hardcoded certificates.** Pull OTA,
+  MQTTS, direct Telegram, Discord and the generic webhook each keep a
+  write-only CA PEM in NVS (≤3072 B), managed over authorized
+  `GET/POST /api/{ota,mqtt,telegram,discord,webhook}/trust` endpoints; the PEM
+  is never returned in diagnostics, export or snapshot. All HTTPS clients fail
+  **closed** on a missing/invalid CA; Telegram and MQTTS additionally require
+  enough contiguous heap before a handshake (deferring instead of crashing
+  under fragmentation); the webhook holds its CA only for the duration of the
+  request, requires HTTPS and refuses redirects.
+- **Config import is validated and verified.** Every imported key is
+  type/range-checked (garbage or out-of-range values rejected, no dangerous
+  defaults) and read back from NVS after writing, so a partial/failed import
+  reports `500` instead of silently persisting a bad config.
+
+### Build
+
+- **CI builds all five shipped CSI/radar envs** (radar-only,
+  IDF4-CSI 16/8 MB, IDF5-CSI 16/8 MB) instead of two, and each artifact
+  carries a machine-readable firmware manifest (env, version string from the
+  binary, git SHA, sha256).
+- **Firmware version unified to a single `v5.4.1-poe-wifi` string** across
+  `platformio.ini` (CSI and IDF5 `-D FW_VERSION`) and the `main.cpp` fallback,
+  ending a three-way drift (`rc9` / `v5.4.0-rc2` / `rc3`) that made
+  `/api/version` unable to identify the shipped build.
+
 ## [5.4.0-poe-wifi] - 2026-07-15
 
 Detection-sensitivity release. The v5.3.x diagnostics surfaced that the

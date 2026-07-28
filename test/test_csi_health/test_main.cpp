@@ -89,6 +89,14 @@ void test_score_partial_deduction() {
     TEST_ASSERT_EQUAL_UINT8(75, csiHealthScore(csiHealthReasons(in)));
 }
 
+void test_ml_saturated_flag_and_score() {
+    CsiHealthInputs in = healthy(); in.mlSaturated = true;
+    uint16_t f = csiHealthReasons(in);
+    TEST_ASSERT_TRUE(f & CSI_HEALTH_ML_SATURATED);
+    TEST_ASSERT_EQUAL_UINT8(90, csiHealthScore(f));
+    TEST_ASSERT_EQUAL_STRING("ml_saturated", csiHealthFlagStr(CSI_HEALTH_ML_SATURATED));
+}
+
 void test_flag_strings() {
     TEST_ASSERT_EQUAL_STRING("no_ht_ltf", csiHealthFlagStr(CSI_HEALTH_NO_HT_LTF));
     TEST_ASSERT_EQUAL_STRING("learning_contaminated", csiHealthFlagStr(CSI_HEALTH_LEARNING_CONTAMINATED));
@@ -170,6 +178,7 @@ int main(int, char**) {
     RUN_TEST(test_radar_unavailable_flag);
     RUN_TEST(test_score_clamps_at_zero);
     RUN_TEST(test_score_partial_deduction);
+    RUN_TEST(test_ml_saturated_flag_and_score);
     RUN_TEST(test_flag_strings);
     RUN_TEST(test_debounce_stable_state_logs_once);
     RUN_TEST(test_debounce_oscillation_never_logs);

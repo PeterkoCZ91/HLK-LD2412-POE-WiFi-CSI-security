@@ -2,11 +2,11 @@
 #include "services/MQTTService.h"
 #include "debug.h"
 #include "constants.h"
+#include "services/OtaTlsTrustPolicy.h"
+#include "services/TlsMemoryPolicy.h"
 #include <ETH.h>
 
 MQTTService* MQTTService::_instance = nullptr;
-std::atomic<bool> MQTTService::_otaInProgress{false};
-
 // cppcheck-suppress uninitMemberVar ; globální singleton (zero-init), membery nastavuje begin()
 MQTTService::MQTTService() : _mqttClient(_espClient) {
     _instance = this;
@@ -27,6 +27,10 @@ void MQTTService::begin(Preferences* prefs, const char* deviceId, const char* fw
     s_server.toCharArray(_server, sizeof(_server));
     s_port.toCharArray(_port, sizeof(_port));
     s_user.toCharArray(_user, sizeof(_user));
+    #if defined(MQTTS_ENABLED) && MQTTS_ENABLED == 1
+    _tlsCa = _prefs->getString("mqtt_tls_ca", "");
+    _tlsTrustReady = otaTlsPemValid(_tlsCa.c_str());
+    #endif
     s_pass.toCharArray(_pass, sizeof(_pass));
 
     _lastPublish = millis(); // Prevent DMS false trigger before first publish
@@ -107,6 +111,8 @@ void MQTTService::generateTopics() {
     snprintf(_topics.fusion_presence,   sizeof(_topics.fusion_presence),   "security/%s/fusion/presence", _deviceId);
     snprintf(_topics.fusion_confidence, sizeof(_topics.fusion_confidence), "security/%s/fusion/confidence", _deviceId);
     snprintf(_topics.fusion_source,     sizeof(_topics.fusion_source),     "security/%s/fusion/source", _deviceId);
+    snprintf(_topics.csi_wifi_scan,     sizeof(_topics.csi_wifi_scan),     "security/%s/csi/wifi_scan", _deviceId);
+    snprintf(_topics.runtime_operation, sizeof(_topics.runtime_operation), "security/%s/system/operation", _deviceId);
 
     // OTA / planned-restart signal
     snprintf(_topics.maintenance,       sizeof(_topics.maintenance),       "security/%s/maintenance", _deviceId);
@@ -132,8 +138,7 @@ void MQTTService::setupClient() {
 
     #ifdef MQTTS_ENABLED
     #if MQTTS_ENABLED == 1
-    _espClient.setCACert(mqtt_server_ca);
-    DBG("MQTT", "MQTTS (TLS) enabled");
+    if (_tlsTrustReady) { _espClient.setCACert(_tlsCa.c_str()); DBG("MQTT", "MQTTS trust configured"); } else DBG("MQTT", "MQTTS blocked: CA trust is not configured");
     #else
     DBG("MQTT", "Plain MQTT");
     #endif
@@ -160,7 +165,9 @@ void MQTTService::handleMessage(char* topic, byte* payload, unsigned int length)
     memcpy(msg, payload, len);
     msg[len] = '\0';
 
-    DBG("MQTT", "Received: %s -> %s", topic, msg);
+    // Log topic + length only — the payload can carry the alarm PIN (CMD:pin)
+    // and DBG() lands in the remote-readable /api/debug ring buffer (S-1).
+    DBG("MQTT", "Received: %s (%u B)", topic, length);
 
     if (_commandCallback) {
         _commandCallback(topic, msg);
@@ -169,11 +176,16 @@ void MQTTService::handleMessage(char* topic, byte* payload, unsigned int length)
 
 void MQTTService::update() {
     if (strlen(_server) == 0) return;
+    #if defined(MQTTS_ENABLED) && MQTTS_ENABLED == 1
+    if (!_tlsTrustReady) return;
+    #endif
+    _publishRuntimeOperationState();
     // csi10w: freeze MQTT entirely during HTTP/ArduinoOTA upload. PubSubClient
     // uses blocking WiFiClient.connect() which opens lwIP sockets; a failing
     // reconnect mid-OTA (e.g. broker unreachable) starves AsyncTCP of receive
     // bandwidth and produces non-deterministic upload stalls.
-    if (_otaInProgress.load()) return;
+    if (_isOtaInProgress()) return;
+    processDeferredActions();
 
     if (!_mqttClient.connected()) {
         unsigned long now = millis();
@@ -193,6 +205,14 @@ void MQTTService::update() {
 
 void MQTTService::connect() {
     DBG("MQTT", "Connecting to %s...", _server);
+    #if defined(MQTTS_ENABLED) && MQTTS_ENABLED == 1
+    if (!_tlsTrustReady) return;
+    if (!tlsMemoryAllowsHandshake(ESP.getFreeHeap(), ESP.getMaxAllocHeap(), _tlsCa.length())) {
+        DBG("MQTT", "MQTTS deferred: insufficient heap (%u/%u)",
+            ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+        return;
+    }
+    #endif
 
     if (_mqttClient.connect(_deviceId, _user, _pass, _topics.availability, 1, true, "offline")) {
         DBG("MQTT", "Connected!");
@@ -222,6 +242,7 @@ void MQTTService::connect() {
 
         _reconnectInterval = 5000; // Reset backoff on success
         _justReconnected = true;
+        _lastRuntimeOperation = 0xFF;
         _publishFailStreak = 0;
         _reconnectTotal++;
 
@@ -246,10 +267,31 @@ void MQTTService::connect() {
     }
 }
 
+void MQTTService::_publishRuntimeOperationState() {
+    if (_runtimeOperationCoordinator == nullptr || !_mqttClient.connected()) return;
+
+    RuntimeOperation operation = _runtimeOperationCoordinator->status().operation;
+    uint8_t current = static_cast<uint8_t>(operation);
+    if (current == _lastRuntimeOperation) return;
+
+    // Publish once per transition. A failed transport is retried after reconnect,
+    // when connect() invalidates the cache; never spin on a dead socket during OTA.
+    _lastRuntimeOperation = current;
+    bool published = _mqttClient.publish(
+        _topics.runtime_operation, runtimeOperationText(operation), true);
+    DBG("MQTT", "Runtime operation %s: %s", runtimeOperationText(operation),
+        published ? "published" : "publish failed");
+}
+
 void MQTTService::publishMaintenance(bool active) {
     // Direct client publish, not the guarded publish() wrapper — see the
     // declaration comment in MQTTService.h for why.
     _mqttClient.publish(_topics.maintenance, active ? "1" : "0", true);
+}
+
+void MQTTService::processDeferredActions() {
+    int8_t pending = _pendingMaintenance.exchange(-1, std::memory_order_acq_rel);
+    if (pending >= 0) publishMaintenance(pending == 1);
 }
 
 bool MQTTService::connected() {
@@ -265,17 +307,20 @@ void MQTTService::forceReconnect() {
     connect();
 }
 
-bool MQTTService::publish(const char* topic, const char* payload, bool retained) {
+PublishResult MQTTService::publishResult(const char* topic, const char* payload,
+                                         bool retained, uint64_t eventId) {
     // rc7-fix1c (2026-05-02): drop-on-floor during OTA. Bench reproducer
     // showed MQTT offline buffer (200-slot ring) push pattern continued
     // during /api/update on a broker-disconnected node, fragmenting heap
     // until min_heap dropped to 72 KB and AsyncTCP pbuf alloc started
     // failing mid-upload. update()'s reconnect was already gated, but
     // publish() callers (radar, security, telemetry) kept storing.
-    if (_otaInProgress.load()) return false;
+    if (_isOtaInProgress()) return PublishResult::FAILED;
     if (!_mqttClient.connected()) {
-        if (_offlineBuffer) _offlineBuffer->store(topic, payload, retained);
-        return false;
+        if (_offlineBuffer && _offlineBuffer->store(topic, payload, retained, eventId)) {
+            return PublishResult::QUEUED_OFFLINE;
+        }
+        return PublishResult::FAILED;
     }
 
     // fail-fast: detect oversized payload before calling PubSubClient.
@@ -294,15 +339,16 @@ bool MQTTService::publish(const char* topic, const char* payload, bool retained)
             _lastFailTopic[sizeof(_lastFailTopic) - 1] = '\0';
             DBG("MQTT", "Publish OVERSIZED '%s' (payload %u B, buf %u B) — connection kept",
                 _lastFailTopic, (unsigned)pLen, (unsigned)bufSize);
-            return false;
+            return PublishResult::FAILED;
         }
     }
 
     bool success = _mqttClient.publish(topic, payload, retained);
     if (success) {
         _lastPublish = millis();
+        _publishedSinceBoot = true;
         _publishFailStreak = 0;
-        return true;
+        return PublishResult::PUBLISHED;
     }
 
     // publish() returned false while connected()+sized-OK → transport half-open.
@@ -323,7 +369,8 @@ bool MQTTService::publish(const char* topic, const char* payload, bool retained)
     _lastFailState     = _mqttClient.state();
     strncpy(_lastFailTopic, topic, sizeof(_lastFailTopic) - 1);
     _lastFailTopic[sizeof(_lastFailTopic) - 1] = '\0';
-    if (_offlineBuffer) _offlineBuffer->store(topic, payload, retained);
+    bool queued = _offlineBuffer &&
+                  _offlineBuffer->store(topic, payload, retained, eventId);
 
     if (_publishFailStreak == 1) {
         // Log OK→fail transition only (throttled: subsequent fails in same cycle
@@ -334,7 +381,7 @@ bool MQTTService::publish(const char* topic, const char* payload, bool retained)
         // _publishFailStreak intentionally not reset here — connect() resets it
         // on successful reconnect; health API shows streak=1 while disconnected
     }
-    return false;
+    return queued ? PublishResult::QUEUED_OFFLINE : PublishResult::FAILED;
 }
 
 // Publish a single HA Discovery entity (called from publishDiscoveryStep)
@@ -437,6 +484,29 @@ void MQTTService::publishDiscoveryStep() {
         // valid for gateOffset 0-27). Do NOT renumber to a lower index
         // without also shifting that arithmetic.
         case 53: publishOneDiscovery("binary_sensor", "maintenance", "Maintenance Mode", _topics.maintenance, "", "mdi:wrench-clock", "", "{\"pl_on\":\"1\",\"pl_off\":\"0\",\"ent_cat\":\"diagnostic\"}"); break;
+        case 54: {
+            #ifdef USE_CSI
+            char scanExtra[192];
+            snprintf(scanExtra, sizeof(scanExtra),
+                "{\"val_tpl\":\"{{ value_json.state }}\",\"json_attr_t\":\"%s\",\"ent_cat\":\"diagnostic\"}",
+                _topics.csi_wifi_scan);
+            publishOneDiscovery("sensor", "csi_wifi_scan", "CSI WiFi Scan",
+                _topics.csi_wifi_scan, "", "mdi:wifi-sync", "", scanExtra);
+            #endif
+            break;
+        }
+        case 55: {
+            #ifdef USE_CSI
+            publishOneDiscovery("binary_sensor", "csi_capture_active", "CSI Capture Active",
+                _topics.csi_wifi_scan, "", "mdi:access-point-network", "",
+                "{\"val_tpl\":\"{{ 'ON' if value_json.capture_active else 'OFF' }}\","
+                "\"pl_on\":\"ON\",\"pl_off\":\"OFF\",\"ent_cat\":\"diagnostic\"}");
+            #endif
+            break;
+        }
+        case 56: publishOneDiscovery("sensor", "runtime_operation", "Runtime Operation",
+            _topics.runtime_operation, "", "mdi:progress-wrench", "",
+            "{\"ent_cat\":\"diagnostic\"}"); break;
         default: {
             // Engineering gates: indices 25-52 (14 gates × 2: moving + static)
             int gateOffset = _discoveryIndex - 25;
@@ -482,7 +552,8 @@ void MQTTService::checkCertificateExpiry() {
     mbedtls_x509_crt cert;
     mbedtls_x509_crt_init(&cert);
 
-    int ret = mbedtls_x509_crt_parse(&cert, (const unsigned char*)mqtt_server_ca, strlen(mqtt_server_ca) + 1);
+    if (!_tlsTrustReady) { mbedtls_x509_crt_free(&cert); return; }
+    int ret = mbedtls_x509_crt_parse(&cert, (const unsigned char*)_tlsCa.c_str(), _tlsCa.length() + 1);
     if (ret != 0) {
         DBG("Cert", "Parse failed: -0x%x", -ret);
         mbedtls_x509_crt_free(&cert);

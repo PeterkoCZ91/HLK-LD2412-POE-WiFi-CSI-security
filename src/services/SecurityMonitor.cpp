@@ -19,6 +19,14 @@ static void fillISOTime(char* buf, size_t len) {
 }
 
 void SecurityMonitor::enqueueAlarmEvent() {
+    if (_alarmEventBootId == 0) {
+        _alarmEventBootId = esp_random();
+        if (_alarmEventBootId == 0) _alarmEventBootId = 1;
+    }
+    _pendingEvent.event_id =
+        (static_cast<uint64_t>(_alarmEventBootId) << 32) | _nextAlarmEventId++;
+    if (_nextAlarmEventId == 0) _nextAlarmEventId = 1;
+
     if (_pendingEventCount < ALARM_QUEUE_SIZE) {
         uint8_t idx = (_pendingEventHead + _pendingEventCount) % ALARM_QUEUE_SIZE;
         _pendingEvents[idx] = _pendingEvent;
@@ -96,6 +104,13 @@ static void fillForensicFieldsImpl(AlarmTriggerEvent& evt,
 SecurityMonitor::SecurityMonitor() {
     // cppcheck-suppress useInitializationList ; jednorázová inicializace při startu
     _mutex = xSemaphoreCreateMutex();
+}
+
+void SecurityMonitor::setCsiDataOk(bool ok) {
+    _csiDataOk = ok;
+#ifdef USE_CSI
+    if (_csiService) _csiService->setDetectionDataOk(ok);
+#endif
 }
 
 void SecurityMonitor::begin(NotificationService* notifService, MQTTService* mqttService, TelegramService* telegramService, EventLog* eventLog, Preferences* prefs, const char* deviceLabel) {
@@ -235,9 +250,12 @@ uint32_t SecurityMonitor::_armHealthWarnings() {
     return computeArmWarnings(in);
 }
 
-void SecurityMonitor::setArmed(bool armed, bool immediate, bool homeMode) {
-    if (_mutex && xSemaphoreTake(_mutex, pdMS_TO_TICKS(500)) != pdTRUE) return;
+SetArmedResult SecurityMonitor::setArmed(bool armed, bool immediate, bool homeMode) {
+    // BA-11: report BUSY on a mutex timeout instead of silently returning — the
+    // caller must not tell the operator "Disarmed" when nothing happened.
+    if (_mutex && xSemaphoreTake(_mutex, pdMS_TO_TICKS(500)) != pdTRUE) return SetArmedResult::BUSY;
     unsigned long now = millis();
+    bool disarmChanged = false;   // BA-11: disarm of an already-disarmed alarm is IDEMPOTENT
     if (armed) {
         syncFsmConfig();
         ArmResult r = _fsm.arm(immediate, now);
@@ -245,7 +263,7 @@ void SecurityMonitor::setArmed(bool armed, bool immediate, bool homeMode) {
         if (r == ArmResult::REJECTED) {
             DBG("SecMon", "setArmed(true) REJECTED — state is %s", getAlarmStateStr());
             if (_mutex) xSemaphoreGive(_mutex);
-            return;
+            return SetArmedResult::REJECTED;
         }
         // Already arming/armed — idempotent, but allow upgrade/flip of homeMode flag
         if (r == ArmResult::IDEMPOTENT) {
@@ -257,7 +275,7 @@ void SecurityMonitor::setArmed(bool armed, bool immediate, bool homeMode) {
                 DBG("SecMon", "setArmed(true) ignored — already %s", getAlarmStateStr());
             }
             if (_mutex) xSemaphoreGive(_mutex);
-            return;
+            return SetArmedResult::IDEMPOTENT;
         }
         // r == ARMING_STARTED or ARMED_IMMEDIATE — FSM has set state + exit-delay timer.
         _alarmState = _fsm.state();
@@ -293,7 +311,8 @@ void SecurityMonitor::setArmed(bool armed, bool immediate, bool homeMode) {
     } else {
         // FIX #1: Always deactivate siren on disarm (covers TRIGGERED + any corrupted state)
         deactivateSiren();
-        bool changed = _fsm.disarm(now);  // resets FSM state + all timers
+        disarmChanged = _fsm.disarm(now);  // resets FSM state + all timers
+        bool changed = disarmChanged;
         _alarmState = _fsm.state();
         _homeMode = false;
         _lastPresenceWhileDisarmed = 0;
@@ -316,6 +335,10 @@ void SecurityMonitor::setArmed(bool armed, bool immediate, bool homeMode) {
         _prefs->putBool("sec_home_mode", armed ? _homeMode : false);
     }
     if (_mutex) xSemaphoreGive(_mutex);
+    // arm reaches here only on ARMING_STARTED/ARMED_IMMEDIATE (APPLIED);
+    // disarm is APPLIED when the FSM state actually changed, else IDEMPOTENT.
+    if (armed) return SetArmedResult::APPLIED;
+    return disarmChanged ? SetArmedResult::APPLIED : SetArmedResult::IDEMPOTENT;
 }
 
 const char* SecurityMonitor::getAlarmStateStr() const {
@@ -643,13 +666,15 @@ void SecurityMonitor::processRadarData(uint16_t distance, uint8_t move_energy, u
     // variance/ML values below are frozen snapshots — letting them vote would
     // suppress a live radar detection (stale "CSI+ML disagree") or hold a
     // phantom presence (stale ML). Starved ⇒ radar-only fallback.
-    if (_csiService && _csiDataOk) {
+    CsiDetectionSnapshot csiSnapshot;
+    if (_csiService && _csiDataOk &&
+        _csiService->readDetectionSnapshot(csiSnapshot) && csiSnapshot.dataOk) {
         bool radarSees = (distance > 0 && (move_energy > 0 || static_energy > 0)) && !_isStaticFiltered;
-        bool csiSees = _csiService->getMotionState();
-        bool mlSees  = _csiService->isMlEnabled() && _csiService->getMlMotionState();
-        float csiScore = _csiService->getCompositeScore();
-        float csiBreathing = _csiService->getBreathingScore();
-        float mlProb = _csiService->getMlProbability();
+        bool csiSees = csiSnapshot.motion;
+        bool mlSees  = csiSnapshot.mlEnabled && csiSnapshot.mlMotion;
+        float csiScore = csiSnapshot.compositeScore;
+        float csiBreathing = csiSnapshot.breathingScore;
+        float mlProb = csiSnapshot.mlProbability;
 
         // Source bitmask: bit0=radar, bit1=CSI variance, bit2=CSI MLP
         _fusionSource = (radarSees ? 1 : 0) | (csiSees ? 2 : 0) | (mlSees ? 4 : 0);
@@ -718,7 +743,7 @@ void SecurityMonitor::processRadarData(uint16_t distance, uint8_t move_energy, u
             // Treat as weak signal — only elevate confidence when ml_probability is strongly above threshold.
             _csiSuppressCount = 0;
             _csiOnlyStart = 0;
-            if (mlProb > (_csiService->getMlThreshold() + 0.2f)) {
+            if (mlProb > (csiSnapshot.mlThreshold + 0.2f)) {
                 _fusionPresence = true;
                 _fusionConfidence = 0.3f * mlProb;
                 if (fusionDbgGate(now))

@@ -6,15 +6,22 @@
 #include <esp_wifi_types.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <freertos/queue.h>
+#include <freertos/semphr.h>
 #include <atomic>
 #include <Preferences.h>
 #include "services/CsiSiteModel.h"
 #include "services/NvsCsiModelStore.h"
 #include "services/CsiModelManager.h"
+#include "services/CsiMlSaturation.h"
 #include "services/CsiDecisionTrace.h"
 #include "services/CsiEventRing.h"
 #include "services/CsiShadowDetector.h"
 #include "services/CsiHealthReasons.h"
+#include "services/CsiDetectionSnapshot.h"
+#include "services/CsiModelCommand.h"
+#include "services/RuntimeOperationCoordinator.h"
+#include "services/WifiScanResults.h"
 
 class MQTTService;
 
@@ -45,6 +52,13 @@ public:
     void begin(const char* ssid, const char* password,
                MQTTService* mqtt, const char* topicPrefix,
                Preferences* prefs = nullptr);
+    void setRuntimeOperationCoordinator(RuntimeOperationCoordinator* coordinator) {
+        _runtimeOperationCoordinator = coordinator;
+    }
+    RuntimeOperation getRuntimeOperation() const {
+        return _runtimeOperationCoordinator != nullptr
+            ? _runtimeOperationCoordinator->status().operation : RuntimeOperation::IDLE;
+    }
     void update();
 
     bool isActive() const { return _active; }
@@ -58,6 +72,10 @@ public:
     float getDser() const { return _lastDser; }
     float getPlcr() const { return _lastPlcr; }
     bool  getMotionState() const { return _motionState; }
+    bool  readDetectionSnapshot(CsiDetectionSnapshot& out) const {
+        return _detectionSnapshot.read(out);
+    }
+    void  setDetectionDataOk(bool ok);
     float getVariance() const { return _runningVariance; }
     uint32_t getPacketCount() const { return _totalPackets; }
 
@@ -135,18 +153,40 @@ public:
     // Diagnostics actions
     void resetIdleBaseline();
     void forceReconnect();
+    WifiScanStartResult startWifiScan();
+    WifiScanState getWifiScanState() const {
+        return static_cast<WifiScanState>(_wifiScanState.load(std::memory_order_acquire));
+    }
+    uint32_t getWifiScanElapsedMs() const {
+        uint32_t started = _wifiScanStartMs.load(std::memory_order_relaxed);
+        return started ? (uint32_t)(millis() - started) : 0;
+    }
+    uint32_t getWifiScanDurationMs() const {
+        return _wifiScanDurationMs.load(std::memory_order_acquire);
+    }
+    uint8_t getWifiScanResultCount() const {
+        return _wifiScanResultCount.load(std::memory_order_acquire);
+    }
+    WifiScanFailureReason getWifiScanFailureReason() const {
+        return static_cast<WifiScanFailureReason>(
+            _wifiScanFailure.load(std::memory_order_acquire));
+    }
+    bool isWifiCaptureActive() const {
+        return _wifiScanCaptureActive.load(std::memory_order_acquire);
+    }
+    uint8_t copyWifiScanResults(WifiScanNetwork* out, uint8_t capacity);
     // OTA single-homing: drop / restore the CSI WiFi STA so the device isn't dual-homed
     // on the Ethernet subnet during a flash (dual-homing intermittently breaks espota).
-    // update()'s reconnect loop is already gated by _otaInProgress, so WiFi stays down
+    // update()'s reconnect loop is gated by the shared runtime coordinator, so WiFi stays down
     // between these calls. See docs/OTA_OPERATIONS.md (dual-homing).
     void wifiDownForOta();
     void wifiUpAfterOta();
-    void calibrateThreshold(uint32_t durationMs = 10000);
+    bool calibrateThreshold(uint32_t durationMs = 10000);
     bool isCalibrating() const { return _calibrating; }
     float getCalibrationProgress() const;
     bool startSiteLearning(uint32_t durationMs, bool replaceCandidate = false);
     void stopSiteLearning();
-    void clearLearnedSiteModel();
+    CsiModelOp clearLearnedSiteModel();   // BA-10: propagates NVS erase result
     bool isSiteLearning() const { return _siteLearningActive; }
     float getSiteLearningProgress() const;
     uint32_t getSiteLearningElapsedSec() const;
@@ -171,9 +211,17 @@ public:
 
     // csi-model: active/candidate/previous slot management (site-learning v2).
     // finalize now produces a CANDIDATE only; apply/rollback switch detection.
-    CsiModelOp applyCandidateModel();
+    // M-2: apply blocks an AP-incompatible candidate unless force=true (a
+    // conscious override). Detection is never blocked — only the apply is gated.
+    CsiModelOp applyCandidateModel(bool force = false);
     CsiModelOp rollbackSiteModel();
     CsiModelOp clearCandidateModel();
+    CsiModelRequestStatus requestModelOperation(CsiModelCommand command,
+                                                bool force,
+                                                uint32_t timeoutMs,
+                                                CsiModelOp& result);
+    // Called by the main loop; owns deferred MQTT side effects from model ops.
+    void processDeferredActions();
     // P1.5 import (navrh 17.5): land an externally-supplied model as CANDIDATE
     // only — never active. Assigns a fresh generation, validates+seals via the
     // model manager, and requires an explicit apply afterwards.
@@ -183,6 +231,12 @@ public:
     const CsiSiteModel& modelActive()    const { return _modelMgr.active(); }
     const CsiSiteModel& modelCandidate() const { return _modelMgr.candidate(); }
     const CsiSiteModel& modelPrevious()  const { return _modelMgr.previous(); }
+    // M-2: BSSID compatibility of a model vs the currently associated AP.
+    // Returns UNKNOWN until a BSSID is known (fail-safe: never a hard mismatch).
+    CsiModelCompat modelCompatibility(const CsiSiteModel& m) const {
+        static const uint8_t zero[6] = {0,0,0,0,0,0};
+        return csiModelCompatibility(m, _bssidInitialized ? _lastBSSID : zero);
+    }
     uint32_t activeModelGeneration() const { return _modelMgr.active().generation; }
     bool getModelQuality(CsiModelQuality& out) const {
         if (!_hasQuality) return false; out = _lastQuality; return true;
@@ -239,19 +293,14 @@ public:
     float    getNbviBestScore()  const { return _nbviBestScore; }
     float    getNbviWorstScore() const { return _nbviWorstScore; }
 
-    // csi7b: OTA-aware pause. While set, update() and _restoreEthDefaultNetif()
-    // short-circuit so CSI does not touch WiFi/lwIP state during OTA transfer.
-    // WiFi reconnects and netif_set_default() otherwise risk dropping the TCP
-    // stream mid-upload. Set from ArduinoOTA.onStart / HTTP OTA Update.begin;
-    // cleared from onEnd / onError / abort paths.
-    static void setOtaInProgress(bool active) { _otaInProgress.store(active); }
-    static bool isOtaInProgress() { return _otaInProgress.load(); }
-
     // csi8: MLP motion detection (15-feature MLP 15->16->8->1, F1=0.795 baseline).
     // Runs in parallel with variance-threshold path so HA can A/B compare ML vs radar.
     void  setMlEnabled(bool enabled) { _mlEnabled = enabled; if (!enabled) _mlMotion = false; }
     bool  isMlEnabled()       const { return _mlEnabled; }
     float getMlProbability()  const { return _mlProbability; }
+    uint32_t getQueueDrops()  const { return _csiQueueDrops.load(); }
+    bool  isMlSaturated()     const { return _mlSatGuard.saturated(); }
+    uint8_t getMlDutyPct()    const { return _mlSatGuard.dutyPct(); }
     bool  getMlMotionState()  const { return _mlMotion; }
     float getMlThreshold()    const { return _mlThreshold; }
     void  setMlThreshold(float thr) {
@@ -262,7 +311,17 @@ public:
 
 private:
     static void _csiCallback(void* ctx, wifi_csi_info_t* info);
-    void _processCSI(wifi_csi_info_t* info);
+    static void _csiProcTask(void* arg);
+    void _processCSI(const int8_t* buf, uint16_t len);
+
+    // Frame hand-off z WiFi tasku (ppTask, core 0) do csi_proc (core 1).
+    // Plná pipeline v callbacku vyhladověla IDLE0 → task WDT panic (rc4).
+    struct CsiFrame { uint16_t len; int8_t buf[256]; };  // 256 = HT20_CSI_LEN_DOUBLE
+    QueueHandle_t _csiFrameQueue = nullptr;
+    TaskHandle_t  _csiProcHandle = nullptr;
+    std::atomic<uint32_t> _csiQueueDrops{0};
+    CsiModelCommandSlot _modelCommandSlot;
+    std::atomic<uint8_t> _pendingModelPublish{0};
     void _publishMQTT();
     void _updateMotionState();
     void _recordDecisionTrace(bool bufferReady, bool rawMotion, bool finalMotion,
@@ -274,20 +333,41 @@ private:
     uint16_t _computeCsiHealthFlags() const;  // P1.4: CSI-intrinsic health subset
     void _updateHealthEvents(float effThr);    // emit HEALTH_CHANGE on transition
     void _initWiFiForCSI(const char* ssid, const char* password);
+    void _finishCalibrationOperation();
+    void _finishSiteLearningOperation(bool cancelled = false);
+    void _pollRuntimeOperationTimeouts(uint32_t nowMs);
+    bool _isOtaInProgress() const {
+        return _runtimeOperationCoordinator != nullptr &&
+               _runtimeOperationCoordinator->status().operation == RuntimeOperation::OTA;
+    }
     void _restoreEthDefaultNetif();
+    void _pollWifiScan();
+    void _finishWifiScanOperation();
+    bool _restoreCsiAfterWifiScan();
+    void _publishWifiScanMqtt();
     void _startTrafficGen();
     void _stopTrafficGen();
     static void _trafficGenTask(void* arg);
-    void _loadLearnedModel();
-    void _saveLearnedModel(float threshold, float meanVar, float stdVar, float maxVar, uint32_t samples);
+    void _loadLearnedModel();          // reads legacy csi_lrn_* once as migration input
+    void _removeLegacyKeys();          // M-4: wipe legacy csi_lrn_* after migration
     float _computeSiteLearningThreshold() const;
     void _finalizeSiteLearning();
-    void _publishModelState(const char* event);  // retained active/candidate JSON + event, on model change only
+    enum class ModelPublishEvent : uint8_t {
+        NONE, CANDIDATE_READY, APPLIED, ROLLEDBACK, CANDIDATE_CLEARED,
+        CANDIDATE_IMPORTED, ALL_CLEARED
+    };
+    void _publishModelState(const char* event);  // main-loop owner only
+    void _scheduleModelStatePublish(ModelPublishEvent event) {
+        _pendingModelPublish.store(static_cast<uint8_t>(event), std::memory_order_release);
+    }
     void _applyActiveToRuntime();     // mirror active slot into _learned*/idle baseline (no _threshold change)
     void _switchDetectionToActive();  // apply/rollback only: move detection _threshold to active model
     void _resetShortTermState();      // flush P95/hysteresis/running stats + reinit EMA timer
     void _runMlInference();
     void _continuousLearnRefresh();
+    void _publishDetectionSnapshot();
+    void _processPendingModelOperation();
+    CsiModelOp _executeModelCommand(CsiModelCommand command, bool force);
 
     // Configuration
     uint16_t _windowSize = 75;
@@ -419,6 +499,30 @@ private:
     float    _packetRateEma = 0.0f;   // P1.4: slow average of _packetRate for stability check
     bool     _reconnectRequested = false;
 
+    // Operator-triggered asynchronous AP discovery. Results are fixed-size and
+    // BSSID-free; CSI capture is suspended while the radio scans other channels.
+    RuntimeOperationCoordinator* _runtimeOperationCoordinator = nullptr;
+    SemaphoreHandle_t _wifiScanMutex = nullptr;
+    WifiScanResults _wifiScanResults;
+    std::atomic<uint8_t> _wifiScanState{static_cast<uint8_t>(WifiScanState::IDLE)};
+    std::atomic<uint32_t> _wifiScanStartMs{0};
+    std::atomic<uint32_t> _wifiScanDurationMs{0};
+    std::atomic<uint8_t> _wifiScanResultCount{0};
+    std::atomic<uint8_t> _wifiScanFailure{
+        static_cast<uint8_t>(WifiScanFailureReason::NONE)};
+    std::atomic<bool> _wifiScanDriverDone{false};
+    // A scan requested while STA reconnect is in progress is started later by
+    // update(), after the reconnect state has settled.
+    std::atomic<bool> _wifiScanStartPending{false};
+    std::atomic<bool> _wifiScanCaptureActive{true};
+    std::atomic<bool> _wifiScanMqttDirty{true};
+    uint32_t _wifiScanMqttPublishMs = 0;
+    uint32_t _wifiScanRestoreAttemptMs = 0;
+    uint32_t _wifiScanNextStartAttemptMs = 0;
+    uint8_t _wifiScanStartAttempts = 0;
+    std::atomic<bool> _wifiScanCsiSuspended{false};
+    std::atomic<bool> _wifiScanAutoReconnectSuspended{false};
+
     // MQTT change-gating: last published values + heartbeat clock. Floats go
     // out when they move, states on flip; heartbeat republishes everything.
     uint32_t _mqttHeartbeatMs = 0;
@@ -531,6 +635,7 @@ private:
     bool     _mlEnabled     = true;
     float    _mlThreshold   = 0.50f;      // enter threshold; exit = threshold * ML_EXIT_FACTOR
     float    _mlProbability = 0.0f;
+    CsiMlSaturationGuard _mlSatGuard;   // v5.4.1: duty-cycle distrust (navrh 1A)
     bool     _mlMotion      = false;
     static constexpr float ML_EXIT_FACTOR = 0.70f;  // exit = 0.35 when threshold = 0.50
     // Same usable-capture floor as CSI_HEALTH_PACKET_RATE_LOW (CsiHealthReasons.h) —
@@ -545,10 +650,11 @@ private:
     TaskHandle_t _trafficGenHandle = nullptr;
     int _trafficGenSock = -1;
     std::atomic<bool> _trafficGenRunning{false};
-    static std::atomic<bool> _otaInProgress;
 
     // State
     bool _active = false;
+    bool _detectionDataOk = true;
+    CsiDetectionSnapshotStore _detectionSnapshot;
     MQTTService* _mqtt = nullptr;
     char _topicPrefix[64] = {};
 

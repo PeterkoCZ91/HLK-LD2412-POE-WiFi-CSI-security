@@ -4,12 +4,7 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include <freertos/semphr.h>
-
-struct LogEntry {
-    unsigned long timestamp;
-    char type[8];    // INFO, WARN, ERROR, ALARM
-    char message[80];
-};
+#include "services/LogRing.h"
 
 class LogService {
 public:
@@ -27,7 +22,14 @@ public:
     void getLogJSON(JsonDocument& doc);
     void clear();
 
+    // RTC-noinit mirror: every appended entry is also written here so the
+    // log survives panic/software reset (not power loss). May stay nullptr.
+    void attachRtcMirror(LogRtcRing* ring) { _rtcMirror = ring; }
+    // Preload entries captured before the previous reboot (oldest-first).
+    void restorePrevBoot(const LogRtcRing& ring);
+
 private:
+    LogRtcRing* _rtcMirror = nullptr;
     SemaphoreHandle_t _mutex = nullptr;
     LogEntry* _buffer;
     size_t _maxEntries;

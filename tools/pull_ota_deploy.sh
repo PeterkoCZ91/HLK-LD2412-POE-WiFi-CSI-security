@@ -113,7 +113,11 @@ norm_mac() {
 }
 
 curl_auth() {
-  curl -sS --connect-timeout 5 --digest -u "${USER}:${PASS}" "$@"
+  # Body-buffering/heavy endpoints authenticate before their handlers run and
+  # therefore require credentials on the first request. Force preemptive Basic;
+  # a Digest challenge/retry can otherwise leave an empty response while a
+  # stale persisted OTA status looks successful.
+  curl -sS --connect-timeout 5 --basic -u "${USER}:${PASS}" "$@"
 }
 
 CURRENT_FW=$(curl -sS --connect-timeout 5 "http://${HOST}/api/version" || true)
@@ -214,6 +218,7 @@ BODY=$(FW_URL="$FW_URL" FW_MD5="$FW_MD5" python3 -c 'import json,os; print(json.
 echo "Starting Pull OTA..."
 RESP=$(curl_auth -H 'Content-Type: application/json' -d "$BODY" "http://${HOST}/api/update/pull")
 echo "  response: $RESP"
+[ -n "$RESP" ] || fail "Pull OTA returned an empty response; update was not accepted"
 
 for i in $(seq 1 120); do
   sleep 2
@@ -244,13 +249,17 @@ for i in $(seq 1 60); do
   sleep 2
   NEW_FW=$(curl -sS --connect-timeout 3 "http://${HOST}/api/version" 2>/dev/null || true)
   if [ -n "$NEW_FW" ]; then
-    echo "  version: $NEW_FW"
     if [ -n "$EXPECT_NEW_FW" ] && [ "$NEW_FW" != "$EXPECT_NEW_FW" ]; then
-      fail "new firmware mismatch: expected $EXPECT_NEW_FW, got $NEW_FW"
+      echo "  still waiting (version: $NEW_FW)"
+      continue
     fi
+    echo "  version: $NEW_FW"
     echo "Pull OTA complete"
     exit 0
   fi
 done
 
+if [ -n "${NEW_FW:-}" ] && [ -n "$EXPECT_NEW_FW" ]; then
+  fail "new firmware mismatch after timeout: expected $EXPECT_NEW_FW, got $NEW_FW"
+fi
 fail "device did not come back on /api/version"

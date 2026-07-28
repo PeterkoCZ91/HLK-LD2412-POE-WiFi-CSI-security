@@ -18,10 +18,13 @@
 #include "services/LD2412Service.h"
 #include "services/MQTTService.h"
 #include "services/SecurityMonitor.h"
+#include "services/AuthLockout.h"
 #include "services/NotificationService.h"
 #include "services/TelegramService.h"
 #include "services/LogService.h"
+#include "services/DmsPolicy.h"
 #include "services/EventLog.h"
+#include "services/RuntimeOperationCoordinator.h"
 #include "services/ConfigSnapshot.h"
 #include "services/MQTTOfflineBuffer.h"
 #ifndef NO_BLUETOOTH
@@ -44,7 +47,7 @@
 // -------------------------------------------------------------------------
 #include <Update.h>
 #ifndef FW_VERSION
-#define FW_VERSION "v5.4.0-poe-wifi"
+#define FW_VERSION "v5.4.1-poe-wifi"
 #endif
 #define WDT_TIMEOUT_SECONDS 60
 
@@ -91,12 +94,18 @@ AsyncEventSource events("/events");
 Preferences preferences;
 MQTTService mqttService;
 SecurityMonitor securityMonitor;
+// Brute-force lockout for the MQTT alarm PIN. MQTT has no per-client IP, so a
+// single shared bucket (key 0) throttles all attempts globally (S-0b).
+AuthLockout mqttCmdLockout;
 #ifdef USE_CSI
 CSIService csiService;
 #endif
 NotificationService notificationService;
 TelegramService telegramBot;
 LogService systemLog(20);
+// Log ring v RTC noinit RAM — přežije panic i SW reset (ne power-cycle),
+// takže /api/logs po pádu ukáže i záznamy z doby před restartem.
+RTC_NOINIT_ATTR static LogRtcRing g_rtcLog;
 EventLog eventLog(RAM_CAPACITY);
 ConfigSnapshot configSnapshot;
 MQTTOfflineBuffer mqttOfflineBuffer;
@@ -193,16 +202,13 @@ std::atomic<bool> g_otaRebootForce{false};
 // CSI data health: true when WiFi is associated but no CSI frames arrive (weak
 // signal / AP issue) → detection is starved. Surfaced in /api/health + metrics.
 std::atomic<bool> g_csiDataStarved{false};
+RuntimeOperationCoordinator g_runtimeOperationCoordinator;
 #ifndef LITE_BUILD
 std::atomic<bool> g_espotaPrepareRequested{false};
 std::atomic<bool> g_espotaMaintenance{false};
-std::atomic<bool> g_otaTransferActive{false};
 std::atomic<uint32_t> g_espotaMaintenanceSeconds{120};
 std::atomic<unsigned long> g_espotaMaintenanceUntilMs{0};
-std::atomic<uint8_t> g_otaRuntimeOwner{0};
-std::atomic<unsigned long> g_otaRuntimeLastProgressMs{0};
 std::atomic<uint32_t> g_otaRuntimeLastBytes{0};
-std::atomic<uint32_t> g_otaRuntimeTimeoutMs{0};
 static constexpr uint8_t OTA_OWNER_NONE = 0;
 static constexpr uint8_t OTA_OWNER_HTTP = 1;
 static constexpr uint8_t OTA_OWNER_PULL = 2;
@@ -210,9 +216,13 @@ static constexpr uint8_t OTA_OWNER_ESPOTA_PREPARE = 3;
 static constexpr uint8_t OTA_OWNER_ESPOTA = 4;
 const char* otaRuntimeOwnerName(uint8_t owner);
 uint8_t otaRuntimeOwner();
+bool otaRuntimeTransferActive();
+uint32_t otaRuntimeLastProgressMs();
+uint32_t otaRuntimeLastBytes();
+uint32_t otaRuntimeTimeoutMs();
 bool otaRuntimeTryBegin(uint8_t owner, uint32_t timeoutMs);
 void otaRuntimeMarkProgress(uint32_t bytes);
-void otaRuntimeEnd(uint8_t owner);
+bool otaRuntimeEnd(uint8_t owner);
 void otaRuntimeRestoreServices(const char* reason, bool restartRadar);
 #endif
 
@@ -287,10 +297,12 @@ void onEthEvent(arduino_event_id_t event) {
     switch (event) {
         case ARDUINO_EVENT_ETH_START:
             Serial.println("[ETH] Started");
+            DBG("ETH", "event=start uptime_ms=%lu", millis());
             ETH.setHostname(configManager.getConfig().hostname);
             break;
         case ARDUINO_EVENT_ETH_CONNECTED:
             Serial.println("[ETH] Link UP");
+            DBG("ETH", "event=connected uptime_ms=%lu link=%d", millis(), ETH.linkUp());
             ethConnected = true;
             break;
         case ARDUINO_EVENT_ETH_GOT_IP:
@@ -298,15 +310,19 @@ void onEthEvent(arduino_event_id_t event) {
                 ETH.localIP().toString().c_str(),
                 ETH.linkSpeed(),
                 ETH.fullDuplex() ? "Full" : "Half");
+            DBG("ETH", "event=got_ip uptime_ms=%lu speed_mbps=%d duplex=%s",
+                millis(), ETH.linkSpeed(), ETH.fullDuplex() ? "full" : "half");
             ethGotIP = true;
             break;
         case ARDUINO_EVENT_ETH_DISCONNECTED:
             Serial.println("[ETH] Link DOWN");
+            DBG("ETH", "event=disconnected uptime_ms=%lu link=%d", millis(), ETH.linkUp());
             ethConnected = false;
             ethGotIP = false;
             break;
         case ARDUINO_EVENT_ETH_STOP:
             Serial.println("[ETH] Stopped");
+            DBG("ETH", "event=stop uptime_ms=%lu", millis());
             ethConnected = false;
             ethGotIP = false;
             break;
@@ -326,6 +342,8 @@ void safeRestart(const char* reason) {
         systemLog.warn(String("Reboot inhibit: ") + reason + " suppressed");
         return;
     }
+    // Drain web-originated MQTT work here, on the main-loop owner, before reboot.
+    mqttService.processDeferredActions();
     preferences.putString("restart_cause", reason);
     preferences.putULong("last_uptime", millis() / 1000);
     preferences.putULong("last_heap", ESP.getFreeHeap());
@@ -415,9 +433,7 @@ void connectivityTask(void* param) {
         // Skip the watchdog cycle entirely while a /api/update is in flight.
         // The watchdog otherwise prints DBG, hits ETH.linkUp() / mqtt state,
         // and (without inhibit) could reboot mid-upload.
-#ifdef USE_CSI
-        if (CSIService::isOtaInProgress()) continue;
-#endif
+        if (g_runtimeOperationCoordinator.status().operation == RuntimeOperation::OTA) continue;
 
         // --- ETH link watchdog ---
         if (!ETH.linkUp()) {
@@ -474,6 +490,12 @@ void connectivityTask(void* param) {
 
 void setup() {
     Serial.begin(115200);
+
+    // Restore logu z předchozího bootu (RTC RAM), pak ring resetovat a
+    // připojit jako mirror pro tento běh — dřív než cokoli začne logovat.
+    if (logRingValid(g_rtcLog)) systemLog.restorePrevBoot(g_rtcLog);
+    logRingInit(g_rtcLog);
+    systemLog.attachRtcMirror(&g_rtcLog);
 
     zonesMutex = xSemaphoreCreateMutex();
     pinMode(LED_PIN, OUTPUT);
@@ -788,6 +810,7 @@ void setup() {
         .preferences = &preferences,
         .radar = &radar,
         .mqttService = &mqttService,
+        .runtimeOperationCoordinator = &g_runtimeOperationCoordinator,
         .securityMonitor = &securityMonitor,
         .telegramBot = &telegramBot,
         .notificationService = &notificationService,
@@ -820,7 +843,13 @@ void setup() {
 
     // Init services
     g_myDeviceId = configManager.getConfig().mqtt_id; // For supervision heartbeat
+    mqttService.setRuntimeOperationCoordinator(&g_runtimeOperationCoordinator);
     if (configManager.getConfig().mqtt_enabled) {
+        // M-5: a MQTT alarm PIN and Home Assistant control are mutually exclusive
+        // (HA sends bare ARM/DISARM that the PIN guard rejects). Flag the conflict.
+        if (preferences.getString("sec_mqtt_pin", "").length() > 0) {
+            Serial.println("[SECURITY] NOTE: MQTT alarm PIN is set — Home Assistant alarm control (bare ARM/DISARM) will be rejected. Use the PIN or HA control, not both.");
+        }
         mqttService.begin(&preferences, configManager.getConfig().mqtt_id, FW_VERSION);
         mqttService.setCommandCallback([](const char* topic, const char* payload) {
             const MQTTTopics& t = mqttService.getTopics();
@@ -866,14 +895,37 @@ void setup() {
                 bool pinOk = true;
                 String cmdBase = cmd;
                 if (mqttPin.length() > 0) {
-                    int sep = cmd.indexOf(':');
-                    if (sep < 0) {
+                    uint32_t now = millis();
+                    // Brute-force lockout: reject without even checking the PIN
+                    // while locked, so a flood of wrong PINs can't be tried at
+                    // line rate (S-0b). Shared bucket, key 0.
+                    if (mqttCmdLockout.lockedForMs(0, now) > 0) {
                         pinOk = false;
-                        DBG("SecMon", "MQTT alarm cmd '%s' rejected — PIN required", cmd.c_str());
+                        DBG("SecMon", "MQTT alarm cmd rejected — PIN locked out");
                     } else {
-                        cmdBase = cmd.substring(0, sep);
-                        pinOk = (cmd.substring(sep + 1) == mqttPin);
-                        if (!pinOk) DBG("SecMon", "MQTT alarm cmd rejected — wrong PIN");
+                        int sep = cmd.indexOf(':');
+                        if (sep < 0) {
+                            // No PIN supplied. This is NOT a brute-force guess
+                            // (you can't guess a PIN without sending one), so it
+                            // must NOT count toward the lockout — otherwise HA,
+                            // whose alarm_control_panel discovery is code_*_
+                            // required:false and sends bare ARM/DISARM, would
+                            // lock the bucket and block legitimate CMD:pin
+                            // commands. Reject only.
+                            pinOk = false;
+                            DBG("SecMon", "MQTT alarm cmd '%s' rejected — PIN required", cmd.c_str());
+                        } else {
+                            cmdBase = cmd.substring(0, sep);
+                            pinOk = (cmd.substring(sep + 1) == mqttPin);
+                            if (pinOk) {
+                                mqttCmdLockout.onSuccess(0);
+                            } else {
+                                // A wrong PIN with the CMD:pin shape IS a guess —
+                                // this is the only path that feeds the lockout.
+                                mqttCmdLockout.onFailure(0, now);
+                                DBG("SecMon", "MQTT alarm cmd rejected — wrong PIN");
+                            }
+                        }
                     }
                 }
                 if (pinOk) {
@@ -967,16 +1019,17 @@ void setup() {
     ArduinoOTA.onStart([]() {
         otaRuntimeEnd(OTA_OWNER_ESPOTA_PREPARE);
         if (!otaRuntimeTryBegin(OTA_OWNER_ESPOTA, 180000)) {
-            systemLog.warn(String("ArduinoOTA started while OTA owner is ") + otaRuntimeOwnerName(otaRuntimeOwner()));
+            systemLog.warn(String("ArduinoOTA rejected while runtime operation is ") +
+                runtimeOperationText(g_runtimeOperationCoordinator.status().operation));
+            otaRuntimeRestoreServices("espota_start_rejected", true);
+            return;
         }
         otaRuntimeMarkProgress(0);
         g_espotaMaintenance.store(true);
 #ifdef USE_CSI
-        CSIService::setOtaInProgress(true);
         csiService.wifiDownForOta();   // single-home: drop CSI WiFi so we're not dual-homed during OTA
 #endif
         mqttService.publishMaintenance(true);
-        MQTTService::setOtaInProgress(true);
         String type;
         if (ArduinoOTA.getCommand() == U_FLASH)
             type = "sketch";
@@ -993,10 +1046,6 @@ void setup() {
         }
     });
     ArduinoOTA.onEnd([]() {
-#ifdef USE_CSI
-        CSIService::setOtaInProgress(false);
-#endif
-        MQTTService::setOtaInProgress(false);
         mqttService.publishMaintenance(false);
         g_espotaMaintenance.store(false);
         g_espotaMaintenanceUntilMs.store(0);
@@ -1006,12 +1055,10 @@ void setup() {
         otaRuntimeMarkProgress(total > 0 ? progress : 0);
     });
     ArduinoOTA.onError([](ota_error_t) {
-#ifdef USE_CSI
-        CSIService::setOtaInProgress(false);
-#endif
-        MQTTService::setOtaInProgress(false);
-        otaRuntimeRestoreServices("arduino_ota_error", true);
-        otaRuntimeEnd(OTA_OWNER_ESPOTA);
+        if (otaRuntimeOwner() == OTA_OWNER_ESPOTA) {
+            otaRuntimeRestoreServices("arduino_ota_error", true);
+            otaRuntimeEnd(OTA_OWNER_ESPOTA);
+        }
         systemLog.error("ArduinoOTA failed; runtime services restored");
     });
 
@@ -1042,6 +1089,7 @@ void setup() {
     // WiFi CSI: uses WiFi STA purely for CSI packet capture (network stays on Ethernet)
     // Runtime gate via csi_enabled (NVS) — even if compiled in, user can disable in GUI
     if (configManager.getConfig().csi_enabled) {
+        csiService.setRuntimeOperationCoordinator(&g_runtimeOperationCoordinator);
         // Apply NVS-stored runtime config BEFORE begin so allocations use right window size
         csiService.setWindowSize(configManager.getConfig().csi_window);
         csiService.setThreshold(configManager.getConfig().csi_threshold);
@@ -1088,35 +1136,52 @@ const char* otaRuntimeOwnerName(uint8_t owner) {
 }
 
 uint8_t otaRuntimeOwner() {
-    return g_otaRuntimeOwner.load();
+    RuntimeOperationStatus status = g_runtimeOperationCoordinator.status();
+    return status.operation == RuntimeOperation::OTA ? status.ownerId : OTA_OWNER_NONE;
+}
+
+bool otaRuntimeTransferActive() {
+    uint8_t owner = otaRuntimeOwner();
+    return owner != OTA_OWNER_NONE && owner != OTA_OWNER_ESPOTA_PREPARE;
+}
+
+uint32_t otaRuntimeLastProgressMs() {
+    return g_runtimeOperationCoordinator.status().lastProgressMs;
+}
+
+uint32_t otaRuntimeLastBytes() {
+    return g_otaRuntimeLastBytes.load();
+}
+
+uint32_t otaRuntimeTimeoutMs() {
+    return g_runtimeOperationCoordinator.status().timeoutMs;
 }
 
 bool otaRuntimeTryBegin(uint8_t owner, uint32_t timeoutMs) {
-    uint8_t expected = OTA_OWNER_NONE;
-    if (!g_otaRuntimeOwner.compare_exchange_strong(expected, owner)) {
+    if (owner == OTA_OWNER_NONE ||
+        !g_runtimeOperationCoordinator.tryBegin(
+            RuntimeOperation::OTA, millis(), timeoutMs, owner)) {
         return false;
     }
-    unsigned long now = millis();
-    g_otaRuntimeLastProgressMs.store(now);
     g_otaRuntimeLastBytes.store(0);
-    g_otaRuntimeTimeoutMs.store(timeoutMs);
-    g_otaTransferActive.store(owner != OTA_OWNER_ESPOTA_PREPARE);
     return true;
 }
 
 void otaRuntimeMarkProgress(uint32_t bytes) {
-    g_otaRuntimeLastProgressMs.store(millis());
-    g_otaRuntimeLastBytes.store(bytes);
+    uint8_t owner = otaRuntimeOwner();
+    if (owner != OTA_OWNER_NONE && g_runtimeOperationCoordinator.markProgress(
+            RuntimeOperation::OTA, millis(), owner)) {
+        g_otaRuntimeLastBytes.store(bytes);
+    }
 }
 
-void otaRuntimeEnd(uint8_t owner) {
-    uint8_t current = g_otaRuntimeOwner.load();
-    if (owner != OTA_OWNER_NONE && current != owner) return;
-    g_otaRuntimeOwner.store(OTA_OWNER_NONE);
-    g_otaRuntimeLastProgressMs.store(0);
+bool otaRuntimeEnd(uint8_t owner) {
+    if (owner == OTA_OWNER_NONE ||
+        !g_runtimeOperationCoordinator.finish(RuntimeOperation::OTA, owner)) {
+        return false;
+    }
     g_otaRuntimeLastBytes.store(0);
-    g_otaRuntimeTimeoutMs.store(0);
-    g_otaTransferActive.store(false);
+    return true;
 }
 
 void otaRuntimeRestoreServices(const char* reason, bool restartRadar) {
@@ -1124,11 +1189,9 @@ void otaRuntimeRestoreServices(const char* reason, bool restartRadar) {
         Update.abort();
     }
 #ifdef USE_CSI
-    CSIService::setOtaInProgress(false);
     csiService.wifiUpAfterOta();   // restore CSI WiFi if the OTA window closed without a reboot
 #endif
-    MQTTService::setOtaInProgress(false);
-    mqttService.publishMaintenance(false);
+    mqttService.requestMaintenancePublish(false);
     if (restartRadar) {
         uint8_t minGate = preferences.getUInt("radar_min", 0);
         uint8_t maxGate = preferences.getUInt("radar_max", 13);
@@ -1143,21 +1206,21 @@ void otaRuntimeRestoreServices(const char* reason, bool restartRadar) {
 }
 
 static void handleOtaRuntimeWatchdog(unsigned long now) {
-    uint8_t owner = g_otaRuntimeOwner.load();
-    if (owner == OTA_OWNER_NONE) return;
+    RuntimeOperationStatus timedOut;
+    if (!g_runtimeOperationCoordinator.checkTimeout(
+            RuntimeOperation::OTA, now, &timedOut) ||
+        timedOut.operation != RuntimeOperation::OTA) return;
 
-    uint32_t timeoutMs = g_otaRuntimeTimeoutMs.load();
-    unsigned long last = g_otaRuntimeLastProgressMs.load();
-    if (timeoutMs == 0 || last == 0 || (long)(now - last) <= (long)timeoutMs) return;
-
+    uint8_t owner = timedOut.ownerId;
     const char* ownerName = otaRuntimeOwnerName(owner);
-    DBG("OTA", "Runtime watchdog timeout for %s after %lu ms", ownerName, now - last);
+    DBG("OTA", "Runtime watchdog timeout for %s after %lu ms",
+        ownerName, now - timedOut.lastProgressMs);
     systemLog.error(String("OTA timeout: ") + ownerName);
     preferences.putString("ota_phase", "failed");
     preferences.putString("ota_msg", String("runtime timeout: ") + ownerName);
     preferences.putInt("ota_err", -6);
     otaRuntimeRestoreServices("watchdog_timeout", owner == OTA_OWNER_ESPOTA);
-    otaRuntimeEnd(owner);
+    g_otaRuntimeLastBytes.store(0);
 }
 
 static void clearEspotaMaintenanceMode() {
@@ -1177,11 +1240,9 @@ static void handleEspotaMaintenance(unsigned long now) {
         ArduinoOTA.begin();
 
 #ifdef USE_CSI
-        CSIService::setOtaInProgress(true);
         csiService.wifiDownForOta();   // single-home: drop CSI WiFi so we're not dual-homed during OTA
 #endif
         mqttService.publishMaintenance(true);
-        MQTTService::setOtaInProgress(true);
         if (radarTaskHandle && eTaskGetState(radarTaskHandle) != eSuspended) {
             vTaskSuspend(radarTaskHandle);
         }
@@ -1192,7 +1253,7 @@ static void handleEspotaMaintenance(unsigned long now) {
         DBG("OTA", "ESPOTA maintenance window opened for %us", (unsigned)seconds);
     }
 
-    if (g_espotaMaintenance.load() && !g_otaTransferActive.load()) {
+    if (g_espotaMaintenance.load() && !otaRuntimeTransferActive()) {
         unsigned long until = g_espotaMaintenanceUntilMs.load();
         if (until != 0 && (long)(now - until) >= 0) {
             clearEspotaMaintenanceMode();
@@ -1240,6 +1301,7 @@ void loop() {
 
     if (configManager.getConfig().mqtt_enabled) mqttService.update();
 #ifdef USE_CSI
+    csiService.processDeferredActions();
     if (configManager.getConfig().csi_enabled) {
         // csi6b: ground-truth presence from LD2412 radar — keeps stationary humans
         // (CSI variance low, breathing hold active) out of quiet-site learning.
@@ -1309,10 +1371,15 @@ void loop() {
         static bool gateVerified = false;
         if (!gateVerified && now - bootTime >= TIMEOUT_GATE_VERIFY_MS) {
             gateVerified = true;
-            uint8_t expectedMin = preferences.getUInt("radar_min", 0);
-            uint8_t expectedMax = preferences.getUInt("radar_max", 13);
-            if (!radar.verifyGateConfig(expectedMin, expectedMax)) {
-                eventLog.addEvent(EVT_SYSTEM, 0, 0, "Gate config reverted by FW");
+            // Radar-less kus: UART config dotaz na neinicializovaný/odpojený
+            // radar umí skončit LoadProhibited v LD2412::getAckNonBlocking
+            // (coredump 2026-07-18) — přeskočit, není co ověřovat.
+            if (radar.isRadarConnected()) {
+                uint8_t expectedMin = preferences.getUInt("radar_min", 0);
+                uint8_t expectedMax = preferences.getUInt("radar_max", 13);
+                if (!radar.verifyGateConfig(expectedMin, expectedMax)) {
+                    eventLog.addEvent(EVT_SYSTEM, 0, 0, "Gate config reverted by FW");
+                }
             }
         }
     }
@@ -1590,11 +1657,8 @@ void loop() {
     // docs/OTA_FAILURE_2026_05_02.md: 30-min DMS firing mid-upload returns
     // Update.hasError()=true on resume) or while the operator has explicitly
     // pinned the device for stability testing via reboot inhibit.
-#ifdef USE_CSI
-    bool dmsBlocked = CSIService::isOtaInProgress() || g_rebootInhibit.load();
-#else
-    bool dmsBlocked = g_rebootInhibit.load();
-#endif
+    bool dmsBlocked = g_runtimeOperationCoordinator.status().operation == RuntimeOperation::OTA ||
+                      g_rebootInhibit.load();
     if (!dmsDegraded && !dmsBlocked && configManager.getConfig().mqtt_enabled && strlen(configManager.getConfig().mqtt_server) > 0 && (now - bootTime) > TIMEOUT_DMS_STARTUP_MS &&
         dmsPublishStale) {
 
@@ -1633,7 +1697,11 @@ void loop() {
     // Reset DMS counter after successful publish — read-before-write so a
     // RAM-only reset doesn't issue a redundant flash erase on the dms_count
     // NVS page.
-    if (dmsRestarts > 0 && mqttService.getLastPublishTime() > 0 && !dmsPublishStale) {
+    // v5.4.1: reset až po REÁLNÉM publishi — _lastPublish je na bootu
+    // inicializovaný na millis(), takže samotné "not stale" nulovalo čítač
+    // pár sekund po každém startu a cap DMS_MAX_RESTARTS nikdy nezafungoval
+    // (8-10x restart smyčka při výpadku brokeru na obou test nodech).
+    if (dmsShouldResetCounter(dmsRestarts, mqttService.publishedSinceBoot(), dmsPublishStale)) {
         if (preferences.getUInt("dms_count", 0) != 0) {
             preferences.putUInt("dms_count", 0);
         }
@@ -1652,11 +1720,8 @@ void loop() {
     // ("nezatěžovat ESP během flashe"): JsonDocument allocation + events->send
     // every 250 ms is wasted heap pressure when AsyncTCP needs every byte
     // for the upload pbuf chain.
-#ifdef USE_CSI
-    bool sseSkipForOta = CSIService::isOtaInProgress();
-#else
-    bool sseSkipForOta = false;
-#endif
+    bool sseSkipForOta =
+        g_runtimeOperationCoordinator.status().operation == RuntimeOperation::OTA;
     if (!sseSkipForOta && now - lastSSE > INTERVAL_SSE_UPDATE_MS && ESP.getFreeHeap() >= HEAP_MIN_FOR_PUBLISH) {
         lastSSE = now;
         JsonDocument doc;
@@ -1809,6 +1874,7 @@ void loop() {
                 AlarmTriggerEvent evt;
                 while (securityMonitor.peekAlarmEvent(evt)) {
                     JsonDocument evtDoc;
+                    evtDoc["event_id"]    = evt.event_id;
                     evtDoc["reason"]      = evt.reason;
                     evtDoc["zone"]        = evt.zone;
                     evtDoc["distance_cm"] = evt.distance_cm;
@@ -1848,7 +1914,9 @@ void loop() {
 
                     String evtJson;
                     serializeJson(evtDoc, evtJson);
-                    if (mqttService.publish(topics.alarm_event, evtJson.c_str(), false)) {
+                    PublishResult publishResult = mqttService.publishResult(
+                        topics.alarm_event, evtJson.c_str(), false, evt.event_id);
+                    if (mqttPublishResultConsumes(publishResult)) {
                         securityMonitor.consumeAlarmEvent();
                     } else {
                         break; // Retry next loop iteration

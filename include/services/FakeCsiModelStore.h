@@ -13,8 +13,9 @@ public:
     uint32_t gen = 0;
 
     // failure injection
-    int failSlotMask = 0;   // bit per slot -> writeSlot(slot) returns false
-    int failNextN = 0;      // fail the next N writes regardless of slot
+    int failSlotMask = 0;        // bit per slot -> writeSlot(slot) returns false
+    int failNextN = 0;           // fail the next N writes regardless of slot
+    int eraseFailSlotMask = 0;   // bit per slot -> eraseSlot(slot) returns false (slot survives)
 
     static int idx(CsiModelSlot s) { return static_cast<int>(s); }
 
@@ -35,6 +36,7 @@ public:
         return true;
     }
     bool eraseSlot(CsiModelSlot slot) override {
+        if (eraseFailSlotMask & (1 << idx(slot))) return false;  // slot NOT cleared
         present[idx(slot)] = false;
         return true;
     }

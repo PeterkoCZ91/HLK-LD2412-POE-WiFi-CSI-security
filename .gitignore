@@ -4,6 +4,7 @@
 .vscode/
 .local-notes/
 .claude/
+.codegraph/
 
 # Python
 __pycache__/
@@ -39,6 +40,13 @@ bench_*.jsonl
 
 # Internal planning/audit artifacts — keep local, never public
 docs/superpowers/
+docs/BUG_AUDIT_*.md
+docs/ROADMAP_REVIEW_*.md
+docs/PROJECT_MEMORY*.md
+docs/*_TASK_*.md
+# Internal Czech design/proposal notes (návrhy) — root-level working docs
+*-navrh*.md
+*-navrh-*.md
 
 # pioarduino build artefakty (generované z idf_component manifest)
 src/idf_component.yml
