@@ -220,6 +220,11 @@ public:
                                                 bool force,
                                                 uint32_t timeoutMs,
                                                 CsiModelOp& result);
+    // #3 (48h audit): import routed through the command slot (csi_proc), so the
+    // candidate write is serialized with APPLY instead of racing on async_tcp.
+    CsiModelRequestStatus requestModelImport(const CsiSiteModel& src,
+                                             uint32_t timeoutMs,
+                                             CsiModelOp& result);
     // Called by the main loop; owns deferred MQTT side effects from model ops.
     void processDeferredActions();
     // P1.5 import (navrh 17.5): land an externally-supplied model as CANDIDATE
@@ -322,6 +327,15 @@ private:
     std::atomic<uint32_t> _csiQueueDrops{0};
     CsiModelCommandSlot _modelCommandSlot;
     std::atomic<uint8_t> _pendingModelPublish{0};
+    // #6: the continuous-EMA drift is computed on the main loop but its ACTIVE-slot
+    // write must run on csi_proc, serialized with apply/rollback/import. The main
+    // loop stashes the drifted values and raises _emaPersistPending (release); the
+    // csi_proc worker consumes it (acquire) via _processPendingEmaPersist(). Single
+    // producer (main loop) / single consumer (csi_proc) — no cross-task write race.
+    std::atomic<bool> _emaPersistPending{false};
+    float _emaPersistThr = 0.0f;
+    float _emaPersistMean = 0.0f;
+    float _emaPersistStd = 0.0f;
     void _publishMQTT();
     void _updateMotionState();
     void _recordDecisionTrace(bool bufferReady, bool rawMotion, bool finalMotion,
@@ -367,6 +381,7 @@ private:
     void _continuousLearnRefresh();
     void _publishDetectionSnapshot();
     void _processPendingModelOperation();
+    void _processPendingEmaPersist();   // #6: run the stashed EMA persist on csi_proc
     CsiModelOp _executeModelCommand(CsiModelCommand command, bool force);
 
     // Configuration

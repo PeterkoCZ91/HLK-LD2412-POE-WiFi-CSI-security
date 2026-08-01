@@ -9,7 +9,9 @@ enum class CsiModelCommand : uint8_t {
     APPLY,
     ROLLBACK,
     CLEAR_CANDIDATE,
-    CLEAR_ALL
+    CLEAR_ALL,
+    IMPORT   // land a web-imported model as candidate — routed here so the _cand
+             // write is serialized on csi_proc with APPLY (no async_tcp race)
 };
 
 enum class CsiModelRequestStatus : uint8_t {
@@ -43,6 +45,25 @@ public:
         _state.store(CsiModelCommandState::PENDING, std::memory_order_release);
         return true;
     }
+
+    // IMPORT variant: carries the model payload. _payload is written before the
+    // release store on _state, so the claimer's acquire sees a consistent copy.
+    bool submit(CsiModelCommand command, bool force, const CsiSiteModel& payload) {
+        CsiModelCommandState expected = CsiModelCommandState::IDLE;
+        if (!_state.compare_exchange_strong(expected, CsiModelCommandState::CLAIMED,
+                                            std::memory_order_acq_rel)) {
+            return false;
+        }
+        _command = command;
+        _force = force;
+        _payload = payload;
+        _abandoned.store(false, std::memory_order_relaxed);
+        _state.store(CsiModelCommandState::PENDING, std::memory_order_release);
+        return true;
+    }
+
+    // Valid only for the worker between claim() and complete().
+    const CsiSiteModel& payload() const { return _payload; }
 
     bool claim(CsiModelCommand& command, bool& force) {
         CsiModelCommandState expected = CsiModelCommandState::PENDING;
@@ -95,6 +116,7 @@ private:
     CsiModelCommand _command = CsiModelCommand::APPLY;
     bool _force = false;
     CsiModelOp _result = CsiModelOp::STORE_FAILED;
+    CsiSiteModel _payload;   // IMPORT payload; written under the state release/acquire fence
 };
 
 #endif

@@ -32,6 +32,7 @@
 #endif
 #ifdef USE_CSI
 #include "services/CSIService.h"
+#include "services/FusionReason.h"   // #8 fusion panel — reason string
 #endif
 #include "debug.h"
 #include "secrets.h"
@@ -47,7 +48,7 @@
 // -------------------------------------------------------------------------
 #include <Update.h>
 #ifndef FW_VERSION
-#define FW_VERSION "v5.4.1-poe-wifi"
+#define FW_VERSION "v5.6.0"
 #endif
 #define WDT_TIMEOUT_SECONDS 60
 
@@ -886,6 +887,13 @@ void setup() {
                     securityMonitor.setPetImmunity((uint8_t)val);
                     preferences.putUInt("sec_pet", (uint8_t)val);
                 }
+            } else if (strcmp(topic, t.preset_set) == 0) {
+                SecPreset preset;
+                if (parseSecPreset(payload, preset)) {
+                    securityMonitor.applySecurityPreset(preset);
+                    preferences.putUInt("sec_preset", (uint32_t)preset);
+                    mqttService.publishPresetState(secPresetName(preset));
+                }
             } else if (strcmp(topic, t.cmd_dyn_bg) == 0) {
                 radar.startCalibration();
             } else if (strcmp(topic, t.alarm_set) == 0) {
@@ -1003,12 +1011,41 @@ void setup() {
     if (preferences.isKey("sec_hb"))
         securityMonitor.setHeartbeatInterval(preferences.getULong("sec_hb", 14400000));
 
-    securityMonitor.setEntryDelay(preferences.getULong("sec_entry_dl", DEFAULT_ENTRY_DELAY_MS));
+    // v5.5: the security preset is a BASELINE bundle; the explicit per-parameter
+    // config below overrides it. Apply the preset only if the user actually chose
+    // one, so devices that never touched presets keep their persisted/default
+    // tunables — no silent alarm-behavior change on upgrade.
+    if (preferences.isKey("sec_preset")) {
+        uint32_t presetRaw = preferences.getUInt("sec_preset", (uint32_t)SecPreset::HOME);
+        if (presetRaw > (uint32_t)SecPreset::PARANOID) {
+            presetRaw = (uint32_t)SecPreset::HOME;
+        }
+        securityMonitor.applySecurityPreset((SecPreset)presetRaw);
+    }
+
+    // Preset-controlled params: an explicitly persisted value overrides the preset
+    // baseline; unset -> keep preset/compile default (== member default, so a
+    // non-preset device is byte-for-byte unaffected).
+    if (preferences.isKey("sec_entry_dl"))
+        securityMonitor.setEntryDelay(preferences.getULong("sec_entry_dl", DEFAULT_ENTRY_DELAY_MS));
+    if (preferences.isKey("sec_alarm_en"))
+        securityMonitor.setAlarmEnergyThreshold(preferences.getUChar("sec_alarm_en", DEFAULT_ALARM_ENERGY_THRESHOLD));
+    if (preferences.isKey("sec_pet"))
+        securityMonitor.setPetImmunity((uint8_t)preferences.getUInt("sec_pet", 0));
+    if (preferences.isKey("sec_corrob"))
+        securityMonitor.setCorroborationEnabled(preferences.getBool("sec_corrob", false));
+
+    // Params the preset does not touch: always loaded.
     securityMonitor.setExitDelay(preferences.getULong("sec_exit_dl", DEFAULT_EXIT_DELAY_MS));
     securityMonitor.setDisarmReminderEnabled(preferences.getBool("sec_dis_rem", false));
     securityMonitor.setTriggerTimeout(preferences.getULong("sec_trig_to", DEFAULT_TRIGGER_TIMEOUT_MS));
     securityMonitor.setAutoRearm(preferences.getBool("sec_auto_rearm", true));
-    securityMonitor.setAlarmEnergyThreshold(preferences.getUChar("sec_alarm_en", DEFAULT_ALARM_ENERGY_THRESHOLD));
+    securityMonitor.setCrossModalEnabled(preferences.getBool("sec_xmodal", true));
+    securityMonitor.setCorroborationWindowMs(preferences.getULong("sec_corrob_ms", 8000));
+    if (configManager.getConfig().mqtt_enabled) {
+        mqttService.publishPresetState(
+            secPresetName(securityMonitor.getSecurityPreset()));
+    }
     securityMonitor.setSirenPin(SIREN_PIN);
     if (preferences.getBool("sec_armed", false)) {
         bool homeMode = preferences.getBool("sec_home_mode", false);
@@ -1761,12 +1798,26 @@ void loop() {
                 csi["learning_samples"]    = csiService.getSiteLearningAcceptedSamples();
             }
 
-            // Fusion state in SSE telemetry
+            // Fusion state in SSE telemetry (#8 fusion panel)
             if (securityMonitor.isFusionActive()) {
                 JsonObject fusion = doc["fusion"].to<JsonObject>();
                 fusion["presence"]   = securityMonitor.isFusionPresence();
                 fusion["confidence"] = securityMonitor.getFusionConfidence();
                 fusion["source"]     = securityMonitor.getFusionSourceStr();
+                uint8_t fsrc = securityMonitor.getFusionSource();
+                fusion["radar"] = (fsrc & FUSION_RADAR) != 0;
+                fusion["csi"]   = (fsrc & FUSION_CSI) != 0;
+                fusion["ml"]    = (fsrc & FUSION_ML) != 0;
+                // radar N/A on CSI-only nodes (radar-less) — panel greys the bar
+                fusion["radar_present"] = !securityMonitor.isRadarMonitoringDisabled();
+                // bar levels 0-100: radar = current moving energy (already in doc
+                // from radar.getTelemetryJson), csi = composite score, ml = probability
+                fusion["radar_lvl"] = doc["moving_energy"].as<int>();
+                fusion["csi_lvl"]   = (int)(csiService.getCompositeScore() * 100.0f);
+                fusion["ml_lvl"]    = (int)(csiService.getMlProbability() * 100.0f);
+                char rbuf[96];
+                fusionReasonStr(fsrc, securityMonitor.getFusionConfidence(), rbuf, sizeof(rbuf));
+                fusion["reason"] = rbuf;
             }
         }
         #endif

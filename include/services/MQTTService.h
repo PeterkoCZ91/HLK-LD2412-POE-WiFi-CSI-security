@@ -48,6 +48,7 @@ struct MQTTTopics {
     char motion_direction[64];
     char motion_type[64];
     char alarm_event[64];
+    char alarm_why[64];
 
     // Security alerts
     char alert_loitering[64];
@@ -62,6 +63,8 @@ struct MQTTTopics {
     char state_sensitivity[64];
     char cmd_pet_immunity[64];
     char state_pet_immunity[64];
+    char preset_state[64];
+    char preset_set[64];
 
     // LD2412 specific
     char cmd_dyn_bg[64];
@@ -158,6 +161,9 @@ public:
     const char* getServer() const { return _server; }
     const char* getPort() const { return _port; }
     bool consumeReconnect() { bool v = _justReconnected; _justReconnected = false; return v; }
+    void publishPresetState(const char* name);
+    void publishAlarmWhy(const char* reason, uint8_t fusionSource,
+                         float confidence, const char* zone);
 
     // Retained "1"/"0" on security/<id>/maintenance. Publishes directly via
     // the underlying MQTT client, bypassing the runtime-operation guard in

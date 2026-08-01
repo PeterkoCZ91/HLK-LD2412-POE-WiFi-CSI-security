@@ -61,6 +61,7 @@ void MQTTService::generateTopics() {
     snprintf(_topics.motion_direction,sizeof(_topics.motion_direction),"security/%s/presence/direction", _deviceId);
     snprintf(_topics.motion_type,     sizeof(_topics.motion_type),     "security/%s/presence/motion_type", _deviceId);
     snprintf(_topics.alarm_event,     sizeof(_topics.alarm_event),     "security/%s/alarm/event", _deviceId);
+    snprintf(_topics.alarm_why,       sizeof(_topics.alarm_why),       "security/%s/alarm/why", _deviceId);
     snprintf(_topics.alert_loitering, sizeof(_topics.alert_loitering), "security/%s/alert/loitering", _deviceId);
     snprintf(_topics.alert_anti_masking, sizeof(_topics.alert_anti_masking), "security/%s/alert/anti_masking", _deviceId);
 
@@ -72,6 +73,8 @@ void MQTTService::generateTopics() {
     snprintf(_topics.state_sensitivity, sizeof(_topics.state_sensitivity), "security/%s/config/sensitivity", _deviceId);
     snprintf(_topics.cmd_pet_immunity,  sizeof(_topics.cmd_pet_immunity),  "security/%s/config/pet_immunity/set", _deviceId);
     snprintf(_topics.state_pet_immunity,sizeof(_topics.state_pet_immunity),"security/%s/config/pet_immunity", _deviceId);
+    snprintf(_topics.preset_state,      sizeof(_topics.preset_state),      "security/%s/preset", _deviceId);
+    snprintf(_topics.preset_set,        sizeof(_topics.preset_set),        "security/%s/preset/set", _deviceId);
 
     snprintf(_topics.cmd_dyn_bg,      sizeof(_topics.cmd_dyn_bg),      "security/%s/dyn_bg/set", _deviceId);
 
@@ -224,6 +227,7 @@ void MQTTService::connect() {
         _mqttClient.subscribe(_topics.cmd_config);
         _mqttClient.subscribe(_topics.cmd_max_range);
         _mqttClient.subscribe(_topics.cmd_hold_time);
+        _mqttClient.subscribe(_topics.preset_set);
         _mqttClient.subscribe(_topics.cmd_sensitivity);
         _mqttClient.subscribe(_topics.cmd_pet_immunity);
         _mqttClient.subscribe(_topics.cmd_dyn_bg);
@@ -384,6 +388,24 @@ PublishResult MQTTService::publishResult(const char* topic, const char* payload,
     return queued ? PublishResult::QUEUED_OFFLINE : PublishResult::FAILED;
 }
 
+void MQTTService::publishAlarmWhy(const char* reason, uint8_t fusionSource,
+                                  float confidence, const char* zone) {
+    JsonDocument doc;
+    doc["reason"] = reason;
+    doc["radar"] = (fusionSource & 0x1) != 0;
+    doc["csi"] = (fusionSource & 0x2) != 0;
+    doc["ml"] = (fusionSource & 0x4) != 0;
+    doc["confidence"] = confidence;
+    doc["zone"] = zone;
+    String payload;
+    serializeJson(doc, payload);
+    publish(_topics.alarm_why, payload.c_str(), true);
+}
+
+void MQTTService::publishPresetState(const char* name) {
+    publish(_topics.preset_state, name, true);
+}
+
 // Publish a single HA Discovery entity (called from publishDiscoveryStep)
 void MQTTService::publishOneDiscovery(const char* type, const char* uid, const char* name, const char* state_topic, const char* unit, const char* icon, const char* dev_class, const char* extra) {
     JsonDocument doc;
@@ -507,6 +529,24 @@ void MQTTService::publishDiscoveryStep() {
         case 56: publishOneDiscovery("sensor", "runtime_operation", "Runtime Operation",
             _topics.runtime_operation, "", "mdi:progress-wrench", "",
             "{\"ent_cat\":\"diagnostic\"}"); break;
+        case 57: {
+            char whyExtra[192];
+            snprintf(whyExtra, sizeof(whyExtra),
+                "{\"val_tpl\":\"{{ value_json.reason }}\",\"json_attr_t\":\"%s\"}",
+                _topics.alarm_why);
+            publishOneDiscovery("sensor", "alarm_reason", "Alarm Reason",
+                _topics.alarm_why, "", "mdi:help-circle", "", whyExtra);
+            break;
+        }
+        case 58: {
+            char presetExtra[192];
+            snprintf(presetExtra, sizeof(presetExtra),
+                "{\"options\":[\"Empty\",\"Home\",\"Paranoid\"],\"cmd_t\":\"%s\"}",
+                _topics.preset_set);
+            publishOneDiscovery("select", "sec_preset", "Security Preset",
+                _topics.preset_state, "", "mdi:shield-tune", "", presetExtra);
+            break;
+        }
         default: {
             // Engineering gates: indices 25-52 (14 gates × 2: moving + static)
             int gateOffset = _discoveryIndex - 25;

@@ -3,7 +3,7 @@
 [![PlatformIO](https://img.shields.io/badge/PlatformIO-ESP32-orange?logo=platformio)](https://platformio.org/)
 [![ESP32](https://img.shields.io/badge/MCU-ESP32--WROOM--32-blue?logo=espressif)](https://www.espressif.com/)
 [![License](https://img.shields.io/badge/License-GPL--3.0-blue)](LICENSE)
-[![Version](https://img.shields.io/badge/Version-5.4.1--poe--wifi-blue)]()
+[![Version](https://img.shields.io/badge/Version-5.6.0-blue)]()
 [![Discussions](https://img.shields.io/badge/GitHub-Discussions-purple?logo=github)](https://github.com/PeterkoCZ91/HLK-LD2412-POE-WiFi-CSI-security/discussions)
 
 **Dual-sensor intrusion detection system** — ESP32 + HLK-LD2412 24 GHz mmWave radar + **WiFi CSI (Channel State Information) passive motion detection** over **wired Ethernet with Power over Ethernet**. Full alarm state machine, zone management, Home Assistant integration, Telegram bot, and a dark-mode web dashboard. No cloud required.
@@ -11,6 +11,12 @@
 WiFi CSI detection algorithms based on [ESPectre](https://github.com/francescopace/espectre) by Francesco Pace (GPLv3).
 
 > [!NOTE]
+> **v5.6.0** — placement-awareness, fusion explainability and a concurrency/persistence hardening pass. CSI health surfaces **sensor-placement warnings** (`rssi_too_strong` when the node is near-field enough to saturate detection, `rssi_too_weak` when the link is too faint). A **live fusion explainability panel** in the dashboard shows per-modality radar/CSI/ML bars, a confidence gauge and a plain-language reason. Fixes a cluster of race/atomicity issues: the CSI **model-import** and **continuous-EMA** writes are now serialized on the `csi_proc` worker (no torn `_active` / spurious `STORE_FAILED`), and **`/api/config/import` is now all-or-nothing** (rolls back on a mid-sequence NVS failure instead of leaving a half-written auth/network state). Validated across a multi-day dual-node soak (32 h+ armed on production, zero triggers/crashes); 240/240 native tests, all five shipped builds green. See [CHANGELOG](CHANGELOG.md#560---2026-08-01).
+
+> [!TIP]
+> **v5.5.0** — fusion liveness and HA explainability: passive cross-modal radar↔CSI desync health reporting, an opt-in low-confidence corroboration window before the unchanged alarm FSM, retained per-alarm reason/contributor JSON for Home Assistant, and tested `Empty`/`Home`/`Paranoid` security presets over API, MQTT and HA select. 228/228 native tests; all five shipped firmware environments verified. See [CHANGELOG](CHANGELOG.md#550---2026-07-28).
+
+> [!TIP]
 > **v5.4.1** — reliability-first release. A **core-dump read-out API** (`GET /api/coredump` + `/download` + `POST /api/coredump/erase`) turned three previously undiagnosable field crashes into same-day fixes; adds **system-log persistence across panic/reset** and an **ML-saturation guard** (`ml_saturated`). Lands the full reliability roadmap: model-lifecycle correctness (atomic `clear_model`/rollback, BSSID-gated candidate apply) and disarm-PIN hardening (Release A); a **single runtime operation coordinator** with unified status (`GET /api/operation/status`, retained `security/<device>/system/operation`, HA sensor) that serializes OTA / WiFi scan / calibration / site-learning and fails closed on conflict (Release B); and security hardening — **central log/export secret redaction** and **per-service TLS trust management** (write-only CA PEM in NVS via `/api/{ota,mqtt,telegram,discord,webhook}/trust`, every HTTPS client fail-closed) (Release C). Plus a **nearby-WiFi scan** in the CSI dashboard (`POST /api/csi/wifi/scan`). Validated across a multi-day lab soak; 213/213 native tests. See [CHANGELOG](CHANGELOG.md#541-poe-wifi---2026-07-27).
 
 > [!TIP]
@@ -577,7 +583,7 @@ All endpoints require Digest auth except where noted.
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| GET | `/api/health` | Uptime, Ethernet info, MQTT, heap, CSI status, reset history |
+| GET | `/api/health` | Uptime, Ethernet info, MQTT, heap, CSI status, `crossmodal_desync`, reset history |
 | GET | `/api/operation/status` | Runtime operation coordinator snapshot: current operation (idle / OTA / WiFi scan / calibration / site-learning), owner and typed failure reason. Mirrored to a retained MQTT `security/<device>/system/operation` topic + an HA "Runtime Operation" sensor |
 | GET | `/metrics` | Prometheus text exposition — heap, chip temp, radar health, ETH/MQTT state, alarm state, fusion confidence, CSI stats. **Basic auth**. See [Prometheus Metrics](#prometheus-metrics) |
 | GET | `/healthz` | Unauthenticated liveness probe — heap + uptime. Use for external monitoring when auth may be degraded. |
@@ -593,7 +599,8 @@ All endpoints require Digest auth except where noted.
 | POST | `/api/alarm/arm` | Arm system (`?immediate=1` for no delay, `?home=1` for ARM_HOME mode) |
 | POST | `/api/alarm/disarm` | Disarm system |
 | GET/POST | `/api/alarm/config` | Entry/exit delay, debounce frames, disarm reminder |
-| GET/POST | `/api/security/config` | Anti-masking, loitering, heartbeat, pet immunity |
+| GET/POST | `/api/security/config` | Anti-masking, loitering, heartbeat, pet immunity, `crossmodal_enabled`, `corroboration_enabled`, `corroboration_window_ms` |
+| GET/POST | `/api/security_preset` | Security sensitivity preset: `Empty`, `Home`, or `Paranoid` (also exposed as a Home Assistant select) |
 | POST | `/api/security/mqtt-pin` | Set or clear the MQTT alarm PIN (POST body `pin=1234`; empty value to clear — sent in the request body, not the query string, so the PIN never lands in logs). **Mutually exclusive with Home Assistant alarm control:** HA's `alarm_control_panel` sends bare `ARM`/`DISARM` (no code), which the PIN guard rejects — use a PIN *or* HA control, not both |
 | GET/POST | `/api/schedule` | Scheduled arm/disarm times |
 | GET/POST | `/api/timezone` | Timezone and DST offset |
@@ -942,7 +949,8 @@ A: Yes. Each device gets a unique `device_id` (auto-derived from MAC) so HA disc
 | v5.3.1-poe-wifi | **Event-ring first-night fixes:** `HEALTH_CHANGE` events debounced (`CsiHealthDebounce`, ~10-tick hold) so a boundary-oscillating `packet_rate_unstable` flag no longer floods the 256-slot ring and evicts real motion edges; health transitions now evaluated even when the CSI window is empty, so a starved link is reported instead of logging nothing. Detection/alarm/API behavior unchanged. |
 | v5.4.0-poe-wifi | **Detection-sensitivity release.** Link-relative variance floor replaces the fixed `0.005` that masked real walking peaks on strong WiFi links (`csiModelRelativeFloor()`, `max(1e-4, 3× the link's own learned quiet-mean variance)`); adaptive P95 may now *lower* the effective threshold, not only raise it; hysteresis default 0.7 → 0.5. **Fixes:** ML motion vote gated by the packet-rate floor (`csiMlVoteTrusted()` — no more `ml_probability` saturation on a starved link) and alarm forensic `var_ratio` divided by the effective (not the legacy static) threshold. **Traffic gen** defaults to ICMP (ISP routers throttle UDP:7 as a DDoS heuristic). **Added:** runtime NBVI toggle (`POST /api/csi?nbvi=0\|1`) and a retained planned-maintenance MQTT topic (`security/<device>/maintenance`) so HA can distinguish a planned reboot/OTA from a real offline/tamper event. |
 | v5.4.1-poe-wifi | **Crash-forensics + reliability-first release.** Core-dump read-out API (`GET /api/coredump`), system-log persistence across panic/reset, ML-saturation guard (`ml_saturated`). Full reliability roadmap: model-lifecycle correctness + disarm-PIN hardening (Release A); a single `RuntimeOperationCoordinator` serializing OTA / WiFi scan / calibration / site-learning with unified status (`GET /api/operation/status`, retained `security/<device>/system/operation`, HA sensor, fail-closed `409` on conflict) (Release B); central log/export secret redaction + per-service TLS trust management (write-only CA PEM in NVS via `/api/{ota,mqtt,telegram,discord,webhook}/trust`, all HTTPS fail-closed) (Release C). Nearby-WiFi scan in the CSI dashboard (`POST /api/csi/wifi/scan`). 213/213 native tests, all five shipped builds green. |
-
+| v5.5.0 | **Fusion liveness + HA explainability.** Passive radar↔CSI cross-modal desync health warning; opt-in 8 s low-confidence corroboration gate before the unchanged AlarmFSM; retained alarm reason with radar/CSI/ML attributes; `Empty`/`Home`/`Paranoid` security preset over API, MQTT and HA select. 228/228 native tests, all five shipped builds green. |
+| v5.6.0 | **Placement-awareness + fusion explainability + concurrency/persistence hardening.** CSI sensor-placement health warnings (`rssi_too_strong` near-field saturation, `rssi_too_weak` faint link); a live fusion explainability dashboard panel (per-modality radar/CSI/ML bars + confidence gauge + plain-language reason). Race/atomicity fixes: CSI model-import and continuous-EMA slot writes serialized on the `csi_proc` worker (no torn `_active` / spurious `STORE_FAILED`), and all-or-nothing `/api/config/import` (rollback journal instead of a half-written auth/network state). Multi-day dual-node soak (32 h+ armed on production, zero triggers/crashes); 240/240 native tests, all five shipped builds green. |
 ---
 
 ## Related Projects

@@ -10,6 +10,9 @@
 #include "EventLog.h"
 #include "AlarmFSM.h"   // T6: pure alarm state machine (AlarmState/ArmResult/TickEvent/MotionEvent)
 #include "CsiTamperDetector.h"   // #5: CSI-side tamper (packet collapse / frozen variance)
+#include "CrossModalLiveness.h"  // #1: radar<->CSI cross-modal liveness
+#include "CorroborationWindow.h" // #3: low-confidence corroboration gate
+#include "SecurityPreset.h"      // #12: Empty/Home/Paranoid alarm preset
 
 // Forward declarations
 class MQTTService;
@@ -124,6 +127,29 @@ public:
     bool isFusionPresence() const { return _fusionPresence; }
     float getFusionConfidence() const { return _fusionConfidence; }
     const char* getFusionSourceStr() const;
+    uint8_t getFusionSource() const { return _fusionSource; }   // #8 raw bitmask: radar=1|csi=2|ml=4
+    uint32_t getCrossModalFlags() const { return _crossModalLatched; }
+    bool isCrossModalEnabled() const { return _crossModalEnabled; }
+    void setCrossModalEnabled(bool en) {
+        _crossModalEnabled = en;
+        if (!en) {
+            _crossModal.reset();
+            _crossModalLatched = CROSSMODAL_NONE;
+        }
+    }
+    bool isCorroborationHolding() const { return _corroboration.windowOpen(); }
+    bool isCorroborationEnabled() const { return _corroborationEnabled; }
+    uint32_t getCorroborationWindowMs() const { return _corroboration.windowMs; }
+    void setCorroborationWindowMs(uint32_t windowMs) {
+        _corroboration.windowMs = windowMs;
+        _corroboration.reset();
+    }
+    void setCorroborationEnabled(bool en) {
+        _corroborationEnabled = en;
+        if (!en) {
+            _corroboration.reset();
+        }
+    }
 
     // Configuration
     void setRSSIThreshold(int threshold) { _rssiThreshold = threshold; }
@@ -155,6 +181,8 @@ public:
 
     // Alarm energy threshold (min energy to trigger ARMED→PENDING)
     void setAlarmEnergyThreshold(uint8_t e) { _alarmEnergyThreshold = e; }
+    void applySecurityPreset(SecPreset preset);
+    SecPreset getSecurityPreset() const { return _securityPreset; }
     uint8_t getAlarmEnergyThreshold() const { return _alarmEnergyThreshold; }
     void setAlarmDebounceFrames(uint8_t n) { _alarmDebounceFrames = (n < 1) ? 1 : n; }
     uint8_t getAlarmDebounceFrames() const { return _alarmDebounceFrames; }
@@ -223,6 +251,12 @@ private:
     void _checkCsiTamper();
     CsiTamperDetector _csiTamper;
     bool _csiTamperLatched = false;
+    CrossModalLiveness _crossModal;
+    uint32_t _crossModalLatched = CROSSMODAL_NONE;
+    SecPreset _securityPreset = SecPreset::HOME;
+    bool _crossModalEnabled = true;
+    CorroborationWindow _corroboration;
+    bool _corroborationEnabled = false;  // Opt-in: changes alarm timing.
 
     SemaphoreHandle_t _mutex = nullptr;
     NotificationService* _notifService = nullptr;

@@ -98,6 +98,21 @@ const char index_html[] PROGMEM = R"rawliteral(
         .row-input span { margin-bottom: 2px; }
         input[type=text], input[type=number], select { padding: 10px; font-size: 1rem; }
     }
+    /* #8 Fusion explainability panel */
+    .fbars { display:flex; gap:14px; justify-content:center; align-items:flex-end; margin:8px 0 10px; }
+    .fbar { display:flex; flex-direction:column; align-items:center; gap:4px; width:48px; }
+    .fbar-track { width:24px; height:70px; background:var(--sec); border-radius:5px; display:flex; align-items:flex-end; overflow:hidden; }
+    .fbar-fill { width:100%; height:0%; background:#555; border-radius:5px; transition:height .3s, background .3s; }
+    .fbar-fill.on { background:var(--accent); }
+    .fbar span { font-size:.72rem; color:#aaa; }
+    .fbar.na .fbar-track { opacity:.35; }
+    .fbar.na .fbar-fill { height:100%; background:repeating-linear-gradient(45deg,#444,#444 4px,#333 4px,#333 8px); }
+    .fbar.na span::after { content:" N/A"; color:#777; }
+    .fgauge { display:flex; align-items:center; gap:8px; margin:6px 0; }
+    .fgauge-track { flex:1; height:10px; background:var(--sec); border-radius:5px; overflow:hidden; }
+    .fgauge-fill { height:100%; width:0%; background:linear-gradient(90deg,var(--warn),#e0c000,var(--accent)); transition:width .3s; }
+    .fgauge span { font-size:.85rem; font-weight:bold; color:var(--text); min-width:40px; text-align:right; }
+    .freason { font-size:.8rem; color:#bbb; text-align:center; margin-top:6px; min-height:1.1em; }
   </style>
   <script>
   // i18n — CZ/EN language support
@@ -245,6 +260,7 @@ const char index_html[] PROGMEM = R"rawliteral(
       ml_threshold_lbl: "ML práh (enter):",
       ml_help: "<b>MLP klasifikátor:</b> 17 featur (turbulence — chaotičnost signálu, fáze, DSER — poměr Dopplerovy spektrální energie, PLCR — korelace úrovně fáze) → 18→9→1 sigmoid. Trénováno na espectre datasetu (F1 = 0.852). Enter ≥ threshold, exit = threshold × 0.70, N/M smoothing 4/5 z 6 oken. Výstup jde do fusion jako 3. signál.",
       detection_src: "Zdroj detekce", fusion_enabled: "Fusion povoleno",
+      fusion_title: "Fúze — kdo vidí pohyb", radar_lbl: "Radar",
       mw_radar_section: "MW radar", csi_section: "WiFi CSI", csi_offline: "CSI offline", csi_nodata: "Bez dat", radar_disconnected: "Radar odpojen",
       radar_show: "▸ Radar nepřipojen — zobrazit", radar_hide: "▾ Skrýt radar", csi_metrics_title: "CSI METRIKY (expert)", variance_window: "Rozptyl signálu (variance, okno)", src_ml: "Strojové učení",
       enabled: "Povoleno",
@@ -431,6 +447,7 @@ const char index_html[] PROGMEM = R"rawliteral(
       ml_threshold_lbl: "ML threshold (enter):",
       ml_help: "<b>MLP classifier:</b> 17 features (turbulence — signal chaoticness, phase, DSER — Doppler Spectral Energy Ratio, PLCR — Phase-Level Correlation Ratio) → 18→9→1 sigmoid. Trained on espectre dataset (F1 = 0.852). Enter ≥ threshold, exit = threshold × 0.70, N/M smoothing 4/5 of 6 windows. Output is fed into fusion as 3rd signal.",
       detection_src: "Detection source", fusion_enabled: "Fusion enabled",
+      fusion_title: "Fusion — who sees motion", radar_lbl: "Radar",
       mw_radar_section: "MW radar", csi_section: "WiFi CSI", csi_offline: "CSI offline", csi_nodata: "No data", radar_disconnected: "Radar disconnected",
       radar_show: "▸ Radar not connected — show", radar_hide: "▾ Hide radar", csi_metrics_title: "CSI METRICS (expert)", variance_window: "Signal variance (window)", src_ml: "Machine learning",
       enabled: "Enabled",
@@ -544,6 +561,18 @@ const char index_html[] PROGMEM = R"rawliteral(
                 <div id="csi_main_link" class="unit" style="margin-top:2px">—</div>
             </div>
         </div>
+    </div>
+
+    <!-- FUSION EXPLAINABILITY (#8) -->
+    <div class="card" id="fusion_panel">
+        <div class="section-title" data-nocollapse data-i18n="fusion_title">Fúze — kdo vidí pohyb</div>
+        <div class="fbars">
+            <div class="fbar" id="fbar_radar"><div class="fbar-track"><div class="fbar-fill" id="fb_radar"></div></div><span data-i18n="radar_lbl">Radar</span></div>
+            <div class="fbar"><div class="fbar-track"><div class="fbar-fill" id="fb_csi"></div></div><span>CSI</span></div>
+            <div class="fbar"><div class="fbar-track"><div class="fbar-fill" id="fb_ml"></div></div><span>ML</span></div>
+        </div>
+        <div class="fgauge"><div class="fgauge-track"><div id="fg_fill" class="fgauge-fill"></div></div><span id="fg_val">–</span></div>
+        <div class="freason" id="fusion_reason">–</div>
     </div>
 
     <!-- HEALTH & STATS -->
@@ -1225,6 +1254,7 @@ function connectSSE() {
         if(d.alarm_state) { alarmArmed = d.armed; updateAlarmUI(d.alarm_state); }
         if(d.gate_move && !$('tab2').classList.contains('hidden')) updateGatesUI(d);
         if(d.csi) { renderCsiMainPanel(d.csi); updateCSIUI(d.csi); }
+        if(d.fusion) renderFusionPanel(d.fusion);
     });
 
     evtSource.onerror = () => {
@@ -1613,6 +1643,27 @@ function updateMLUI(d) {
 // at a glance that CSI is alive (and whether it detects). Three states:
 // offline (no WiFi assoc / no packets), KLID (alive, idle), POHYB (detecting).
 let csiLastDataMs = 0;   // last time we saw CSI packets (pps>0), for stale-data detection
+function renderFusionPanel(f) {
+    if (!f) return;
+    const clamp = v => Math.max(0, Math.min(100, v || 0));
+    const setBar = (id, lvl, on) => {
+        const el = $(id); if (!el) return;
+        el.style.height = clamp(lvl) + '%';
+        el.className = 'fbar-fill' + (on ? ' on' : '');
+    };
+    // radar N/A on CSI-only (radar-less) nodes
+    const rbar = $('fbar_radar');
+    const radarNa = (f.radar_present === false);
+    if (rbar) rbar.classList.toggle('na', radarNa);
+    setBar('fb_radar', radarNa ? 0 : f.radar_lvl, f.radar);
+    setBar('fb_csi', f.csi_lvl, f.csi);
+    setBar('fb_ml', f.ml_lvl, f.ml);
+    const pct = Math.round((f.confidence || 0) * 100);
+    if ($('fg_fill')) $('fg_fill').style.width = pct + '%';
+    if ($('fg_val')) $('fg_val').innerText = pct + '%';
+    if ($('fusion_reason')) $('fusion_reason').innerText = f.reason || '–';
+}
+
 function renderCsiMainPanel(csi) {
     const st = $('csi_main_state'), link = $('csi_main_link');
     if (!st || !link) return;

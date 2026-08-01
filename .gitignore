@@ -40,6 +40,7 @@ bench_*.jsonl
 
 # Internal planning/audit artifacts — keep local, never public
 docs/superpowers/
+docs/archiv/
 docs/BUG_AUDIT_*.md
 docs/ROADMAP_REVIEW_*.md
 docs/PROJECT_MEMORY*.md

@@ -1,6 +1,7 @@
 #ifndef LITE_BUILD
 #include "WebRoutes.h"
 #include <esp_task_wdt.h>
+#include <vector>
 #include "ConfigManager.h"
 #include <ETH.h>
 
@@ -362,6 +363,7 @@ void setupTelemetryRoutes() {
         doc["health_score"] = _deps.radar->getHealthScore();
         doc["radar_monitoring_disabled"] = _deps.securityMonitor->isRadarMonitoringDisabled();
         doc["csi_data_ok"] = !g_csiDataStarved.load();
+        doc["crossmodal_desync"] = (_deps.securityMonitor->getCrossModalFlags() != 0);
         doc["coredump_present"] = coredumpPresent();
         doc["free_heap"] = ESP.getFreeHeap();
         doc["min_heap"] = ESP.getMinFreeHeap();
@@ -819,6 +821,16 @@ static bool validateConfigImport(const JsonDocument& doc, const char*& badField)
     return true;
 }
 
+// #5 (BA-12): key-by-key NVS import with all-or-nothing rollback. Each key this
+// import actually changes is journalled with its prior state BEFORE the write
+// (the read is side-effect-free, so the success path stays byte-identical to the
+// old writer). On any mid-sequence write/verify failure the caller invokes
+// rollback(), which restores every journalled key in reverse order — removing
+// keys that did not exist before the import. This kills the durable half-state
+// that could otherwise persist e.g. auth_pass without auth_user and lock the
+// device out on the next reboot. Best-effort: a restore write can itself fail
+// under a genuinely full NVS (the caller logs it); full atomicity would need a
+// versioned CRC blob + verify-then-switch, deferred as a larger rework.
 class ConfigImportWriter {
 public:
     explicit ConfigImportWriter(Preferences* prefs) : _prefs(prefs) {}
@@ -827,6 +839,7 @@ public:
         if (!ready(key)) return false;
         const String before = _prefs->getString(key, "\x01");
         if (before == value) return true;
+        journalString(key);
         const size_t written = _prefs->putString(key, value);
         if ((value.length() > 0 && written != value.length()) ||
             _prefs->getString(key, "\x01") != value) return fail(key);
@@ -834,41 +847,76 @@ public:
     }
     bool putBool(const char* key, bool value) {
         if (!ready(key)) return false;
+        journalBool(key);
         const size_t written = _prefs->putBool(key, value);
         return putScalar(key, written, sizeof(uint8_t), _prefs->getBool(key, !value) == value);
     }
     bool putUShort(const char* key, uint16_t value) {
         if (!ready(key)) return false;
+        journalUShort(key);
         const size_t written = _prefs->putUShort(key, value);
         return putScalar(key, written, sizeof(value),
                          _prefs->getUShort(key, static_cast<uint16_t>(value ^ 0xFFFFu)) == value);
     }
     bool putUInt(const char* key, uint32_t value) {
         if (!ready(key)) return false;
+        journalUInt(key);
         const size_t written = _prefs->putUInt(key, value);
         return putScalar(key, written, sizeof(value),
                          _prefs->getUInt(key, value ^ 0xFFFFFFFFu) == value);
     }
     bool putULong(const char* key, uint32_t value) {
         if (!ready(key)) return false;
+        journalULong(key);
         const size_t written = _prefs->putULong(key, value);
         return putScalar(key, written, sizeof(value),
                          _prefs->getULong(key, value ^ 0xFFFFFFFFu) == value);
     }
     bool putInt(const char* key, int32_t value) {
         if (!ready(key)) return false;
+        journalInt(key);
         const size_t written = _prefs->putInt(key, value);
         return putScalar(key, written, sizeof(value),
                          _prefs->getInt(key, value ^ INT32_MIN) == value);
     }
     bool putFloat(const char* key, float value) {
         if (!ready(key)) return false;
+        journalFloat(key);
         const size_t written = _prefs->putFloat(key, value);
         return putScalar(key, written, sizeof(value), _prefs->getFloat(key, NAN) == value);
     }
     const char* failedKey() const { return _failedKey; }
 
+    // Restore every key changed by this import to its pre-import state. Reverse
+    // order so a key touched twice ends on its oldest value. Best-effort.
+    void rollback() {
+        if (_prefs == nullptr) return;
+        for (auto it = _journal.rbegin(); it != _journal.rend(); ++it) {
+            const Rec& r = *it;
+            if (!r.existed) { _prefs->remove(r.key); continue; }
+            switch (r.type) {
+                case TStr:   _prefs->putString(r.key, r.s);   break;
+                case TBool:  _prefs->putBool(r.key, r.v.b);   break;
+                case TU16:   _prefs->putUShort(r.key, r.v.u16); break;
+                case TUInt:  _prefs->putUInt(r.key, r.v.u32);  break;
+                case TULong: _prefs->putULong(r.key, r.v.u32); break;
+                case TInt:   _prefs->putInt(r.key, r.v.i32);   break;
+                case TFloat: _prefs->putFloat(r.key, r.v.f);   break;
+            }
+        }
+        _journal.clear();
+    }
+
 private:
+    enum RecType : uint8_t { TStr, TBool, TU16, TUInt, TULong, TInt, TFloat };
+    struct Rec {
+        const char* key;
+        RecType type;
+        bool existed;
+        String s;                                        // prior value when type==TStr
+        union { bool b; uint16_t u16; uint32_t u32; int32_t i32; float f; } v;
+    };
+
     bool ready(const char* key) {
         if (_failedKey != nullptr) return false;
         if (_prefs == nullptr) return fail(key);
@@ -880,8 +928,47 @@ private:
         return true;
     }
     bool fail(const char* key) { _failedKey = key; return false; }
+
+    // Snapshot the key's prior state before it is overwritten. Reads only.
+    void journalString(const char* key) {
+        Rec r; r.key = key; r.type = TStr; r.existed = _prefs->isKey(key);
+        if (r.existed) r.s = _prefs->getString(key, "");
+        _journal.push_back(std::move(r));
+    }
+    void journalBool(const char* key) {
+        Rec r; r.key = key; r.type = TBool; r.existed = _prefs->isKey(key);
+        r.v.b = r.existed ? _prefs->getBool(key, false) : false;
+        _journal.push_back(std::move(r));
+    }
+    void journalUShort(const char* key) {
+        Rec r; r.key = key; r.type = TU16; r.existed = _prefs->isKey(key);
+        r.v.u16 = r.existed ? _prefs->getUShort(key, 0) : 0;
+        _journal.push_back(std::move(r));
+    }
+    void journalUInt(const char* key) {
+        Rec r; r.key = key; r.type = TUInt; r.existed = _prefs->isKey(key);
+        r.v.u32 = r.existed ? _prefs->getUInt(key, 0) : 0;
+        _journal.push_back(std::move(r));
+    }
+    void journalULong(const char* key) {
+        Rec r; r.key = key; r.type = TULong; r.existed = _prefs->isKey(key);
+        r.v.u32 = r.existed ? _prefs->getULong(key, 0) : 0;
+        _journal.push_back(std::move(r));
+    }
+    void journalInt(const char* key) {
+        Rec r; r.key = key; r.type = TInt; r.existed = _prefs->isKey(key);
+        r.v.i32 = r.existed ? _prefs->getInt(key, 0) : 0;
+        _journal.push_back(std::move(r));
+    }
+    void journalFloat(const char* key) {
+        Rec r; r.key = key; r.type = TFloat; r.existed = _prefs->isKey(key);
+        r.v.f = r.existed ? _prefs->getFloat(key, 0.0f) : 0.0f;
+        _journal.push_back(std::move(r));
+    }
+
     Preferences* _prefs;
     const char* _failedKey = nullptr;
+    std::vector<Rec> _journal;
 };
 
 void setupConfigRoutes() {
@@ -1073,6 +1160,35 @@ void setupConfigRoutes() {
         } else {
             request->send(400, "text/plain", "Missing name");
         }
+    });
+
+    _deps.server->on("/api/security_preset", HTTP_GET, [](AsyncWebServerRequest *request) {
+        if (!checkAuth(request)) return;
+        JsonDocument doc;
+        doc["preset"] = secPresetName(_deps.securityMonitor->getSecurityPreset());
+        sendJsonBuffered(request, doc);
+    });
+
+    _deps.server->on("/api/security_preset", HTTP_POST, [](AsyncWebServerRequest *request) {
+        if (!checkAuth(request)) return;
+        if (!request->hasParam("name")) {
+            request->send(400, "text/plain", "Missing name");
+            return;
+        }
+        SecPreset preset;
+        String name = request->getParam("name")->value();
+        if (!parseSecPreset(name.c_str(), preset)) {
+            request->send(400, "text/plain", "Unknown security preset");
+            return;
+        }
+        _deps.securityMonitor->applySecurityPreset(preset);
+        _deps.preferences->putUInt("sec_preset", (uint32_t)preset);
+        if (_deps.mqttService->connected()) {
+            _deps.mqttService->publishPresetState(secPresetName(preset));
+        }
+        JsonDocument doc;
+        doc["preset"] = secPresetName(preset);
+        sendJsonBuffered(request, doc);
     });
 
     // --- Telegram Config ---
@@ -1460,6 +1576,10 @@ void setupConfigRoutes() {
                     const char* failed = writer.failedKey() ? writer.failedKey() : "unknown";
                     DBG("CONFIG", "Import NVS write/verify failed at key=%s", failed);
                     if (_deps.systemLog) _deps.systemLog->error(String("Config import NVS failure at key=") + failed);
+                    // #5: undo the keys already written so a partial import never
+                    // leaves a durable half-state (e.g. auth_pass without auth_user).
+                    writer.rollback();
+                    if (_deps.systemLog) _deps.systemLog->warn("Config import rolled back to pre-import state");
                     free(slab);
                     request->_tempObject = nullptr;
                     request->send(500, "text/plain", String("Config write failed at field: ") + failed);
@@ -1514,6 +1634,9 @@ void setupSecurityRoutes() {
         doc["loiter_alert"] = _deps.securityMonitor->isLoiterAlertEnabled();
         doc["heartbeat"] = _deps.securityMonitor->getHeartbeatInterval() / INTERVAL_TELEMETRY_IDLE_MS;
         doc["pet_immunity"] = _deps.radar->getMinMoveEnergy();
+        doc["crossmodal_enabled"] = _deps.securityMonitor->isCrossModalEnabled();
+        doc["corroboration_enabled"] = _deps.securityMonitor->isCorroborationEnabled();
+        doc["corroboration_window_ms"] = _deps.securityMonitor->getCorroborationWindowMs();
         sendJsonBuffered(request, doc);
     });
 
@@ -1551,6 +1674,24 @@ void setupSecurityRoutes() {
                  _deps.radar->setMinMoveEnergy((uint8_t)val);
                  _deps.securityMonitor->setPetImmunity((uint8_t)val);
                  _deps.preferences->putUInt("sec_pet", (uint8_t)val);
+            }
+        }
+        if (request->hasParam("crossmodal_enabled")) {
+            bool en = request->getParam("crossmodal_enabled")->value() == "1";
+            _deps.securityMonitor->setCrossModalEnabled(en);
+            _deps.preferences->putBool("sec_xmodal", en);
+        }
+        if (request->hasParam("corroboration_enabled")) {
+            bool en = request->getParam("corroboration_enabled")->value() == "1";
+            _deps.securityMonitor->setCorroborationEnabled(en);
+            _deps.preferences->putBool("sec_corrob", en);
+        }
+        if (request->hasParam("corroboration_window_ms")) {
+            uint32_t windowMs =
+                (uint32_t)request->getParam("corroboration_window_ms")->value().toInt();
+            if (windowMs > 0) {
+                _deps.securityMonitor->setCorroborationWindowMs(windowMs);
+                _deps.preferences->putULong("sec_corrob_ms", windowMs);
             }
         }
         request->send(200, "text/plain", "Security config saved");
@@ -3153,6 +3294,22 @@ static int csiModelRequestHttp(CSIService* service, CsiModelCommand command,
     }
     return csiModelOpHttp(result, msg);
 }
+
+// #3 (48h audit): import variant — routed through the command slot so the
+// candidate write serializes with APPLY on csi_proc (no async_tcp _cand race).
+static int csiModelImportHttp(CSIService* service, const CsiSiteModel& m, const char*& msg) {
+    CsiModelOp result = CsiModelOp::STORE_FAILED;
+    CsiModelRequestStatus status = service->requestModelImport(m, 2000, result);
+    if (status == CsiModelRequestStatus::BUSY) {
+        msg = "Another model operation is in progress";
+        return 409;
+    }
+    if (status == CsiModelRequestStatus::TIMED_OUT) {
+        msg = "Model operation timed out";
+        return 503;
+    }
+    return csiModelOpHttp(result, msg);
+}
 // Serialize one model slot into a JSON object (only meaningful fields when valid).
 static void csiSlotToJson(JsonObject o, const CsiSiteModel& m) {
     o["valid"] = m.valid;
@@ -3524,7 +3681,7 @@ void setupCSIRoutes() {
         // model is re-associated with the local AP on apply.
 
         const char* msg = "";
-        int code = csiModelOpHttp(_deps.csiService->importCandidateModel(m), msg);
+        int code = csiModelImportHttp(_deps.csiService, m, msg);
         request->send(code, "text/plain", msg);
     }, NULL, [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
         if (!index && !checkAuth(request)) return;
@@ -3614,6 +3771,9 @@ void setupCSIRoutes() {
         in.mqttConnected        = (_deps.mqttService != nullptr) && _deps.mqttService->connected();
         in.mlSaturated          = csi->isMlSaturated();
         in.clockValid           = clockValid;
+        in.rssiDbm              = csi->getWifiRSSI();
+        in.rssiHotDbm           = CSI_RSSI_HOT_DBM;
+        in.rssiWeakDbm          = CSI_RSSI_WEAK_DBM;
 
         uint16_t flags = csiHealthReasons(in);
 

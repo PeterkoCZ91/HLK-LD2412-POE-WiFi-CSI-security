@@ -2,6 +2,7 @@
 #include "services/MQTTService.h"
 #include "services/ml_features.h"
 #include "services/ml_weights.h"
+#include "constants.h"   // CSI_RSSI_HOT_DBM / CSI_RSSI_WEAK_DBM (placement thresholds)
 #include "debug.h"
 #include <ETH.h>
 #include <WiFi.h>
@@ -77,6 +78,7 @@ void CSIService::_csiProcTask(void* arg) {
     CsiFrame f;
     for (;;) {
         self->_processPendingModelOperation();
+        self->_processPendingEmaPersist();   // #6: EMA drift persisted on this task
         if (xQueueReceive(self->_csiFrameQueue, &f, pdMS_TO_TICKS(20)) == pdTRUE) {
             self->_processCSI(f.buf, f.len);
             self->_processPendingModelOperation();
@@ -1008,6 +1010,9 @@ uint16_t CSIService::_computeCsiHealthFlags() const {
     in.mqttExpected       = false;   // external — excluded from the CSI-intrinsic subset
     in.mqttConnected      = true;
     in.mlSaturated        = _mlSatGuard.saturated();
+    in.rssiDbm            = getWifiRSSI();
+    in.rssiHotDbm         = CSI_RSSI_HOT_DBM;
+    in.rssiWeakDbm        = CSI_RSSI_WEAK_DBM;
     return csiHealthReasons(in);
 }
 
@@ -1100,12 +1105,30 @@ void CSIService::_continuousLearnRefresh() {
 
     unsigned long now = millis();
     if (now - _lastLearnRefreshSaveMs > 600000UL) {  // 10 min
-        // EMA drifts ONLY the active slot; candidate/previous stay immutable.
-        // The slot is the source of truth now — no legacy csi_lrn_* write (M-4).
-        _modelMgr.updateActiveEma(_learnedThreshold, _learnedMeanVar, _learnedStdVar);
-        if (_prefs) _prefs->putFloat("csi_thr", _learnedThreshold);  // config-path sync
-        _lastLearnRefreshSaveMs = now;
+        // #6: don't touch the ACTIVE slot from the main loop — that races
+        // apply/rollback/import on csi_proc (torn _active read / spurious
+        // read-back-verify mismatch -> STORE_FAILED). Stash the drifted values
+        // and let _processPendingEmaPersist() write them on csi_proc, serialized
+        // with the model-command worker. EMA drifts ONLY the active slot;
+        // candidate/previous stay immutable (source of truth = the slot, M-4).
+        if (!_emaPersistPending.load(std::memory_order_acquire)) {
+            _emaPersistThr  = _learnedThreshold;
+            _emaPersistMean = _learnedMeanVar;
+            _emaPersistStd  = _learnedStdVar;
+            _emaPersistPending.store(true, std::memory_order_release);
+            _lastLearnRefreshSaveMs = now;
+        }
     }
+}
+
+// #6: consume the main-loop EMA stash on csi_proc, so updateActiveEma()'s ACTIVE
+// RAM + NVS write is serialized with applyCandidate()/rollback()/import on this
+// same task — never a cross-task write/write on _active.
+void CSIService::_processPendingEmaPersist() {
+    if (!_emaPersistPending.load(std::memory_order_acquire)) return;
+    _modelMgr.updateActiveEma(_emaPersistThr, _emaPersistMean, _emaPersistStd);
+    if (_prefs) _prefs->putFloat("csi_thr", _emaPersistThr);  // config-path sync
+    _emaPersistPending.store(false, std::memory_order_release);
 }
 
 // ============================================================================
@@ -2389,6 +2412,7 @@ CsiModelOp CSIService::_executeModelCommand(CsiModelCommand command, bool force)
         case CsiModelCommand::ROLLBACK:        return rollbackSiteModel();
         case CsiModelCommand::CLEAR_CANDIDATE: return clearCandidateModel();
         case CsiModelCommand::CLEAR_ALL:       return clearLearnedSiteModel();
+        case CsiModelCommand::IMPORT:          return importCandidateModel(_modelCommandSlot.payload());
     }
     return CsiModelOp::STORE_FAILED;
 }
@@ -2412,6 +2436,29 @@ CsiModelRequestStatus CSIService::requestModelOperation(CsiModelCommand command,
         return CsiModelRequestStatus::BUSY;
     }
 
+    uint32_t started = millis();
+    do {
+        if (_modelCommandSlot.poll(result)) return CsiModelRequestStatus::COMPLETED;
+        delay(1);
+    } while ((uint32_t)(millis() - started) < timeoutMs);
+
+    _modelCommandSlot.abandon();
+    if (_modelCommandSlot.poll(result)) return CsiModelRequestStatus::COMPLETED;
+    return CsiModelRequestStatus::TIMED_OUT;
+}
+
+// #3 (48h audit): route a web import through the command slot so the _cand write
+// (finalizeCandidate) runs on csi_proc, serialized with APPLY — no async_tcp race.
+CsiModelRequestStatus CSIService::requestModelImport(const CsiSiteModel& src,
+                                                     uint32_t timeoutMs,
+                                                     CsiModelOp& result) {
+    if (!_active || _csiProcHandle == nullptr) {
+        result = importCandidateModel(src);   // no worker running → safe to run inline
+        return CsiModelRequestStatus::COMPLETED;
+    }
+    if (!_modelCommandSlot.submit(CsiModelCommand::IMPORT, false, src)) {
+        return CsiModelRequestStatus::BUSY;
+    }
     uint32_t started = millis();
     do {
         if (_modelCommandSlot.poll(result)) return CsiModelRequestStatus::COMPLETED;

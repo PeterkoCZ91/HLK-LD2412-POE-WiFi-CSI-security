@@ -22,10 +22,12 @@ enum CsiHealthFlag : uint16_t {
     CSI_HEALTH_MQTT_DISCONNECTED     = 1u << 8,  // MQTT enabled but not connected (reporting only)
     CSI_HEALTH_CLOCK_INVALID         = 1u << 9,  // wall clock not synced — timestamps/staleness unreliable
     CSI_HEALTH_ML_SATURATED          = 1u << 10, // ml_motion duty-cycle pinned true — vote untrusted (foreign-site model)
+    CSI_HEALTH_RSSI_TOO_STRONG       = 1u << 11, // WiFi too strong — sensor too close to AP (near-field, ML saturates)
+    CSI_HEALTH_RSSI_TOO_WEAK         = 1u << 12, // WiFi too weak — sensor too far from AP / low SNR
 };
 
 // Highest reason bit index in use — bump when adding flags.
-static constexpr uint8_t CSI_HEALTH_FLAG_COUNT = 11;
+static constexpr uint8_t CSI_HEALTH_FLAG_COUNT = 13;
 
 // Snapshot of everything needed to judge sensor health. Filled by the caller
 // from CSIService / LD2412 / MQTT state; the classifier stays pure.
@@ -44,6 +46,12 @@ struct CsiHealthInputs {
     bool  mqttConnected       = false;
     bool  clockValid          = false;
     bool  mlSaturated         = false;  // CsiMlSaturationGuard verdict
+    // Placement: CSI needs a moderate signal (sweet spot ~ -55..-70 dBm). Too
+    // close to the AP (near-field, strong direct path) makes the shape features
+    // saturate the ML; too far starves SNR. rssiDbm == 0 → unknown, skip.
+    int   rssiDbm             = 0;
+    int   rssiHotDbm          = -55;    // stronger (greater) than this → too close (near-field, ML saturates)
+    int   rssiWeakDbm         = -70;    // weaker (less) than this → too far / low SNR
 };
 
 // Derive the set of active health-reason flags. No-HT-LTF is only meaningful
@@ -61,6 +69,8 @@ inline uint16_t csiHealthReasons(const CsiHealthInputs& in) {
     if (in.mqttExpected && !in.mqttConnected)       f |= CSI_HEALTH_MQTT_DISCONNECTED;
     if (!in.clockValid)                             f |= CSI_HEALTH_CLOCK_INVALID;
     if (in.mlSaturated)                             f |= CSI_HEALTH_ML_SATURATED;
+    if (in.rssiDbm != 0 && in.rssiDbm > in.rssiHotDbm)   f |= CSI_HEALTH_RSSI_TOO_STRONG;
+    if (in.rssiDbm != 0 && in.rssiDbm < in.rssiWeakDbm)  f |= CSI_HEALTH_RSSI_TOO_WEAK;
     return f;
 }
 
@@ -79,6 +89,8 @@ inline uint8_t csiHealthPenalty(CsiHealthFlag flag) {
         case CSI_HEALTH_MQTT_DISCONNECTED:     return 10;
         case CSI_HEALTH_CLOCK_INVALID:         return 5;
         case CSI_HEALTH_ML_SATURATED:          return 10;
+        case CSI_HEALTH_RSSI_TOO_STRONG:       return 15;
+        case CSI_HEALTH_RSSI_TOO_WEAK:         return 10;
         default:                               return 0;
     }
 }
@@ -108,6 +120,8 @@ inline const char* csiHealthFlagStr(CsiHealthFlag flag) {
         case CSI_HEALTH_MQTT_DISCONNECTED:     return "mqtt_disconnected";
         case CSI_HEALTH_CLOCK_INVALID:         return "clock_invalid";
         case CSI_HEALTH_ML_SATURATED:          return "ml_saturated";
+        case CSI_HEALTH_RSSI_TOO_STRONG:       return "rssi_too_strong";
+        case CSI_HEALTH_RSSI_TOO_WEAK:         return "rssi_too_weak";
         default:                               return "unknown";
     }
 }

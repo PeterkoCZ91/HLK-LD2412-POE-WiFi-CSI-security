@@ -93,8 +93,8 @@ constexpr unsigned long TIMEOUT_CSI_DATA_RECOVER_MS  = 10000;     // sustained d
 constexpr unsigned long INTERVAL_RSSI_BASELINE_MS    = 30000;     // RSSI baseline establishment (30s)
 
 // CSI WiFi RSSI thresholds (for /api/health warning surface)
-constexpr int CSI_RSSI_WEAK_DBM                      = -70;       // Below this: low SNR, CSI degraded
-constexpr int CSI_RSSI_HOT_DBM                       = -40;       // Above this: too close, may saturate
+constexpr int CSI_RSSI_WEAK_DBM                      = -70;       // Below this: low SNR, CSI degraded (sensor too far)
+constexpr int CSI_RSSI_HOT_DBM                       = -55;       // Above this: too close to AP — near-field, ML saturates (confirmed live: -52 @ ~40cm saturates). CSI sweet spot ~ -55..-70.
 
 // =============================================================================
 // Time Conversion

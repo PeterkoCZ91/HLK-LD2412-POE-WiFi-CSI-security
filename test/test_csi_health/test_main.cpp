@@ -17,6 +17,7 @@ static CsiHealthInputs healthy() {
     in.radarAvailable = true;
     in.mqttExpected = true; in.mqttConnected = true;
     in.clockValid = true;
+    in.rssiDbm = -60;  // CSI sweet spot (thresholds default -50 hot / -70 weak)
     return in;
 }
 
@@ -101,6 +102,48 @@ void test_flag_strings() {
     TEST_ASSERT_EQUAL_STRING("no_ht_ltf", csiHealthFlagStr(CSI_HEALTH_NO_HT_LTF));
     TEST_ASSERT_EQUAL_STRING("learning_contaminated", csiHealthFlagStr(CSI_HEALTH_LEARNING_CONTAMINATED));
     TEST_ASSERT_EQUAL_STRING("clock_invalid", csiHealthFlagStr(CSI_HEALTH_CLOCK_INVALID));
+    TEST_ASSERT_EQUAL_STRING("rssi_too_strong", csiHealthFlagStr(CSI_HEALTH_RSSI_TOO_STRONG));
+    TEST_ASSERT_EQUAL_STRING("rssi_too_weak", csiHealthFlagStr(CSI_HEALTH_RSSI_TOO_WEAK));
+}
+
+// ---- placement: RSSI too strong (too close to AP) / too weak (too far) ------
+void test_rssi_too_strong_when_close_to_ap() {
+    // near-field geometry: ~40 cm from the AP, RSSI -44 -> ML saturates
+    CsiHealthInputs in = healthy(); in.rssiDbm = -44;
+    uint16_t f = csiHealthReasons(in);
+    TEST_ASSERT_TRUE(f & CSI_HEALTH_RSSI_TOO_STRONG);
+    TEST_ASSERT_FALSE(f & CSI_HEALTH_RSSI_TOO_WEAK);
+    TEST_ASSERT_EQUAL_UINT8(85, csiHealthScore(f));  // -15
+}
+
+void test_rssi_too_strong_at_minus_52() {
+    // live-confirmed at ~40 cm from the AP: -52 dBm saturates the ML —
+    // must flag with the -55 hot threshold.
+    CsiHealthInputs in = healthy(); in.rssiDbm = -52;
+    TEST_ASSERT_TRUE(csiHealthReasons(in) & CSI_HEALTH_RSSI_TOO_STRONG);
+}
+
+void test_rssi_too_weak_when_far_from_ap() {
+    // far / weak link, RSSI -85 -> low SNR
+    CsiHealthInputs in = healthy(); in.rssiDbm = -85;
+    uint16_t f = csiHealthReasons(in);
+    TEST_ASSERT_TRUE(f & CSI_HEALTH_RSSI_TOO_WEAK);
+    TEST_ASSERT_FALSE(f & CSI_HEALTH_RSSI_TOO_STRONG);
+    TEST_ASSERT_EQUAL_UINT8(90, csiHealthScore(f));  // -10
+}
+
+void test_rssi_sweet_spot_no_flag() {
+    for (int r = -55; r >= -70; r -= 5) {   // -55, -60, -65, -70 (boundary inclusive-weak)
+        CsiHealthInputs in = healthy(); in.rssiDbm = r;
+        uint16_t f = csiHealthReasons(in);
+        TEST_ASSERT_FALSE(f & (CSI_HEALTH_RSSI_TOO_STRONG | CSI_HEALTH_RSSI_TOO_WEAK));
+    }
+}
+
+void test_rssi_unknown_skips_placement() {
+    CsiHealthInputs in = healthy(); in.rssiDbm = 0;  // 0 == not available
+    uint16_t f = csiHealthReasons(in);
+    TEST_ASSERT_FALSE(f & (CSI_HEALTH_RSSI_TOO_STRONG | CSI_HEALTH_RSSI_TOO_WEAK));
 }
 
 // ---- debounce (v5.3.1: oscillating flags must not spam the event ring) -----
@@ -180,6 +223,11 @@ int main(int, char**) {
     RUN_TEST(test_score_partial_deduction);
     RUN_TEST(test_ml_saturated_flag_and_score);
     RUN_TEST(test_flag_strings);
+    RUN_TEST(test_rssi_too_strong_when_close_to_ap);
+    RUN_TEST(test_rssi_too_strong_at_minus_52);
+    RUN_TEST(test_rssi_too_weak_when_far_from_ap);
+    RUN_TEST(test_rssi_sweet_spot_no_flag);
+    RUN_TEST(test_rssi_unknown_skips_placement);
     RUN_TEST(test_debounce_stable_state_logs_once);
     RUN_TEST(test_debounce_oscillation_never_logs);
     RUN_TEST(test_debounce_genuine_transition_logs_after_stability);

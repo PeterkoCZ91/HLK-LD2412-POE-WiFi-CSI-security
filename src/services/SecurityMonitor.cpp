@@ -113,6 +113,16 @@ void SecurityMonitor::setCsiDataOk(bool ok) {
 #endif
 }
 
+void SecurityMonitor::applySecurityPreset(SecPreset preset) {
+    SecPresetParams params = securityPresetParams(preset);
+    setAlarmEnergyThreshold(params.alarmEnergyThreshold);
+    setEntryDelay(params.entryDelayMs);
+    setPetImmunity(params.petImmunity);
+    setCorroborationEnabled(params.corroborationEnabled);
+    _securityPreset = preset;
+    DBG("SecMon", "Security preset applied: %s", secPresetName(preset));
+}
+
 void SecurityMonitor::begin(NotificationService* notifService, MQTTService* mqttService, TelegramService* telegramService, EventLog* eventLog, Preferences* prefs, const char* deviceLabel) {
     _notifService = notifService;
     _mqttService = mqttService;
@@ -823,8 +833,28 @@ void SecurityMonitor::processRadarData(uint16_t distance, uint8_t move_energy, u
 
     // FSM owns debounce (N consecutive qualifying frames) + the ARMED→PENDING/TRIGGERED
     // transition. We hang the existing side-effects (event, alert, siren) off the result.
+    bool fsmQualifies = armedQualifies;
+    if (_corroborationEnabled && armedQualifies) {
+        CorrInputs inputs;
+        inputs.qualifies = true;
+        inputs.confidence = _fusionConfidence;
+        inputs.fusionSource = _fusionSource;
+        inputs.nowMs = (uint32_t)now;
+        CorrGate gate = _corroboration.evaluate(inputs);
+        if (gate != CorrGate::PASS) {
+            fsmQualifies = false;
+            if (gate == CorrGate::SUPPRESS) {
+                DBG("SecMon",
+                    "CORROBORATION: low-conf %.2f suppressed (no 2nd modality in window)",
+                    _fusionConfidence);
+            }
+        }
+    } else if (_corroborationEnabled) {
+        _corroboration.evaluate(
+            {false, _fusionConfidence, _fusionSource, (uint32_t)now});
+    }
     syncFsmConfig();
-    MotionEvent mev = _fsm.reportMotion(armedQualifies, behavior, now);
+    MotionEvent mev = _fsm.reportMotion(fsmQualifies, behavior, now);
     _armedDebounceCount = _fsm.debounceCount();  // mirror for diagnostics
     _alarmState = _fsm.state();
 
@@ -843,6 +873,10 @@ void SecurityMonitor::processRadarData(uint16_t distance, uint8_t move_energy, u
         fillForensicFieldsImpl(_pendingEvent, getFusionSourceStr(), _fusionConfidence, _isStaticFiltered, zoneName, _prevZoneName.c_str());
         snapshotRingTo(_pendingEvent, now);
         enqueueAlarmEvent();
+        if (_mqttService && _mqttService->connected()) {
+            _mqttService->publishAlarmWhy(
+                _pendingEvent.reason, _fusionSource, _fusionConfidence, zoneName);
+        }
 
         if (immediate) {
             DBG("SecMon", "IMMEDIATE TRIGGER in zone '%s'!", zoneName);
@@ -882,7 +916,12 @@ void SecurityMonitor::processRadarData(uint16_t distance, uint8_t move_energy, u
 // rising edge and clears the latch once CSI recovers.
 void SecurityMonitor::_checkCsiTamper() {
 #ifdef USE_CSI
-    if (_csiService == nullptr) { _csiTamperLatched = false; return; }
+    if (_csiService == nullptr) {
+        _csiTamperLatched = false;
+        _crossModal.reset();
+        _crossModalLatched = CROSSMODAL_NONE;
+        return;
+    }
     CsiTamperInputs in;
     in.csiActive   = _csiService->isActive();
     in.ethUp       = ETH.linkUp();
@@ -900,6 +939,25 @@ void SecurityMonitor::_checkCsiTamper() {
     } else if (!flags && _csiTamperLatched) {
         _csiTamperLatched = false;
         DBG("SecMon", "CSI tamper cleared");
+    }
+
+    // #1 cross-modal liveness is passive: it reports a sensor that stays live
+    // but stops correlating, without changing any alarm decision.
+    if (_crossModalEnabled) {
+        CrossModalInputs cm;
+        cm.nowMs = in.nowMs;
+        cm.bothLive = in.csiActive && !_radarMonitoringDisabled;
+        cm.radarSees = _fusionPresence && ((_fusionSource & 0x1) != 0);
+        cm.csiSees = (_fusionSource & 0x2) != 0;
+        uint32_t crossModalFlags = _crossModal.update(cm);
+        if (crossModalFlags && !_crossModalLatched) {
+            char reason[128];
+            renderCrossModal(crossModalFlags, reason, sizeof(reason));
+            DBG("SecMon", "CROSS-MODAL DESYNC: %s", reason);
+            triggerAlert(NotificationType::HEALTH_WARNING,
+                         "⚠️ CROSS-MODAL DESYNC", String(reason));
+        }
+        _crossModalLatched = crossModalFlags;
     }
 #endif  // USE_CSI
 }

@@ -2,6 +2,80 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.6.0] - 2026-08-01
+
+Placement-awareness, fusion explainability and a cluster of concurrency and
+persistence fixes, composed on top of the 5.5 fusion-liveness base. Validated
+across a multi-day dual-node soak (32 h+ armed on the production node, zero
+triggers/crashes). Native coverage increases from 228 to 240 tests; all five
+shipped firmware environments verified.
+
+### Added
+
+- **Sensor-placement health warnings.** CSI health now reports `rssi_too_strong`
+  when the node sits so close to the access point that the strong signal
+  saturates detection (empirically confirmed at ~40 cm / around -52 dBm), and
+  `rssi_too_weak` when the link is too faint to carry usable CSI. The RSSI sweet
+  spot is tuned to `CSI_RSSI_HOT_DBM` -55 / `CSI_RSSI_WEAK_DBM` -70. These are
+  passive health reasons — they never change alarm decisions.
+- **Live fusion explainability panel (#8).** A new dashboard card shows
+  per-modality contribution bars (radar / CSI / ML), a fusion-confidence gauge
+  and a plain-language reason string ("radar + CSI + ML agree (95%)"). SSE
+  telemetry is enriched with per-modality source bits and bar levels.
+
+### Fixed
+
+- **CSI model-import race.** A web-triggered model import wrote the candidate
+  slot directly from the async_tcp task while `applyCandidate` read it on
+  csi_proc, so a concurrent import + apply could seal a torn candidate as the
+  ACTIVE model. Import now routes through the bounded model-command slot as a new
+  `IMPORT` command, serialized on csi_proc with APPLY under a release/acquire
+  fence. The web handler submits and polls exactly like apply (BUSY → 409,
+  timeout → 503).
+- **Continuous-EMA / model-apply cross-task race.** The idle-baseline EMA drift
+  is computed on the main loop but used to write the ACTIVE model slot, which the
+  `csi_proc` worker also writes during apply/rollback/import. The unsynchronized
+  cross-task write could tear `_active` or make an apply's read-back verify see a
+  half-written slot and spuriously report `STORE_FAILED` (HTTP 500). The main loop
+  now stashes the drifted values and raises a flag; the `csi_proc` worker performs
+  the actual slot write, serialized with the model-command path — no cross-task
+  write/write on `_active`.
+- **Config-import atomicity.** `/api/config/import` wrote NVS key-by-key and, on a
+  mid-sequence write failure, left the keys already written in place — able to
+  persist e.g. a new `auth_pass` without its `auth_user` and lock the device out
+  on the next reboot. The writer now journals each changed key's prior value and,
+  on any failure, rolls every changed key back to its pre-import state (removing
+  keys that did not exist before). Best-effort under a genuinely full NVS.
+
+## [5.5.0] - 2026-07-28
+
+Fusion-liveness and Home Assistant explainability release candidate. The new
+health path is passive by default, while the alarm-timing corroboration gate is
+explicitly opt-in. Native coverage increases from 213 to 228 tests.
+
+### Added
+
+- **Cross-modal liveness detector** compares sustained radar and CSI activity
+  over a rolling window and reports `crossmodal_desync` plus a health warning
+  when one live modality persistently fails to corroborate the other. It never
+  changes alarm decisions and defaults enabled.
+- **Low-confidence corroboration window** holds motion below 0.6 confidence for
+  up to 8 seconds while waiting for a second fusion-source bit. It is an opt-in
+  gate before `AlarmFSM::reportMotion`; the FSM itself is unchanged.
+- **Home Assistant alarm explanation** publishes retained JSON on
+  `security/<device>/alarm/why`, including the reason, radar/CSI/ML contributors,
+  fusion confidence and zone. Discovery exposes the reason and JSON attributes.
+- **Security sensitivity presets** (`Empty`, `Home`, `Paranoid`) map to tested
+  alarm-energy, entry-delay, pet-immunity and corroboration settings. A preset is
+  a **baseline** that any explicitly configured per-parameter value overrides, and
+  it is only applied when the user has actually selected one — devices that never
+  chose a preset keep their own persisted/default tunables (no silent change to
+  alarm timing on upgrade). The current preset persists in NVS and is available
+  through `/api/security_preset`, an HA select, and `security/<device>/preset[/set]`
+  MQTT topics.
+- Runtime config keys `crossmodal_enabled`, `corroboration_enabled`, and
+  `corroboration_window_ms` are exposed through `/api/security/config`.
+
 ## [5.4.1-poe-wifi] - 2026-07-27
 
 Crash-forensics + reliability-first release. Core-dump read-out over the API
