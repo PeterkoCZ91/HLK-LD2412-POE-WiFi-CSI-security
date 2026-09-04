@@ -17,4 +17,11 @@ inline bool mqttBufferedEventIdsMatch(uint64_t storedId, uint64_t candidateId) {
     return candidateId != 0 && storedId == candidateId;
 }
 
+// Persistent offline storage is reserved for security/alarm events. Ordinary
+// state and telemetry publishes can be frequent; writing each one to LittleFS
+// while MQTT is down can block loopTask long enough to trip the Task WDT.
+inline bool mqttOfflineBufferShouldStore(uint64_t eventId) {
+    return eventId != 0;
+}
+
 #endif

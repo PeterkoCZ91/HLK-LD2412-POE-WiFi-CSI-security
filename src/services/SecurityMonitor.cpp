@@ -2,7 +2,9 @@
 #include "services/MQTTService.h"
 #include "services/TelegramService.h"
 #include "services/ArmReadiness.h"   // #9 pre-arm health self-test (pure, no CSI dep)
+#include "services/FusionReason.h"   // FUSION_* source bits (pure, no CSI dep)
 #include <time.h>
+#include "services/HeapMetrics.h"
 #ifdef USE_CSI
 #include "services/CSIService.h"     // full CSIService type only in CSI builds
 #endif
@@ -225,7 +227,8 @@ void SecurityMonitor::update() {
             _lastDisarmReminder = now;
             triggerAlert(NotificationType::HEALTH_WARNING,
                 "⚠️ System is still DISARMED",
-                "Presence detected, but alarm is not active.\nUse /arm to activate.");
+                "Presence detected, but alarm is not active.\nUse /arm to activate.",
+                -1, AlertSource::DISARM_REMINDER);
         }
     }
     if (_mutex) xSemaphoreGive(_mutex);
@@ -381,7 +384,8 @@ void SecurityMonitor::checkTamperState(bool isTamper) {
             details += "Check sensor placement and surroundings.";
 
             DBG("SecMon", "TAMPER DETECTED!");
-            triggerAlert(NotificationType::TAMPER_ALERT, msg, details);
+            triggerAlert(NotificationType::TAMPER_ALERT, msg, details, -1,
+                         AlertSource::RADAR_TAMPER);
             _lastTamperAlert = now;
 
             _lastEvent.tamper_detected = true;
@@ -441,7 +445,8 @@ void SecurityMonitor::checkRadarHealth(bool isConnected) {
             : "No radar on UART at boot. Reboot to re-enable radar.";
 
         DBG("SecMon", "Radar monitoring disabled until restart (CSI-only)");
-        triggerAlert(NotificationType::SYSTEM_ERROR, msg, details);
+        triggerAlert(NotificationType::SYSTEM_ERROR, msg, details, -1,
+                     AlertSource::RADAR_OFFLINE);
 
         _lastEvent.radar_disconnected = true;
         _lastEvent.last_event_time = now;
@@ -537,7 +542,8 @@ void SecurityMonitor::processRadarData(uint16_t distance, uint8_t move_energy, u
                     String msg = "⚠️ ANTI-MASKING: Sensor detects no activity!";
                     String details = "Possible tamper (sensor covered) or empty room.\n";
                     details += "Silence duration: " + String(_antiMaskThreshold / MS_PER_MINUTE) + " min";
-                    triggerAlert(NotificationType::TAMPER_ALERT, msg, details);
+                    triggerAlert(NotificationType::TAMPER_ALERT, msg, details, -1,
+                                 AlertSource::ANTI_MASK);
                 }
             }
         }
@@ -568,7 +574,8 @@ void SecurityMonitor::processRadarData(uint16_t distance, uint8_t move_energy, u
         details += "\nETH: " + String(ETH.linkUp() ? "UP" : "DOWN");  // ETH — no RSSI
         details += "\nStav: " + String(_isBlind ? "Silence (no activity)" : "Active");
 
-        triggerAlert(NotificationType::HEALTH_WARNING, msg, details);
+        triggerAlert(NotificationType::HEALTH_WARNING, msg, details, -1,
+                     AlertSource::SENSOR_SILENT);
     }
 
     // 4. Loitering - CONFIGURABLE
@@ -585,7 +592,8 @@ void SecurityMonitor::processRadarData(uint16_t distance, uint8_t move_energy, u
                     String msg = "👤 LOITERING: Someone lingering in close zone!";
                     String details = "Distance: " + String(distance) + " cm\n";
                     details += "Doba: >" + String(_loiterThreshold / 1000) + " sekund";
-                    triggerAlert(NotificationType::PRESENCE_DETECTED, msg, details);
+                    triggerAlert(NotificationType::PRESENCE_DETECTED, msg, details, -1,
+                                 AlertSource::LOITERING);
                 } else {
                     DBG("SecMon", "Loitering detected but notifications are DISABLED in config");
                 }
@@ -635,7 +643,7 @@ void SecurityMonitor::processRadarData(uint16_t distance, uint8_t move_energy, u
                  if (z.alert_level >= 2) nt = NotificationType::HEALTH_WARNING;
                  String msg = "Zone entry: " + String(z.name);
                  String details = "Distance: " + String(distance) + " cm";
-                 triggerAlert(nt, msg, details);
+                 triggerAlert(nt, msg, details, -1, AlertSource::ZONE_ENTRY);
              }
         }
     }
@@ -776,6 +784,11 @@ void SecurityMonitor::processRadarData(uint16_t distance, uint8_t move_energy, u
         _fusionPresence = radarSees;
         _fusionConfidence = radarSees ? 0.7f : 0.0f;
         _fusionSource = radarSees ? 1 : 0;
+#ifdef USE_CSI
+        // CSI exists but is starved — mark it so the dashboard reason reads
+        // "CSI stale" instead of claiming CSI voted against a live radar hit.
+        if (_csiService && !_csiDataOk) _fusionSource |= FUSION_CSI_STALE;
+#endif
     }
 
     // 4b. Approach logging — record every detection while ARMED (forensic trail)
@@ -923,9 +936,13 @@ void SecurityMonitor::_checkCsiTamper() {
         return;
     }
     CsiTamperInputs in;
-    in.csiActive   = _csiService->isActive();
+    // Not isActive()/getPacketRate(): the first is latched true from boot, the
+    // second is an instantaneous 1 s average that this 60 s-cadence caller
+    // aliased into 13 false tamper alerts. The detector averages the monotonic
+    // count over its own interval instead.
+    in.csiActive   = _csiService->isSensing();
     in.ethUp       = ETH.linkUp();
-    in.packetRate  = _csiService->getPacketRate();
+    in.packetCount = _csiService->getPacketCount();
     in.variance    = _csiService->getVariance();
     in.nowMs       = millis();
     uint32_t flags = _csiTamper.update(in);
@@ -935,7 +952,8 @@ void SecurityMonitor::_checkCsiTamper() {
         renderCsiTamper(flags, buf, sizeof(buf));
         DBG("SecMon", "CSI TAMPER: %s", buf);
         triggerAlert(NotificationType::TAMPER_ALERT, "🛡️ CSI sensor tamper",
-                     String(buf) + "\nEthernet is up but the WiFi CSI sensor stopped seeing the room.");
+                     String(buf) + "\nEthernet is up but the WiFi CSI sensor stopped seeing the room.",
+                     -1, AlertSource::CSI_TAMPER);
     } else if (!flags && _csiTamperLatched) {
         _csiTamperLatched = false;
         DBG("SecMon", "CSI tamper cleared");
@@ -955,7 +973,8 @@ void SecurityMonitor::_checkCsiTamper() {
             renderCrossModal(crossModalFlags, reason, sizeof(reason));
             DBG("SecMon", "CROSS-MODAL DESYNC: %s", reason);
             triggerAlert(NotificationType::HEALTH_WARNING,
-                         "⚠️ CROSS-MODAL DESYNC", String(reason));
+                         "⚠️ CROSS-MODAL DESYNC", String(reason), -1,
+                         AlertSource::CROSSMODAL);
         }
         _crossModalLatched = crossModalFlags;
     }
@@ -973,7 +992,7 @@ void SecurityMonitor::checkSystemHealth() {
     }
 
     // Check free heap
-    uint32_t freeHeap = ESP.getFreeHeap();
+    uint32_t freeHeap = heapFreeUsable();
     if (freeHeap < HEAP_LOW_WARNING) {
         DBG("SecMon", "Health Check: Low memory (%u bytes)", freeHeap);
         healthy = false;
@@ -981,7 +1000,8 @@ void SecurityMonitor::checkSystemHealth() {
         if (!_systemHealthy) {  // Was already unhealthy, send alert
             String msg = "System health warning: Low memory";
             String details = "Free heap: " + String(freeHeap) + " bytes";
-            triggerAlert(NotificationType::HEALTH_WARNING, msg, details);
+            triggerAlert(NotificationType::HEALTH_WARNING, msg, details, -1,
+                         AlertSource::LOW_MEMORY);
         }
     }
 
@@ -1001,7 +1021,8 @@ void SecurityMonitor::checkSystemHealth() {
     _systemHealthy = healthy;
 }
 
-void SecurityMonitor::triggerAlert(NotificationType type, const String& message, const String& details, int16_t explicitDist) {
+void SecurityMonitor::triggerAlert(NotificationType type, const String& message, const String& details,
+                                   int16_t explicitDist, AlertSource source) {
     // Log to EventLog if available
     if (_eventLog) {
         uint8_t evtType = EVT_SYSTEM;
@@ -1040,7 +1061,7 @@ void SecurityMonitor::triggerAlert(NotificationType type, const String& message,
 
     // Try NotificationService first (has cooldown, filtering, multi-channel)
     if (_notifService && _notifService->isEnabled()) {
-        _notifService->sendAlert(type, message, details);
+        _notifService->sendAlert(type, message, details, source);
         return;
     }
 

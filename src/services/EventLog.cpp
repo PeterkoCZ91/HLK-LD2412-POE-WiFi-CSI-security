@@ -2,6 +2,7 @@
 #include "debug.h"
 #include <time.h>
 #include <new>
+#include "services/HeapMetrics.h"
 
 EventLog::EventLog(size_t ramCapacity)
     : _ramCapacity(ramCapacity), _head(0), _count(0)
@@ -101,7 +102,7 @@ void EventLog::flushToDisk() {
     LogEvent* snapshot = new(std::nothrow) LogEvent[newEvents];
     if (!snapshot) {
         DBG("EventLog", "CRIT: alloc failed heap=%u maxAlloc=%u",
-            ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+            heapFreeUsable(), heapLargestUsable());
         xSemaphoreGive(_mutex);
         // Defer the next attempt by another flush interval. Without this,
         // flush() would re-enter on every loop tick (the 60 s rate-limit

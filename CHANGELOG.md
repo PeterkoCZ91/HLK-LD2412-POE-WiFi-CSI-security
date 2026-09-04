@@ -2,6 +2,864 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.7.0] - 2026-09-04
+
+Reliability release, composed from dev1 through dev19 on top of the v5.6.0
+base. The line opened as a detection-tuning change — the selectable adaptive
+percentile (#13) — and turned into memory and networking forensics after a
+field node spent three days in a panic streak that nobody noticed until its
+`reset_history` was read by hand. Almost every entry below was found on
+hardware rather than in review: a decoded coredump, a packet capture on the
+LAN segment, or a soak that ran long enough to contradict an assumption made
+earlier in the same line. Two entries correct earlier fixes from this very
+line; both are kept in the history rather than squashed away, because the
+reason each one failed is the useful part.
+
+The lab node closed the dev1-dev17 line at 177.54 h without a reboot, against
+64.14 h for the best build before it. dev18/dev19's admission and
+skip-visibility hardening closed its own two-node soak at 42.5 h, zero
+reboots on either node, the web gate never closing and zero rejected
+requests; the lab node's MQTT-reconnect rate (9.6/day) held stable against an
+independent measurement at less than half that runtime. Native coverage rises
+from 240 to 385 tests, and all five shipped firmware environments build.
+
+### Added
+
+- **The device can now be asked how much memory it really has.**
+  `/api/health` publishes a `heap` object carrying both allocator capabilities
+  side by side (`free_8bit`, `largest_8bit`, `min_free_8bit`, `free_internal`,
+  `largest_internal`, `unusable_internal`, `internal_misleading`), an `sse`
+  object (`clients`, `avg_waiting`, `backlog_skips`) for the send-queue depth
+  that drained the heap unnoticed for weeks, and — from dev17 — an on-device
+  heap watermark tripwire that writes one forensic line into the
+  RTC-mirrored log whenever the low-water mark drops by 2 kB or more. The
+  common thread is that each of the three failures in this release was
+  invisible from outside the node, and in the tripwire's case measurably
+  faster than any HTTP poll that could have observed it.
+- **Two gates that keep a collapsing heap from becoming a panic (dev7).** A
+  web accept gate refuses new connections with an allocation-free TCP RST
+  while free heap or the largest allocatable block is below threshold, capping
+  concurrent SSE clients at 4 on the way; a `std::set_new_handler` last resort
+  stamps an RTC-noinit marker and performs a controlled `esp_restart()` when a
+  throwing `new` cannot be satisfied anywhere in the firmware, so the next
+  boot reports cause `oom_gate heap=<free>/<largest>` instead of a bare panic
+  loop. Both were confirmed working in the field during this line: a load test
+  drove the node to `largest` 5876 B against the 6144 B close threshold, the
+  gate closed, and the restart was orderly.
+- **The node reports its own outages (dev8).** A dirty boot — panic, watchdog,
+  brownout or `oom_gate` restart — now produces a Telegram message and a
+  non-retained MQTT event on `security/<id>/system/outage` carrying the reset
+  reason, uptime before the outage, the pre-crash heap triple and whether a
+  coredump is waiting. A survived heap-pressure episode is reported when the
+  web gate reopens, because at close time the heap cannot afford a TLS
+  handshake. Clean boots stay quiet.
+- **CSI passage-edge events (dev6).** Motion transitions are published as a
+  compact non-retained edge on `<mqtt_id>/csi/event` with `boot_id` and `seq`,
+  so Home Assistant can act on a passage instead of on a retained state topic
+  that pins `ON` and re-fires after every HA restart.
+  `POST /api/csi/selftest/edge` emits a synthetic, source-marked edge so the
+  wire and the automation can be validated without physical motion.
+- **Measured Ethernet link health and routing (dev14, dev15).**
+  `ethernet.flap{}` in `/api/health`, `eth_flaps` / `eth_down_permille` in
+  `/healthz` and three `poe2412_eth_*` series in `/metrics` count link
+  episodes off the driver's own events instead of a once-a-minute poll;
+  `ethernet.route{eth_is_default, asserts, changes}` reports which interface
+  lwIP hands outbound TCP to. Until this release the only way to answer that
+  second question was a packet capture on the LAN segment.
+- **The node now says how often it drops a publish cycle, and how deep the
+  heap went when it did (dev19).** `loop()` skips the entire MQTT publish
+  block — all three tiers — and the SSE telemetry tick whenever free heap is
+  under `HEAP_MIN_FOR_PUBLISH`. Until now the only trace was a bare
+  `[WARN] Low heap — skipping MQTT publish` carrying no number and
+  rate-limited to one line per 10 s, so ten lines over a 37 h soak could
+  equally have been ten events or ten thousand. `/api/health` gains a
+  `heap_skips` object (`mqtt`, `mqtt_logged`, `sse`, `lowest_free`) that
+  counts every skip regardless of the rate limit, and the serial line now
+  reports the free heap it actually decided on, plus `largest`, `min`,
+  in-flight HTTP requests, SSE depth and the runtime operation.
+- **Selectable adaptive-threshold percentile (#13, dev1).** The rolling
+  detection threshold was hard-wired to the P95 of the idle-variance window
+  and is now settable to P99, which rides higher on the noise tail and cuts
+  false positives on a noisy link at the cost of sensitivity. Set via
+  `POST /api/csi?adaptive_pct=95|99`, persisted as `csi_adapt_pct`, reported
+  as `adaptive_percentile`.
+
+### Fixed
+
+- **Every heap threshold in the firmware was inflated by roughly 42 kB
+  (dev12).** arduino-esp32 implements `ESP.getFreeHeap()` and friends over
+  `MALLOC_CAP_INTERNAL`, which on this board also counts a 40948 B IRAM-only
+  region that `malloc()` and `operator new` can never allocate from. The
+  practical effect was that the dev7 web gate could not close: a production
+  node logged nine `oom_gate` restarts in 6.3 h with `close_count: 0`,
+  `free_internal` never below ~43 kB and `largest_internal` pinned at exactly
+  40948 in all nine markers. Every heap decision now reads the
+  byte-addressable heap, and the gate, `HEAP_MIN_FOR_PUBLISH`, the low-RAM
+  alerts, the security health check and the TLS admission policy were all
+  recalibrated to real bytes.
+- **A single stalled dashboard tab could exhaust the heap (dev13).**
+  `AsyncEventSource` bounds its per-client queue by message count, not bytes,
+  and the cap meant to hold it at 8 sat in a `build_flags` list that every
+  board env replaces rather than extends — so the shipped firmware ran the
+  library default of 32 the whole time. At a ~1.5 kB telemetry payload every
+  250 ms that is ~48 kB pinned in separately allocated strings, more than the
+  entire free heap on this board. A tick is now dropped rather than queued
+  behind one that never went out.
+- **A burst of concurrent requests could panic the node (dev18).** The
+  low-heap gate sits on the accept path and allocates nothing, which is
+  correct, but it is a level check on a lagging signal: accepting a connection
+  is nearly free, while its request object, Digest strings and ~3.9 kB
+  response buffer are paid milliseconds later. Fifteen parallel authenticated
+  requests were therefore all admitted against one healthy reading and then ran
+  the heap to 2 kB — a panic rather than a controlled restart. Admission now
+  bounds connections in flight and charges each one a reserve against the
+  gate's own threshold, so it stops admitting long before the ceiling when the
+  node is already under CSI, MQTT or link-flap pressure.
+- **The heap tripwire stored its evidence where link events evicted it
+  (dev18).** It wrote through the system log into a 20-slot RTC ring shared
+  with ordinary logging; on a flapping link that ring turns over in about 50
+  minutes. It now owns a dedicated ring, readable at `GET
+  /api/heap/watermarks`, with the previous boot's records preserved across a
+  panic.
+- **Out-of-memory recovery paths that themselves allocated (dev6).** Four web
+  handlers answered a failed `new (std::nothrow)` with `request->send(503)`,
+  which allocates through a throwing `new`; under real exhaustion the second
+  allocation also fails, `bad_alloc` cannot be constructed, and
+  `std::terminate()` reboots the node. The OOM branches now use the
+  allocation-free `request->abort()`, and a source-invariant test keeps the
+  property from regressing.
+- **MQTT was leaving over the CSI capture radio instead of Ethernet (dev15,
+  dev16).** On this dual-homed hardware both interfaces sit on one flat
+  subnet and the WiFi STA outranks Ethernet on `route_prio`, so lwIP hands the
+  default netif to WiFi at every DHCP renewal. The existing csi7 correction
+  had three call sites, none of which fire on a node that is simply up and
+  working. A node ran 177 h with MQTT pinned to a -71 dBm link, losing the
+  broker about 20 times a day for minutes at a time while its Ethernet was up
+  and healthy — with the alarm armed, those are gaps in alert delivery. A
+  policy now re-asserts Ethernet periodically and forces a reconnect only when
+  a live socket is genuinely stranded, which took two attempts to get right
+  (see dev15 and dev16 below).
+- **The Ethernet watchdog could reboot a node whose link works (dev14).** It
+  summed "time down" across unrelated outages on a flapping link, so six
+  unlucky consecutive samples reached the 5 minute reboot threshold. It now
+  detects that the link came back in between and restarts the timer; a
+  genuinely dead link still reboots on the same rule.
+- **Thirteen false tamper alerts, from two independent defects (dev14).** The
+  detector was sampled once a minute but fed an instantaneous one-second
+  packet rate, so two unlucky dips 60 s apart looked like a minute of
+  blindness; and Ethernet comes up seconds after reset while the WiFi station
+  needs far longer to associate, so a fresh node reported itself sabotaged
+  once per boot. The detector now derives the average over the real interval
+  between calls and a bounded startup grace covers the association window. A
+  sensor that never delivers a packet is still reported — this is deliberately
+  not gated on association, because covering the access point is the attack
+  being watched for.
+- **One producer's alerts could silence another's (dev14).** The notification
+  cooldown was keyed by type alone while three call sites share `TAMPER_ALERT`
+  and four share `HEALTH_WARNING`, so a false CSI tamper muted a genuine radar
+  tamper for five minutes. The key is now `(type, AlertSource)`.
+- **A runtime traffic-generator change could panic the node (dev9).** The web
+  setters run on `async_tcp` but the generator task is owned by `loopTask`;
+  restarting it from the wrong task while holding the lwIP core lock could
+  orphan the old task and spawn a second generator, and two of them contending
+  the lock starved `loopTask` past its watchdog. The setters now stage the
+  change and `update()` performs it on the owning task.
+- **Reconnect and offline behaviour around the broker (dev10, dev13).**
+  Offline persistence keeps event and alarm messages only, so ordinary
+  telemetry no longer writes to LittleFS during an outage, and replay is
+  batched so recovery cannot monopolize `loopTask`. PubSubClient's keepalive
+  and socket timeout are now set explicitly (60 s and 4 s): both library
+  defaults are 15 s, and because `readByte()` busy-waits for its full
+  duration, one truncated packet parked `loopTask` for 15 s — long enough to
+  starve CSI and to miss the very keepalive that then tore the connection
+  down.
+- **The CSI threshold path could enter MOTION on frozen data (dev7).** At
+  pps=0 the turbulence buffer and running variance hold their last values, and
+  roughly 8 s of starvation accumulated enough smoothing votes to fire an
+  alarm on a production node. A tick without fresh packets now freezes the
+  whole decision, reports a `data_starved` reason and counts into
+  `csi.starved_ticks`; the ML path had had such a gate since v5.4, the
+  threshold path had none.
+- **`radar_task` is no longer started on units where no radar answers
+  (dev13)**, where it spun every 2 ms to do nothing while holding an 8192 B
+  stack, and boot-outage notices now name the reporting firmware version
+  (dev11).
+- **Review residua from the v5.6.0 + #13 diffs (dev2).** `adaptive_pct` is
+  parsed strictly instead of through `toFloat()`, whose 0-on-failure was
+  clamped into a persisted P50 — the exact opposite of the desensitization
+  intent; `csi_adapt_pct` joined config export/import so a restored backup no
+  longer silently reverts a P99 node to P95; the SSE buffer grew to 2048 B
+  before the fusion block could push a frame past the cap and freeze the whole
+  dashboard; config-import rollback reports restore failures instead of
+  logging a clean rollback that did not happen.
+
+### Changed
+
+- **Heap figures reported by the device changed meaning (dev12).**
+  `free_heap` and `min_heap` in `/api/health`, `heap_free`/`heap_min`/
+  `heap_largest` in `/metrics` and `/healthz`, and the `free_heap` /
+  `max_alloc_heap` MQTT topics now carry byte-addressable bytes. History
+  recorded before this release reads roughly 42 kB higher for the same
+  physical state on this board; dashboards and alert thresholds built on the
+  old numbers need re-basing. The web gate's NVS keys were renamed to
+  `wg8_*` rather than migrated, because the old values were calibrated
+  against inflated readings and would have held the gate permanently closed.
+- **The MQTT topic `security/<id>/eth_link` is no longer called
+  `security/<id>/rssi` (dev14).** It has only ever carried the Ethernet link
+  state as `ON`/`OFF` and no RSSI value is published over MQTT at all. The
+  Home Assistant discovery `uniq_id` is unchanged, so entities and history are
+  preserved; the retained message under the old name stays on the broker until
+  cleared by hand.
+
+### Known issues
+
+- **A node whose Ethernet port flaps is a site problem, not a firmware one.**
+  The lab node measured 24071 episodes over 7.4 days, 13.2 % of wall-clock
+  down, a 2 s median and a clean geometric length distribution on the PHY's
+  2000 ms poll grid, while a broker on the same segment lost no ICMP at all.
+  The firmware now survives this (no watchdog reboots, no reconnect storms)
+  and reports it honestly, but the cable, port or injector is what fixes it.
+
+## [5.7.0-dev19] - 2026-09-02
+
+### Added
+
+- **The node now says how often it drops a publish cycle, and how deep the
+  heap went when it did.** `loop()` skips the entire MQTT publish block — all
+  three tiers — and the SSE telemetry tick whenever free heap is under
+  `HEAP_MIN_FOR_PUBLISH`. Until now the only trace was a bare
+  `[WARN] Low heap — skipping MQTT publish` carrying no number and rate-limited
+  to one line per 10 s, so ten lines over a 37 h soak could equally have been
+  ten events or ten thousand. `/api/health` gains a `heap_skips` object
+  (`mqtt`, `mqtt_logged`, `sse`, `lowest_free`) that counts every skip
+  regardless of the rate limit, and the serial line now reports the free heap
+  it actually decided on, plus `largest`, `min`, in-flight HTTP requests, SSE
+  depth and the runtime operation. `in_flight` is the point of the exercise: it
+  says whether an AsyncTCP request was being served at the instant `loop()`
+  found the heap collapsed.
+
+### Changed
+
+- The low-heap guard reads `heapFreeUsable()` once and reports that same
+  reading. Re-reading it for the log line would have printed a heap that had
+  already recovered — which is how this dip stayed invisible for a week.
+
+Field evidence (bench node, 37 h on dev18): ten skip warnings while the `STAB`
+heartbeat five seconds either side reported 59 180 B free against a 12 000 B
+threshold. Both figures come from the same `heapFreeUsable()` call inside the
+same `loop()` iteration with no `return` between them, so the heap genuinely
+loses ~47 kB within one pass and hands it straight back. The watermark ring
+missed the corresponding 2 680 → 1 976 B step because 704 B is below its 2 kB
+recording threshold; the threshold is deliberately unchanged, since the ring
+holds 16 slots and lowering it would fill them all in the first minute after
+boot. Nine native tests added (385 total).
+
+## [5.7.0-dev18] - 2026-08-31
+
+### Fixed
+
+- A burst of concurrent authenticated requests could panic the node. The dev7
+  low-heap gate runs on the accept path and is allocation-free, which is the
+  right place — but it is a level check on a lagging signal. Accepting a
+  connection costs almost nothing; its request object, header and Digest
+  strings, `JsonDocument` and ~3.9 kB response buffer are paid milliseconds
+  later, after async_tcp has drained the whole accept backlog in one pass. So
+  fifteen or twenty parallel requests were all admitted against a single
+  healthy ~45 kB reading, and nothing counted how much had already been
+  committed against it. On the bench ten concurrent requests moved the
+  watermark by 216 B, twelve closed the gate and were survived, and fifteen
+  survived once and then panicked at `heap=2040/1012`. `WebAdmissionPolicy`
+  now bounds how many connections may be in flight (8, against a browser's
+  six sockets per host) and charges each admitted connection a 3 kB reserve
+  against the gate's own close threshold, so under CSI, MQTT or link-flap
+  pressure admission stops well before the ceiling. Slots carry a 10 s TTL
+  because two paths never report a disconnect — an SSE stream takes the raw
+  client's callback, and `request->abort()` reports through an AsyncTCP event
+  packet allocated with `new (std::nothrow)`, the allocation that fails first
+  under the exhaustion being guarded. Counters are in `/api/health` →
+  `web_gate.admission{}`.
+- The heap watermark tripwire wrote its findings through the system log into
+  the 20-slot RTC ring shared with ordinary logging. On a node whose Ethernet
+  port flaps, that ring turns over in roughly 50 minutes: a check three hours
+  after deployment found all 20 slots holding link events, and the five lines
+  showing HA discovery draining 33 kB of watermark across its 59 entities were
+  already gone. A forensic instrument cannot keep its evidence where a
+  chattier producer can evict it, so the tripwire now owns a dedicated 16-slot
+  RTC ring that nothing else writes to, readable at `GET
+  /api/heap/watermarks`, with the previous boot's records copied into RAM at
+  startup so they survive a panic.
+
+## [5.7.0-dev17] - 2026-08-31
+
+### Added
+
+- **A tripwire that records when the heap low-water mark moved and what was
+  running at that moment.** The 12 h dev16 soak ended with `min_free_8bit` at
+  7700 B against a 48200 B median — 6.6 kB below the web gate's close
+  threshold and inside the band where this node has historically OOMed — yet
+  not one of 2488 samples taken every 15 s saw the heap below 29504 B. Whoever
+  takes those ~40 kB takes them and gives them back inside a single sampling
+  period, and sampling faster from outside is self-defeating: an
+  `/api/health` request allocates more than the spike being hunted.
+  `heap_caps_get_minimum_free_size()` already holds the minimum; what was
+  missing was a timestamp and a context. The board therefore polls its own
+  watermark every 100 ms in `loop()` and, on each drop, writes one line into
+  the system log — mirrored into the RTC-noinit ring, so it survives a panic —
+  carrying the previous and new watermark, the largest block, free heap, MQTT
+  connected state and reconnect count, the Home Assistant discovery index, the
+  running `RuntimeOperation` and RSSI. The shape of the policy is dictated by
+  the ring holding 20 slots shared with ordinary logging: an instrument that
+  fired on every 200 B ratchet would evict the evidence it exists to collect.
+  Hence a minimum drop of 2 kB measured against the last *recorded* level, so
+  a slow ratchet of sub-threshold steps still adds up to one honest line
+  rather than being discarded step by step; a hard cap of 8 lines per boot;
+  and a rising watermark treated as a stale baseline that re-anchors quietly,
+  never as a negative drop. Pure header, 8 native tests, 355/355 in total.
+
+The instrument earned its keep on the first day, and two of its findings
+change conclusions recorded earlier in this line. Home Assistant discovery had
+been ruled out as the source of the deep dips, correctly on the question that
+was asked — `publishDiscoveryStep()` sends one entity per `update()` cycle and
+allocates single-digit kB per entity, so it cannot take 40 kB in one jump. But
+the watermark does not answer "how much did anyone take at once", it answers
+"how deep did this get in total", and across 59 entities the discovery
+sequence drove it from 56316 B down to 22940 B — 33 kB — inside 17 s of boot.
+That reframes the dev16 dip as a discovery republish landing on an already
+loaded heap rather than one exotic allocation. Separately, a load test pushed
+the node to `largest` 5876 B while 15120 B were free: a 9.2 kB gap where every
+other measurement in this line shows a constant ~3 kB, which is the one
+instance so far of genuine fragmentation rather than a merely full heap. The
+block size was below the gate's 6144 B threshold, the gate closed as designed,
+and `oom_gate` performed a controlled restart — the dev7 and dev12 chain
+verified in the field rather than in a test.
+
+Two limitations are known and deliberately left for the next build, since
+fixing either costs a reboot and restarts the soak: there is no boot grace
+period, so the startup transient spends 2 of the 8 slots, and the shared ring
+turns over in roughly 50 minutes on a node with a flapping link.
+
+## [5.7.0-dev16] - 2026-08-31
+
+### Fixed
+
+- **An Ethernet flap is not a routing steal, and must not force an MQTT
+  reconnect.** The dev15 correction below regressed in the field seven minutes
+  after the flash: re-asserting Ethernet as the default netif worked, but the
+  reconnect that follows a real move fired on every link flap. Measured over
+  the first 15 minutes: 27 flaps, 27 asserts, 27 changes and 28 reconnects —
+  one for one. On this node's ~3200 flaps a day that projects to ~2600
+  reconnects against dev14's ~20, each one republishing 59 Home Assistant
+  discovery entities. The correction was worse than the fault it corrected.
+  The cause is that "the default moved" conflated two different events. When
+  the Ethernet carrier drops, lwIP hands the default to WiFi and hands it
+  straight back seconds later; any Ethernet-borne session broke on its own and
+  a reconnect adds nothing. When Ethernet stays up throughout and WiFi takes
+  the default anyway — a DHCP renewal, the higher `route_prio` — the live
+  session really is stranded on the wrong interface, and only then is the
+  reconnect worth its cost. The policy now records whether the carrier was
+  down at any point while the default was lost, and reports a routing change
+  only when it was not. A dwell-time threshold was tried first and rejected on
+  its own logic: the policy re-asserts every 5 s, so the default is never lost
+  long enough for any threshold to fire and the reconnect would simply never
+  happen — the sampling period of the observer being mistaken for the duration
+  of the event, the same trap as the Ethernet flap counter in dev14, from the
+  other side.
+
+Verified against dev15 at the same point after boot, because the flap rate
+takes about seven minutes to settle: at 7 minutes dev15 had 6 flaps and 7
+reconnects, dev16 had 14 flaps and 1; over 15 minutes, 27 flaps / 28
+reconnects against 34 flaps / 1. `changes` keeps rising in both, so the
+default really is moving and the policy really is putting it back — what is
+gone is the link from a flap to a reconnect.
+
+A 12 h soak answered the question those 15 minutes could not, compared against
+the last 12 h of the dev14 run rather than its 177 h average: 3032 flaps/day
+and 19.9 reconnects/day for dev16, against 2585 and 30.0 for dev14 — a third
+fewer reconnects on 17 % more flaps, and two orders of magnitude away from
+dev15. `eth_is_default` held `true` in 1248 of 1249 samples. The unplanned
+benefit was in delivery latency: `mq_age`, the time since the last MQTT
+traffic, peaked at 614 s under dev14 — over ten minutes during which nothing
+could reach Home Assistant — against 121 s under dev16. That follows directly
+from dev15's premise, since dev14 was sending over a starved capture radio and
+dev16 sends over Ethernet, and it is the part of this fix that matters for an
+armed node.
+
+## [5.7.0-dev15] - 2026-08-31
+
+### Fixed
+
+- **Ethernet is kept as the outbound default, so MQTT stops riding the CSI
+  radio.** This node is dual-homed with both interfaces on one flat subnet:
+  Ethernet for transport and a WiFi station for CSI capture. The station
+  outranks Ethernet on `esp_netif` `route_prio`, so lwIP hands the default
+  netif to WiFi every time that interface takes an IP. The csi7 fix already
+  addressed this once, and its comment describes this exact case — but its
+  correction never runs in steady state: `_restoreEthDefaultNetif()` is called
+  from exactly three places, namely boot, the completion of a WiFi scan, and a
+  branch gated behind "traffic generator NOT running". None of the three fire
+  on a node that is simply up and working, so the first DHCP renewal on the
+  capture interface takes the default and keeps it. Measured in the field: a
+  node ran 177 h with MQTT pinned to a -71 dBm link, cycling `rc=-2` at
+  moments when its Ethernet was up and healthy, and losing the broker roughly
+  20 times a day for minutes at a time — nearly 8 minutes in the worst
+  observed episode. A packet capture on the LAN segment settled it: 30 of 30
+  packets to the broker left from the WiFi address while a concurrent HTTP
+  request left over Ethernet, so this is a real per-socket routing choice and
+  not a dead interface. With the alarm armed, those windows are gaps in alert
+  delivery — the security path riding the same weak radio that the sensor path
+  is already starving on. `EthDefaultNetifPolicy` (pure header, 6 native
+  tests, TDD) decides when to re-assert: it stays quiet while Ethernet already
+  holds the default, so the core lock is not touched for nothing; it never
+  goes near lwIP during an OTA transfer (csi7b); it skips while the carrier is
+  down without latching off, because on a link that is down 13 % of the time
+  it has to keep trying; and it rate-limits retries to 5 s so `update()`
+  cannot spin on `LOCK_TCPIP_CORE()`. It is called from `update()` on the loop
+  task, which is the only safe place — the lock is not reentrant, so a WiFi or
+  lwIP event callback would deadlock. The second half matters as much as the
+  first: an established TCP socket keeps the route it was opened on, so moving
+  the default does not migrate a live MQTT session. `_restoreEthDefaultNetif()`
+  therefore reports whether the default actually moved, and only a real move
+  forces a reconnect.
+
+  **This build shipped a regression**, corrected in dev16 above: the forced
+  reconnect fired on every Ethernet flap, at roughly 2600 reconnects a day.
+  Nothing in the test suite caught it — a 15 minute monitor sampling every two
+  minutes right after the flash did, because it showed `changes` and
+  `mqtt.reconnect_total` next to each other.
+
+### Added
+
+- `/api/health` reports `ethernet.route{eth_is_default, asserts, changes}`.
+  Until now the only way to answer "which interface does outbound TCP use" was
+  a packet capture on the LAN segment, and the answer turned out to be the
+  wrong one for 177 h without anything on the device saying so.
+
+## [5.7.0-dev14] - 2026-08-22
+
+### Added
+
+- The Ethernet link's real flap rate is now measured instead of inferred.
+  `ARDUINO_EVENT_ETH_{CONNECTED,DISCONNECTED}` already fired at the true rate
+  and nothing counted them, so every consumer had to guess from a poll: the
+  connectivity watchdog samples `ETH.linkUp()` once a minute and printed
+  "restored after 60s" for a 2 s glitch, and MQTT diagnostics publish every
+  30 s, which made Home Assistant's history show 339 episodes/day at a 30 s
+  median. Measured off the driver's own edges, the same link was losing 18
+  episodes per 230 s. Flapping is bursty, so across windows the same link
+  measures 10-24 % of wall-clock down and ~2400-6800 episodes/day — an order of
+  magnitude away from the reported figure at either end of the range — with
+  every single episode a whole multiple of the IDF PHY poll period (2000 ms). Exposed as
+  `ethernet.flap{}` in `/api/health`, `eth_flaps` / `eth_down_permille` in
+  `/healthz`, and `poe2412_eth_flaps_total` / `_down_seconds_total` /
+  `_down_permille` in `/metrics`. The watchdog log line now says how long the
+  link was *unseen* and quotes the measured total beside it, so the poll period
+  can no longer be misread as an outage length.
+
+### Fixed
+
+- One producer's alerts could silence a different producer's. The notification
+  cooldown was keyed by `NotificationType` alone, but several unrelated call
+  sites share a type: three raise `TAMPER_ALERT` (radar tamper, CSI tamper,
+  anti-masking) and four raise `HEALTH_WARNING` (disarm reminder,
+  sensor-silent, cross-modal desync, low memory). A false CSI tamper therefore
+  muted a *genuine* radar tamper for the full five minutes, and the chattiest
+  health producer masked the other three. The project had hit this before and
+  treated it as a naming problem — the "FIX #18" comment in SecurityMonitor.cpp
+  moved a zone alert off `TAMPER_ALERT` for exactly this reason, which
+  relocated the collision into `HEALTH_WARNING` rather than removing it. The
+  cooldown is now keyed by `(type, AlertSource)`, with every repeating producer
+  naming itself; anything still passing `GENERIC` keeps the old per-type slot,
+  so nothing that was rate-limited before becomes unlimited.
+- The Ethernet watchdog could reboot a node whose link works. It accumulated
+  "time down" from the first 60 s poll that saw the link down and only reset
+  when a poll saw it up, so on a flapping link it summed unrelated outages: at
+  the 23.5 % down fraction measured in the field, six consecutive unlucky
+  samples is roughly a daily event, and six of them is the 5 minute reboot
+  threshold. It now compares the driver's outage counter across samples — if a
+  new outage began since the last one, the link came back in between and is
+  flapping rather than dead, so the timer restarts. A genuinely dead link still
+  reboots on the same 5 minute rule, including when no driver events arrive at
+  all.
+- CSI tamper detection raised 13 false "sensor tamper" alerts on a field node,
+  from two independent defects. **Aliasing:** `SecurityMonitor` samples the
+  detector once per 60 s (`INTERVAL_HEALTH_CHECK_MS`) but fed it
+  `getPacketRate()`, an instantaneous 1-second average — two unlucky dips 60 s
+  apart were indistinguishable from 60 s of genuine blindness. The detector now
+  takes the monotonic packet count and derives the average over the real
+  interval between calls, so the verdict no longer depends on the caller's
+  cadence, and a trickle too slow to see the room still counts as blind.
+  **Boot transient:** Ethernet comes up seconds after reset while the WiFi
+  station needs far longer to associate, so a fresh node reported itself
+  sabotaged once per boot — which is why all 13 alerts landed either just after
+  a boot or during the OOM crash-loop era, and none while the node ran
+  undisturbed. A bounded startup grace covers the window until the first packet
+  arrives; a sensor that never delivers one is still reported. The threat model
+  is unchanged: this is deliberately not gated on WiFi association, because
+  pulling or covering the AP disassociates the station and that is the attack
+  being watched for.
+- `CSIService::isActive()` is latched true at startup and never cleared, so the
+  tamper detector could not tell "blinded" from "deliberately idle" and read a
+  WiFi scan or an in-flight OTA as sabotage. It now consults `isSensing()`,
+  which also accounts for scan suspension and OTA.
+- The MQTT topic `security/<id>/eth_link` is no longer called
+  `security/<id>/rssi`. It has only ever carried the Ethernet link state as
+  `ON`/`OFF`; no RSSI value is published over MQTT at all, so the old name
+  suggested a signal that does not exist to anyone reading the broker. The
+  Home Assistant discovery `uniq_id` is unchanged, so the existing entity and
+  its history are preserved with no user action. Note that the retained
+  `security/<id>/rssi` message stays on the broker until cleared by hand
+  (`mosquitto_pub -r -n -t security/<id>/rssi`); the firmware has no code path
+  for deleting retained topics.
+- The Home Assistant entity list in the README advertised a `sensor.<id>_rssi`
+  that has never existed, alongside two other entity names that did not match
+  the published discovery configs.
+
+## [5.7.0-dev13] - 2026-08-20
+
+### Fixed
+
+- `-D SSE_MAX_QUEUED_MESSAGES=8` never reached the compiler. It sat in
+  `[common].build_flags`, but every board env does `extends = common` and then
+  redefines `build_flags`, and PlatformIO REPLACES an inherited list instead of
+  appending to it. The shipped firmware therefore ran the library default of 32
+  the whole time, despite a source comment describing exactly the failure mode
+  this cap was meant to prevent. Confirmed inert with a `static_assert` probe
+  and moved into the env that actually builds.
+- An undrained SSE client could exhaust the heap. `AsyncEventSource` bounds its
+  per-client queue by MESSAGE COUNT, not by bytes (the default 32 was in force
+  because of the dead flag above), and this firmware pushes a ~1.5 kB telemetry
+  payload every
+  250 ms. One dashboard tab whose ACKs stalled therefore pinned up to
+  32 x 1.5 kB = ~48 kB in separately allocated `String`s — more than the whole
+  byte-addressable free heap on this board (25-38 kB measured). The field log
+  caught it exactly: `gate CLOSED free=10800 largest=5876 sse=1` followed by
+  `oom_gate heap=916/148`. The dev7 accept gate cannot help here, because the
+  offending client is already connected. A dashboard only ever wants the newest
+  reading, so a tick is now dropped rather than queued behind one that never
+  went out (`WEB_SSE_MAX_BACKLOG`, default 3 outstanding packets).
+- `radar_task` is no longer started on units where no radar answers. On such a
+  unit `LD2412Service::update()` returns immediately on `!_radar`, so the task
+  spun every 2 ms taking and releasing a mutex to do nothing while holding an
+  8192 B stack. Creation is now idempotent and lazy, so a radar that only
+  answers later (the post-OTA restore path re-begins it) still gets its task;
+  radar-equipped units are unaffected.
+- PubSubClient keepalive and socket timeout are now set explicitly (60 s and
+  4 s). Both library defaults are 15 s and neither was ever overridden, so
+  bounded `loopTask` stalls from CSI work read as a dead broker: the library
+  silently dropped the socket and the reconnect replayed all 59 Home Assistant
+  discovery entities. A production node logged four such reconnects within five
+  minutes of boot settling. The 15 s socket timeout was the worse half —
+  `readByte()` busy-waits on `yield()` for its full duration, so one truncated
+  packet parked `loopTask` for 15 s, long enough to starve CSI and to miss the
+  very keepalive that then tore the connection down. Detection of a genuinely
+  dead broker is unaffected: publishes fail fast on `!connected()`.
+
+### Added
+
+- `/api/health` reports an `sse` object (`clients`, `avg_waiting`,
+  `backlog_skips`). SSE depth was previously invisible from outside the device,
+  which is why a client draining the heap went unnoticed for so long.
+
+## [5.7.0-dev12] - 2026-08-20
+
+### Fixed
+
+- Every heap decision now reads the byte-addressable heap (`MALLOC_CAP_8BIT`)
+  instead of `MALLOC_CAP_INTERNAL`. arduino-esp32 implements
+  `ESP.getFreeHeap()`/`getMaxAllocHeap()`/`getMinFreeHeap()` over
+  `MALLOC_CAP_INTERNAL`, which also counts the leftover IRAM-only heap region
+  (0x40096000-0x400A0000 on this build: 40960 B raw, 40948 B usable). That
+  region carries `MALLOC_CAP_EXEC|MALLOC_CAP_32BIT` but not `MALLOC_CAP_8BIT`,
+  so `malloc()` and `operator new` can never allocate from it. Every threshold
+  in the firmware was consequently inflated by ~42 kB on this hardware.
+- The dev7 web low-heap gate could not close. A production node logged nine
+  `oom_gate` restarts in 6.3 h with `close_count: 0` and `rejects_total: 0`:
+  `free_internal` never fell below ~43 kB and `largest_internal` was pinned at
+  exactly 40948 in all nine markers, against 28 kB/12 kB close thresholds. The
+  L1/L1b/L2 layers were unreachable code; only the L3 restart ever fired.
+- Gate thresholds recalibrated to usable-heap bytes: close at 14 kB free /
+  6 kB largest, reopen above 22 kB / 10 kB. The node's real working band is
+  ~36-45 kB free, and the field OOMs struck between 1.4 and 13 kB, so the gate
+  now engages above that range instead of never.
+- `HEAP_MIN_FOR_PUBLISH` (SSE and MQTT publish suppression), the Telegram
+  low-RAM alerts, the security health check and the TLS handshake admission
+  policy were all comparing thresholds against the inflated number and could
+  not trigger either. They now see the real heap; the TLS policy is
+  correspondingly stricter and may refuse a handshake where it previously
+  passed on memory that did not exist.
+- The `oom_gate` marker records usable-heap figures, so `reset_history` no
+  longer reports tens of kB free at the instant a throwing `new` failed.
+- Remaining heap thresholds re-expressed in usable bytes, since honest readings
+  put several of them out of reach: `HEAP_MIN_FOR_PUBLISH` 20000 -> 12000,
+  `HEAP_LOW_WARNING` 30000 -> 18000, `HEAP_WARN_BYTES` 40000 -> 24000,
+  `HEAP_CRIT_BYTES` 20000 -> 12000, `HEAP_RECOVER_BYTES` 60000 -> 32000. The
+  recovery threshold mattered most: above the board's real ceiling, a low-RAM
+  alert could never have cleared. TLS admission moved to 36000/14000, sized on
+  an mbedTLS handshake's actual peak rather than on inflated readings.
+
+### Changed
+
+- `free_heap` and `min_heap` in `/api/health`, `heap_free`/`heap_min`/
+  `heap_largest` in `/metrics` and `/healthz`, and the `free_heap` /
+  `max_alloc_heap` MQTT topics now report the byte-addressable heap. Recorded
+  history from before dev12 reads roughly 42 kB higher for the same physical
+  state on this board.
+- `/api/health` gained a `heap` object publishing both capabilities side by
+  side (`free_8bit`, `largest_8bit`, `min_free_8bit`, `free_internal`,
+  `largest_internal`, `unusable_internal`, `internal_misleading`) so this class
+  of bug is visible from the outside on any future hardware.
+- Gate threshold NVS keys renamed to `wg8_close`, `wg8_open`, `wg8_lclose`,
+  `wg8_lopen`. The dev7 keys held values calibrated against the inflated
+  readings; reusing them would have held the gate permanently closed against
+  honest numbers, so they are abandoned rather than migrated.
+
+## [5.7.0-dev11] - 2026-08-20
+
+### Fixed
+
+- Boot-outage notifications now include the reporting firmware version in
+  Telegram text and the machine-readable MQTT event payload.
+
+## [5.7.0-dev10] - 2026-08-20
+
+### Fixed
+
+- MQTT offline persistence now keeps only event/alarm messages, avoiding
+  LittleFS writes for ordinary telemetry while the broker is unavailable.
+- Offline replay is limited to small batches, so reconnect recovery cannot
+  monopolize `loopTask` or trigger the Task WDT after a prolonged outage.
+
+## [5.7.0-dev9] - 2026-08-18
+
+### Fixed
+
+- **Runtime traffic-generator config change no longer crashes the node
+  (Task WDT panic).** Changing the CSI traffic generator at runtime via the web
+  API (`traffic_icmp` / `traffic_port` / `traffic_pps`) could reboot the device
+  on a Task-WDT panic (field 2026-08-18). Root cause: the setters run on the
+  `async_tcp` task, but the generator task is owned by `loopTask` (`update()`
+  starts it). Restarting it from `async_tcp` — a blocking `_stopTrafficGen()`
+  wait plus a respawn while `async_tcp` holds the lwIP TCPIP core lock — could
+  orphan the old task (its handle was nulled after a 1 s timeout even when the
+  task was still tearing down) and spawn a **second** generator; two tasks
+  contending the TCPIP core lock starved `loopTask` past its 60 s watchdog.
+  Fix mirrors the model-command-slot pattern: the setters now only stage the
+  new value and raise a restart flag; `update()` performs the stop/start on
+  `loopTask`, the task owner, where it is safe. Hardened `_stopTrafficGen()` to
+  clear the handle only once the task actually reached `eDeleted`, and
+  `_startTrafficGen()` to refuse a start while a previous task is still alive —
+  so a second generator can never be spawned even under the race. (Concurrency/
+  task-placement fix — verified by build + on-device soak, not unit-testable.)
+
+## [5.7.0-dev8] - 2026-08-17
+
+The node now reports its own outages. A three-day panic streak earlier this
+month went unnoticed until reset_history was read by hand — everything the
+device knows about a crash at the next boot is now pushed over Telegram
+instead of waiting to be audited.
+
+### Added
+
+- **Boot outage Telegram notice.** After a dirty boot — panic, any watchdog,
+  brownout, or an `oom_gate` restart (a controlled `esp_restart()`, so only
+  the cause string carries the incident) — the node sends a Telegram message
+  with the reset reason, restart cause, uptime before the outage, the
+  pre-crash heap triple recorded by `safeRestart()`/the OOM marker, and
+  whether a coredump is waiting. Clean boots stay quiet: OTA and user
+  restarts are intentional, and power-on can't be told apart from a routine
+  smart-plug power-cycle on PoE sites. The message is built in `setup()` from
+  reset-history data (pure `BootOutageNotice.h`, +`test_boot_outage`, 9
+  tests) and delivered by a loop one-shot once MQTT is up, with 30 s retries
+  (Telegram TLS may lag) and a 5-attempt cap.
+- **Heap-pressure episode Telegram notice.** When the dev7 web heap gate
+  reopens, the node reports the survived episode — closed duration, total
+  rejected connections, current/minimum heap. Sent on REOPEN, not close: at
+  close time the heap cannot afford a Telegram TLS handshake (the existing
+  TLS memory gate would veto it anyway).
+- **MQTT outage events (`security/<id>/system/outage`).** Both incidents above
+  are also published as **non-retained** JSON events (`boot_outage`,
+  `heap_gate_episode`) so a Home Assistant automation can forward them to
+  Telegram — HA-side Telegram is the deployment norm, the node-side bot is
+  often unconfigured. Non-retained on purpose: an HA restart must not replay
+  a stale outage (same rationale as the dev6 passage edge). The retained
+  `system/restart_cause` topic is unchanged and still fires on every boot.
+
+## [5.7.0-dev7] - 2026-08-17
+
+Two independent gates closing the two failure classes surfaced by the
+2026-08-15 field coredump and the 2026-08-17 armed false trigger: the web
+server stops taking new work while the heap is collapsing (instead of
+panicking inside library code), and the CSI threshold path stops voting on
+frozen data while the capture is packet-starved.
+
+### Added
+
+- **Web low-heap accept gate (L1).** The 2026-08-15 coredump showed the dev6
+  OOM guards working — and the panic simply moving into ESPAsyncWebServer's
+  own header parsing, which allocates with a *throwing* `new` on a dead heap.
+  `GatedAsyncWebServer` re-registers the library's accept callback (no fork;
+  the pinned commit's lambda is mirrored with a `new (std::nothrow)`) and
+  consults a pure hysteresis policy (`HeapGatePolicy.h`,
+  +`test_heap_gate_policy`): the gate CLOSES when free heap < 28 kB or the
+  largest allocatable block < 12 kB, rejects new connections with an
+  allocation-free TCP RST, and only REOPENS above 40 kB / 16 kB so a heap
+  hovering at the boundary cannot flap it. Existing connections are untouched;
+  MQTT and the alarm core keep their heap headroom. NVS: `web_gate_en`
+  (default 1), `web_gate_close` / `web_gate_open` (kB). State in
+  `/api/health` → `web_gate{enabled,closed,rejects_total,close_count}`; the
+  loop task probes the gate once a second and logs CLOSE (with a heap/SSE/MQTT
+  snapshot, mirrored into the RTC log ring) and reopen transitions.
+- **SSE client cap (L1b).** SSE reconnect storms (browser tabs + HA right
+  after a link flap — the pattern in the coredump) each hold an AsyncTCP
+  connection and send queue. New event streams are refused while the heap
+  gate is closed, and concurrent SSE clients are capped at
+  `WEB_SSE_MAX_CLIENTS` (4).
+- **OOM last resort: controlled `oom_gate` restart instead of a panic loop
+  (L3).** `std::set_new_handler` now catches the moment a throwing `new`
+  cannot be satisfied anywhere in the firmware. The handler is allocation-free:
+  it stamps an RTC-noinit marker (uptime + free heap + largest block,
+  checksummed — `OomGuard.h`, +`test_oom_marker`) and calls `esp_restart()`.
+  The next boot folds the marker into `reset_history` as cause
+  `oom_gate heap=<free>/<largest>` with the marker's uptime. Guards: NVS
+  `oom_restart_en=0` restores the old panic+coredump behaviour for debugging;
+  an active OTA reboot-inhibit aborts instead (a restart mid-flash-write risks
+  a brick); and if the *previous* boot already ended in an `oom_gate` restart
+  and the next OOM hits within 60 s, the handler aborts so a restart loop
+  surfaces as a visible panic instead of cycling silently.
+- **Lab-only OOM stressor.** `POST /api/dev/oom` (compiled only with
+  `-D DEV_STRESS`, never in release envs) exhausts the heap on demand to
+  bench-validate the whole `oom_gate` → RTC marker → `reset_history` path.
+
+### Fixed
+
+- **CSI threshold path can no longer enter MOTION from packet-starved
+  (frozen) data.** Armed false trigger 2026-08-17 12:32 on the production
+  node: at pps=0 the turbulence buffer and running variance freeze at their
+  last values, `_updateMotionState()` kept comparing the frozen variance
+  against the effective threshold every tick, and ~8 s of starvation
+  accumulated enough smoothing votes to fire `motion_enter` → alarm. The ML
+  path has had a starvation gate since v5.4 (`csiMlVoteTrusted`); the
+  threshold path had none. A tick without fresh packets
+  (`csiVarianceVoteTrusted`, floor 0.5 pps — any real data passes, a
+  zero-packet tick never does) now freezes the whole decision: no smoothing
+  shift, no state change, no shadow evaluation, no idle-baseline drift.
+  Health events still run, the decision trace reports the new
+  `data_starved` reason (plus `data_starved` + `packet_rate` fields in
+  `/api/csi/decision`), and `/api/health` counts frozen ticks in
+  `csi.starved_ticks`. +3 classifier tests, +3 vote-gate tests.
+
+## [5.7.0-dev6] - 2026-08-13
+
+Passage-edge MQTT events so Home Assistant can detect a real passage from a
+discrete edge instead of the pinned retained state, plus a web-handler
+out-of-memory fix surfaced by a field coredump.
+
+### Added
+
+- **CSI passage-edge events (`<mqtt_id>/csi/event`).** On every variance-based
+  motion transition the node now publishes a compact, **non-retained** JSON
+  edge, so Home Assistant can detect a real passage from the EDGE instead of
+  the retained `<mqtt_id>/csi/motion` state — which pins `ON`, is replayed to
+  every new subscriber, and re-fires after an HA restart. Fields: `v` (schema
+  version = 1), `boot_id` (random hex per boot), `seq` (monotonic per boot),
+  `event` (`motion_started` / `motion_ended`), `uptime_ms`, `source`
+  (`csi_variance` for a real edge), `variance`, `threshold`. `boot_id` +
+  `uptime_ms` let a consumer reject a retained / offline-buffer replay from a
+  previous boot. The payload formatter is a pure, header-only helper
+  (`CsiMotionEdge.h`), so it is native-testable without Arduino/MQTT
+  (+`test_csi_motion_edge`). The edge is best-effort: if the broker is down at
+  the transition the event is dropped rather than retried, so a stale replayed
+  edge can never fake a passage.
+- **`POST /api/csi/selftest/edge?state=1|0`.** Emits a synthetic passage edge
+  (`source:"selftest"`) on `<mqtt_id>/csi/event`, so the event wire and an HA
+  passage automation can be validated deterministically without physical
+  motion. `state=1` → `motion_started` (default), `state=0` → `motion_ended`;
+  Digest auth like the other mutating CSI endpoints. The `selftest` source
+  marking means a synthetic edge can never be mistaken for a real passage.
+
+### Fixed
+
+- **Web-handler OOM recovery no longer panics the `async_tcp` task.** Four
+  handlers in `src/WebRoutes.cpp` recovered from a failed `new (std::nothrow)`
+  buffer allocation by calling `request->send(503, ...)` — which itself
+  allocates a response object through a *throwing* `operator new`. Under real
+  heap exhaustion that second allocation also fails, libstdc++ cannot construct
+  the `bad_alloc`, and `std::terminate()` reboots the node (field coredump
+  2026-08-12). The OOM branches now recover with the allocation-free
+  `request->abort()`. A source-invariant guard test (`test_web_alloc_guard`)
+  enforces that every `new (std::nothrow)` failure path in `WebRoutes.cpp`
+  stays allocation-free, so a regression that reintroduces an allocating
+  OOM-recovery branch fails the suite.
+
+## [5.7.0-dev2] - 2026-08-05
+
+Four MED + six LOW findings from the 2026-08-05 surface review of the
+v5.6.0 + #13 diffs.
+
+### Fixed
+
+- **`adaptive_pct` API input is now parsed strictly.** The handler used Arduino
+  `toFloat()`, which returns 0 for anything unparseable (empty value, decimal
+  comma, typo); the setter clamp then turned that 0 into a **persisted P50** —
+  dropping the detection threshold to the median of the idle-variance window on
+  an armed node, the exact opposite of the P99 desensitization intent. Invalid
+  or out-of-band input is now rejected and ignored, like the neighbouring
+  `hysteresis` handler (`csiParseAdaptivePercentile`, +2 native tests).
+- **`csi_adapt_pct` included in config export/import.** The percentile was
+  persisted in NVS but missing from `/api/config/export` and from the import
+  validation + write lists, so restoring a backup onto a replacement node
+  silently reverted a P99-tuned node to P95. Import validates the [0.50, 0.999]
+  band like every other float field.
+- **SSE telemetry buffer 1536 → 2048 B.** The v5.6.0 fusion block (~240 B)
+  pushed the worst-case frame (eng-mode gate arrays + CSI with ML + learning +
+  fusion) to ~1.55 KB, within a few dozen bytes of the cap. On overflow
+  `serializeJson` truncates, the length guard rejects the frame, and **every**
+  SSE event is silently dropped — the whole dashboard freezes until eng
+  mode/learning stops (the pre-v4.1.3 failure mode). Stale sizing comment
+  refreshed.
+- **Config-import rollback reports restore failures.** `rollback()` discarded
+  every restore return value while the handler unconditionally logged "rolled
+  back to pre-import state" — under a nearly-full NVS the durable half-state
+  that #5 exists to prevent could persist with a falsely clean log. Rollback now
+  returns the count of unrestored keys and the handler logs an ERROR telling the
+  operator to verify settings before reboot.
+
+### Fixed (LOW residua, same review)
+
+- **Fusion reason no longer claims a CSI vote that never happened.** The CSI
+  starvation fallback rendered "radar only, CSI/ML disagree" while CSI had
+  simply stopped delivering frames. New `FUSION_CSI_STALE` source bit → "radar
+  only (CSI stale, no data)" (+3 native tests).
+- **Stale EMA persist can no longer overwrite a just-applied/rolled-back
+  model** — `_switchDetectionToActive()` drops the pending main-loop EMA stash
+  derived from the previous active slot.
+- **Config-import journal reserves its storage up front** — a mid-import
+  `push_back` realloc under heap exhaustion would abort (`-fno-exceptions`)
+  after keys were written but before rollback could run.
+- **Serial RSSI diag uses the shared placement thresholds**
+  (`CSI_RSSI_HOT_DBM`/`CSI_RSSI_WEAK_DBM`, was hard-coded -40/-70 predating the
+  v5.6.0 tune) and stays silent when not associated (rssi==0), so it cannot
+  contradict `/api/health` during live placement tuning.
+- **Fusion panel UI:** the radar N/A hatch on radar-less nodes now actually
+  renders (inline height beat the `.fbar.na` stylesheet rule), and the panel
+  stays hidden until the first SSE frame carries fusion data (no permanently
+  dash-filled card when CSI is disabled).
+
+## [5.7.0-dev1] - 2026-07-31
+
+First feature of the v5.7 line, on top of the v5.6 base.
+
+### Added
+
+- **Selectable adaptive-threshold percentile (#13).** The rolling adaptive
+  detection threshold was hard-wired to the P95 of the idle-variance window. It is
+  now configurable — P95 (the sensitive default) or P99, which rides higher on the
+  noise tail and cuts false positives on noisy links at the cost of sensitivity.
+  Set via `POST /api/csi?adaptive_pct=95|99` (a fraction like `0.99` or a whole
+  percent like `99`; clamped to [0.50, 0.999]), persisted in NVS as `csi_adapt_pct`,
+  and reported as `adaptive_percentile` in the `/api/health` csi block. The quantile math is a
+  pure, host-tested helper (`CsiAdaptiveThreshold.h`, +5 native tests).
+
 ## [5.6.0] - 2026-08-01
 
 Placement-awareness, fusion explainability and a cluster of concurrency and

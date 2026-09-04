@@ -31,7 +31,7 @@ struct MQTTTopics {
     char energy_stat[64];
     char light[64];
     char tamper[64];
-    char rssi[64];
+    char eth_link[64];   // ETH PHY link ON/OFF (was misnamed "rssi" until v5.7.0-dev14)
     char uptime[64];
     char ip[64];
     char current_zone[64];
@@ -89,6 +89,7 @@ struct MQTTTopics {
 
     // System restart diagnostics
     char restart_cause[64];
+    char system_outage[64];   // dev8: non-retained outage/heap-episode events (HA → Telegram)
 
     // Chip temperature
     char chip_temp[64];
@@ -148,6 +149,9 @@ public:
     uint16_t getPublishFailStreak() const { return _publishFailStreak; }
     uint32_t getPublishFailTotal()  const { return _publishFailTotal; }
     uint32_t getReconnectTotal()    const { return _reconnectTotal; }
+    // dev17: which discovery entity (if any) was mid-publish when the heap
+    // watermark moved. -1 = discovery not running.
+    int      discoveryIndex()       const { return _discoveryIndex; }
     unsigned long getLastPublishFailMs() const { return _lastPublishFailMs; }
     const char* getLastFailTopic()  const { return _lastFailTopic; }
     int  getLastFailState()         const { return _lastFailState; }

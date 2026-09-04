@@ -7,21 +7,12 @@
 #include <Preferences.h>
 #include <atomic>
 
+// NotificationType and AlertSource live with the cooldown policy, which is the
+// code that has to reason about both of them together.
+#include "services/NotificationCooldownPolicy.h"
+
 // Forward declaration
 class TelegramService;
-
-// Notification Types
-enum class NotificationType {
-    TAMPER_ALERT,
-    PRESENCE_DETECTED,
-    PRESENCE_CLEARED,
-    SYSTEM_ERROR,
-    WIFI_ANOMALY,
-    HEALTH_WARNING,
-    ALARM_STATE_CHANGE,
-    ENTRY_DETECTED,
-    ALARM_TRIGGERED       // FIX #2: dedicated type for real alarm triggers (never tamper-gated)
-};
 
 struct NotificationConfig {
     bool enabled = false;
@@ -56,7 +47,11 @@ public:
     void update();
 
     // Send notifications
-    bool sendAlert(NotificationType type, const String& message, const String& details = "");
+    // `source` identifies the producer for cooldown purposes. Leaving it
+    // GENERIC keeps the old per-type rate limiting; naming it stops one
+    // producer from muting a different one that shares its type.
+    bool sendAlert(NotificationType type, const String& message, const String& details = "",
+                   AlertSource source = AlertSource::GENERIC);
 
     // Configuration
     void setTelegramConfig(const char* token, const char* chatId);
@@ -80,7 +75,7 @@ private:
     void processWebhookQueue();
 
     String formatMessage(NotificationType type, const String& message, const String& details);
-    bool checkCooldown(NotificationType type);
+    bool checkCooldown(NotificationType type, AlertSource source);
     const char* getTypeString(NotificationType type);
 
     NotificationConfig _config;
@@ -96,8 +91,8 @@ private:
     // fail-closed TLS policy never turns alarm delivery into a silent failure.
     std::atomic<uint8_t> _tlsBlockedMask{0};
 
-    // Cooldown tracking per notification type
-    unsigned long _lastNotification[9] = {0};  // One per NotificationType enum
+    // Cooldown tracking, keyed by producer rather than by type
+    NotificationCooldownPolicy _cooldown;
 };
 
 #endif

@@ -563,8 +563,9 @@ const char index_html[] PROGMEM = R"rawliteral(
         </div>
     </div>
 
-    <!-- FUSION EXPLAINABILITY (#8) -->
-    <div class="card" id="fusion_panel">
+    <!-- FUSION EXPLAINABILITY (#8) — hidden until the first SSE frame carries a
+         fusion object (CSI disabled / not compiled => permanently dash-filled card) -->
+    <div class="card" id="fusion_panel" style="display:none">
         <div class="section-title" data-nocollapse data-i18n="fusion_title">Fúze — kdo vidí pohyb</div>
         <div class="fbars">
             <div class="fbar" id="fbar_radar"><div class="fbar-track"><div class="fbar-fill" id="fb_radar"></div></div><span data-i18n="radar_lbl">Radar</span></div>
@@ -1254,7 +1255,11 @@ function connectSSE() {
         if(d.alarm_state) { alarmArmed = d.armed; updateAlarmUI(d.alarm_state); }
         if(d.gate_move && !$('tab2').classList.contains('hidden')) updateGatesUI(d);
         if(d.csi) { renderCsiMainPanel(d.csi); updateCSIUI(d.csi); }
-        if(d.fusion) renderFusionPanel(d.fusion);
+        if(d.fusion) {
+            const fp = $('fusion_panel');
+            if (fp && fp.style.display === 'none') fp.style.display = '';
+            renderFusionPanel(d.fusion);
+        }
     });
 
     evtSource.onerror = () => {
@@ -1651,11 +1656,17 @@ function renderFusionPanel(f) {
         el.style.height = clamp(lvl) + '%';
         el.className = 'fbar-fill' + (on ? ' on' : '');
     };
-    // radar N/A on CSI-only (radar-less) nodes
+    // radar N/A on CSI-only (radar-less) nodes — clear the inline height so the
+    // stylesheet's .fbar.na hatch (height:100%) can win; inline style beats CSS
     const rbar = $('fbar_radar');
     const radarNa = (f.radar_present === false);
     if (rbar) rbar.classList.toggle('na', radarNa);
-    setBar('fb_radar', radarNa ? 0 : f.radar_lvl, f.radar);
+    if (radarNa) {
+        const el = $('fb_radar');
+        if (el) { el.style.height = ''; el.className = 'fbar-fill'; }
+    } else {
+        setBar('fb_radar', f.radar_lvl, f.radar);
+    }
     setBar('fb_csi', f.csi_lvl, f.csi);
     setBar('fb_ml', f.ml_lvl, f.ml);
     const pct = Math.round((f.confidence || 0) * 100);

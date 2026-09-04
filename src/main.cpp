@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <ETH.h>
+#include "services/HeapMetrics.h"
 #ifndef LITE_BUILD
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
@@ -22,11 +23,23 @@
 #include "services/NotificationService.h"
 #include "services/TelegramService.h"
 #include "services/LogService.h"
+#include "services/HeapWatermarkTripwire.h"
+#include "services/HeapSkipTracker.h"
+#include "services/HeapWatermarkRing.h"
 #include "services/DmsPolicy.h"
 #include "services/EventLog.h"
 #include "services/RuntimeOperationCoordinator.h"
 #include "services/ConfigSnapshot.h"
 #include "services/MQTTOfflineBuffer.h"
+#include "services/HeapGatePolicy.h"   // dev7 L1: web low-heap accept gate
+#include "services/EthLinkFlapTracker.h" // real PHY flap accounting (the watchdog only aliases it)
+#include "services/OomGuard.h"         // dev7 L3: OOM new-handler marker + restart decision
+#include "services/BootOutageNotice.h" // dev8: dirty-boot Telegram notice
+#include <esp_core_dump.h>
+#ifndef LITE_BUILD
+#include "services/GatedWebServer.h"   // dev7 L1: AsyncWebServer with gated accept
+#endif
+#include <new>                          // std::set_new_handler
 #ifndef NO_BLUETOOTH
 #include "services/BluetoothService.h"
 #endif
@@ -48,7 +61,7 @@
 // -------------------------------------------------------------------------
 #include <Update.h>
 #ifndef FW_VERSION
-#define FW_VERSION "v5.6.0"
+#define FW_VERSION "v5.7.0"
 #endif
 #define WDT_TIMEOUT_SECONDS 60
 
@@ -88,8 +101,14 @@ const char* ntpServer = "pool.ntp.org";
 // Objects
 // -------------------------------------------------------------------------
 LD2412Service radar(RADAR_RX_PIN, RADAR_TX_PIN);
+// dev7 L1: accept gate shared by the web server (async_tcp), the SSE connect
+// handler, /api/health and the loop-task transition logging.
+HeapGatePolicy g_webHeapGate;
+// Counts the driver's own link edges. The 60 s connectivity watchdog below can
+// only ever see a 2 s glitch as "60 s down"; this sees what actually happened.
+EthLinkFlapTracker g_ethFlap;
 #ifndef LITE_BUILD
-AsyncWebServer server(80);
+GatedAsyncWebServer server(80, g_webHeapGate);
 AsyncEventSource events("/events");
 #endif
 Preferences preferences;
@@ -104,9 +123,32 @@ CSIService csiService;
 NotificationService notificationService;
 TelegramService telegramBot;
 LogService systemLog(20);
+// dev19: the publish guard fires while STAB reports 59 kB free five seconds
+// either side, so the dip lives between two samples. Count every skip, log a
+// few — see include/services/HeapSkipTracker.h.
+HeapSkipTracker g_mqttHeapSkips(10000);
+HeapSkipTracker g_sseHeapSkips(10000);
+
+// dev17 heap-spike forensics — see include/services/HeapWatermarkTripwire.h.
+// 2 kB minimum drop, at most 8 log lines for the whole boot: LogRtcRing has
+// 20 slots shared with ordinary logging and must not be flooded by its own
+// instrument.
+HeapWatermarkTripwire g_heapWatermarkTripwire(2048, 8);
 // Log ring v RTC noinit RAM — přežije panic i SW reset (ne power-cycle),
 // takže /api/logs po pádu ukáže i záznamy z doby před restartem.
 RTC_NOINIT_ATTR static LogRtcRing g_rtcLog;
+// dev18: the tripwire's OWN ring. It used to write through systemLog into
+// g_rtcLog above — which the ETH link handler turns over in ~50 min on a
+// flapping link, evicting the very evidence the tripwire collects. Separate
+// storage, nobody else writes here.
+RTC_NOINIT_ATTR HeapWatermarkRtcRing g_heapWmRing;
+HeapWatermarkRtcRing g_heapWmPrevBoot;   // RAM copy carried from the last boot
+bool g_heapWmPrevBootValid = false;
+// dev7 L3: OOM incident marker — the new-handler must not allocate, so the
+// record survives in RTC noinit RAM and is folded into reset_history at boot.
+RTC_NOINIT_ATTR static OomMarker g_oomMarker;
+static bool g_lastBootWasOomRestart = false;   // loop guard input, set once at boot
+static std::atomic<bool> g_oomRestartEnabled{true};   // NVS oom_restart_en
 EventLog eventLog(RAM_CAPACITY);
 ConfigSnapshot configSnapshot;
 MQTTOfflineBuffer mqttOfflineBuffer;
@@ -115,6 +157,13 @@ BluetoothService btService;
 #endif
 TaskHandle_t radarTaskHandle = nullptr;
 String g_prevRestartCause = "none";
+// dev8: boot outage notices — built in setup() from the reset-history data,
+// delivered by loop one-shots once the network is up, then cleared. The text
+// goes to the node's own Telegram (if configured); the JSON goes NON-retained
+// to security/<id>/system/outage for an HA automation to forward (HA-side
+// Telegram is the deployment norm — the node-side bot is often unconfigured).
+static String g_bootOutageNotice;
+static String g_bootOutageEventJson;
 
 // -------------------------------------------------------------------------
 // Supervision Heartbeat — peer monitoring
@@ -203,6 +252,8 @@ std::atomic<bool> g_otaRebootForce{false};
 // CSI data health: true when WiFi is associated but no CSI frames arrive (weak
 // signal / AP issue) → detection is starved. Surfaced in /api/health + metrics.
 std::atomic<bool> g_csiDataStarved{false};
+// dev13: SSE ticks dropped because a client had not drained its queue.
+std::atomic<uint32_t> g_sseBacklogSkips{0};
 RuntimeOperationCoordinator g_runtimeOperationCoordinator;
 #ifndef LITE_BUILD
 std::atomic<bool> g_espotaPrepareRequested{false};
@@ -304,6 +355,7 @@ void onEthEvent(arduino_event_id_t event) {
         case ARDUINO_EVENT_ETH_CONNECTED:
             Serial.println("[ETH] Link UP");
             DBG("ETH", "event=connected uptime_ms=%lu link=%d", millis(), ETH.linkUp());
+            g_ethFlap.onLinkUp(millis());
             ethConnected = true;
             break;
         case ARDUINO_EVENT_ETH_GOT_IP:
@@ -318,6 +370,7 @@ void onEthEvent(arduino_event_id_t event) {
         case ARDUINO_EVENT_ETH_DISCONNECTED:
             Serial.println("[ETH] Link DOWN");
             DBG("ETH", "event=disconnected uptime_ms=%lu link=%d", millis(), ETH.linkUp());
+            g_ethFlap.onLinkDown(millis());
             ethConnected = false;
             ethGotIP = false;
             break;
@@ -339,7 +392,7 @@ void safeRestart(const char* reason) {
     bool force = g_otaRebootForce.load();
     if (g_rebootInhibit.load() && !force) {
         DBG("SYSTEM", ">>> REBOOT INHIBIT: '%s' suppressed (uptime %lus, heap %u)",
-            reason, millis() / 1000, ESP.getFreeHeap());
+            reason, millis() / 1000, heapFreeUsable());
         systemLog.warn(String("Reboot inhibit: ") + reason + " suppressed");
         return;
     }
@@ -347,13 +400,32 @@ void safeRestart(const char* reason) {
     mqttService.processDeferredActions();
     preferences.putString("restart_cause", reason);
     preferences.putULong("last_uptime", millis() / 1000);
-    preferences.putULong("last_heap", ESP.getFreeHeap());
-    preferences.putULong("last_maxalloc", ESP.getMaxAllocHeap());
-    preferences.putULong("last_minheap", ESP.getMinFreeHeap());
+    preferences.putULong("last_heap", heapFreeUsable());
+    preferences.putULong("last_maxalloc", heapLargestUsable());
+    preferences.putULong("last_minheap", heapMinFreeUsable());
     DBG("SYSTEM", ">>> RESTART: %s (uptime %lus, heap %u/%u/%u)",
-        reason, millis() / 1000, ESP.getFreeHeap(), ESP.getMaxAllocHeap(), ESP.getMinFreeHeap());
+        reason, millis() / 1000, heapFreeUsable(), heapLargestUsable(), heapMinFreeUsable());
     delay(500);
     ESP.restart();
+}
+
+// -------------------------------------------------------------------------
+// dev7 L3: OOM last resort — std::set_new_handler target
+// -------------------------------------------------------------------------
+// A throwing `new` could not be satisfied anywhere in the firmware (field
+// coredump 2026-08-15: ESPAsyncWebServer header parsing). NOTHING here may
+// allocate — no String, no NVS, no log, no safeRestart() (it does NVS puts
+// and an MQTT drain). Stamp the RTC marker, then either restart cleanly or
+// fall through to abort() for a panic + coredump (debug flag, OTA write in
+// progress, or a restart loop caught by the uptime guard).
+static void oomNewHandler() {
+    uint32_t uptimeS = millis() / 1000;
+    oomMarkerSet(g_oomMarker, uptimeS, heapFreeUsable(), heapLargestUsable());
+    if (oomShouldRestart(g_oomRestartEnabled.load(), g_rebootInhibit.load(),
+                         g_lastBootWasOomRestart, uptimeS)) {
+        esp_restart();
+    }
+    abort();   // keep the pre-dev7 behaviour: panic + coredump
 }
 
 // -------------------------------------------------------------------------
@@ -418,6 +490,18 @@ void radarTask(void* param) {
     }
 }
 
+// dev13: don't pay 8 kB of stack for a sensor that isn't there. On a radar-less
+// unit LD2412Service::update() returns immediately on `!_radar`, so this task
+// spun every 2 ms taking and releasing a mutex to do nothing — while holding
+// 8192 B, roughly a quarter of the byte-addressable heap this board actually
+// has free (25-38 kB measured). Idempotent and lazy so a radar that only
+// answers later (post-OTA restore re-begins it) still gets its task. Every
+// radarTaskHandle reader is already null-guarded.
+static void ensureRadarTask(bool radarPresent) {
+    if (radarTaskHandle || !radarPresent) return;
+    xTaskCreatePinnedToCore(radarTask, "radar_task", 8192, nullptr, 2, &radarTaskHandle, 1);
+}
+
 // ETH link watchdog timeout — reboot if link stays down this long
 constexpr unsigned long ETH_LINK_WATCHDOG_MS = 300000; // 5 minut
 
@@ -427,6 +511,7 @@ void connectivityTask(void* param) {
     int mqttFailCount = 0;
     const int MQTT_FAIL_THRESHOLD = 5;
     unsigned long ethDownSince = 0; // 0 = ETH is up
+    uint32_t ethDownFlapMark = 0;   // flap count when this outage was first seen
 
     for (;;) {
         vTaskDelay(delayTicks);
@@ -438,10 +523,23 @@ void connectivityTask(void* param) {
 
         // --- ETH link watchdog ---
         if (!ETH.linkUp()) {
+            uint32_t flapNow = g_ethFlap.stats(millis()).downCount;
             if (ethDownSince == 0) {
                 ethDownSince = millis();
+                ethDownFlapMark = flapNow;
                 DBG("CONN", "ETH link DOWN — watchdog started");
                 systemLog.warn("ETH link DOWN");
+            } else if (flapNow != ethDownFlapMark) {
+                // A new outage began since the last sample, which means the
+                // link came back up in between and this is a FLAPPING link,
+                // not a dead one. Restarting the timer matters: a link down
+                // 23.5 % of the time (measured in the field) makes six
+                // consecutive unlucky samples a roughly daily event, and this
+                // watchdog would then reboot a node whose link works.
+                ethDownSince = millis();
+                ethDownFlapMark = flapNow;
+                DBG("CONN", "ETH link flapping (%lu outages) — watchdog timer restarted",
+                    (unsigned long)flapNow);
             } else {
                 unsigned long downFor = millis() - ethDownSince;
                 DBG("CONN", "ETH link DOWN for %lu s / %lu s timeout",
@@ -467,12 +565,22 @@ void connectivityTask(void* param) {
 
         // ETH is up — reset watchdog
         if (ethDownSince != 0) {
+            // This figure is quantised to the 60 s poll period and says only
+            // "the link was down when I last looked". Report the driver's
+            // measured total alongside it so the log cannot be misread as an
+            // outage length — a 2 s PHY glitch used to print "restored after
+            // 60s" and that number reached Home Assistant as fact.
             unsigned long downSec = (millis() - ethDownSince) / 1000;
-            DBG("CONN", "ETH link restored after %lu s", downSec);
-            systemLog.info("ETH link restored after " + String(downSec) + "s");
+            EthLinkFlapStats flap = g_ethFlap.stats(millis());
+            DBG("CONN", "ETH link restored (unseen for <=%lu s; driver: %lu flaps, %lu ms down total)",
+                downSec, (unsigned long)flap.downCount, (unsigned long)flap.downTotalMs);
+            systemLog.info("ETH link back (unseen <=" + String(downSec) + "s, " +
+                           String(flap.downCount) + " flaps/" +
+                           String(flap.downTotalMs / 1000) + "s down since boot)");
             ethLinkDownSeconds = downSec;
             ethLinkRestoredNotify = true; // consumed by loop()
             ethDownSince = 0;
+            ethDownFlapMark = 0;
         }
 
         // --- MQTT watchdog ---
@@ -494,6 +602,14 @@ void setup() {
 
     // Restore logu z předchozího bootu (RTC RAM), pak ring resetovat a
     // připojit jako mirror pro tento běh — dřív než cokoli začne logovat.
+    // Carry the previous boot's watermark records into RAM before clearing the
+    // RTC ring for this boot — after a panic they are the last thing the node
+    // saw, and that is exactly when they matter.
+    if (heapWmRingValid(g_heapWmRing) && heapWmRingCount(g_heapWmRing) > 0) {
+        memcpy(&g_heapWmPrevBoot, &g_heapWmRing, sizeof(g_heapWmPrevBoot));
+        g_heapWmPrevBootValid = true;
+    }
+    heapWmRingInit(g_heapWmRing);
     if (logRingValid(g_rtcLog)) systemLog.restorePrevBoot(g_rtcLog);
     logRingInit(g_rtcLog);
     systemLog.attachRtcMirror(&g_rtcLog);
@@ -572,6 +688,7 @@ void setup() {
     Serial.println("=============================================\n");
 
     // Register ETH event handler BEFORE ETH.begin()
+    g_ethFlap.begin(millis());   // observation window opens with the handler
     WiFi.onEvent(onEthEvent);
 
     // --- Auto-Config by MAC (Multi-Device Support) ---
@@ -631,11 +748,25 @@ void setup() {
     rtc_uptime_magic = RTC_UPTIME_MAGIC;  // arm for next crash
     rtc_last_uptime_s = 0;
 
+    // dev7 L3: an OOM new-handler restart cannot write NVS (restart_cause stays
+    // "none", reset reason reads as a plain software reset) — the RTC marker is
+    // the only record. Fold it into this boot's entry and remember it for the
+    // restart-loop guard in oomNewHandler().
+    const char* uptimeSrc = rtcValid ? "rtc" : "nvs";
+    if (oomMarkerValid(g_oomMarker)) {
+        g_lastBootWasOomRestart = true;
+        prevRestartCause = "oom_gate heap=" + String(g_oomMarker.freeBytes) +
+                           "/" + String(g_oomMarker.largestBytes);
+        crashUptime = g_oomMarker.uptimeS;
+        uptimeSrc = "oom_marker";
+    }
+    oomMarkerClear(g_oomMarker);   // also scrubs power-on RTC garbage
+
     JsonObject entry = arr.add<JsonObject>();
     entry["reason"] = reasonStr;
     entry["cause"] = prevRestartCause;
     entry["uptime"] = crashUptime;
-    entry["uptime_src"] = rtcValid ? "rtc" : "nvs";
+    entry["uptime_src"] = uptimeSrc;
     entry["ts"] = millis();
 
     while (arr.size() > 10) arr.remove(0);
@@ -647,10 +778,66 @@ void setup() {
     DBG("SYSTEM", "Reset reason: %s, cause: %s", reasonStr.c_str(), prevRestartCause.c_str());
     systemLog.warn("System restart: " + reasonStr + " (" + prevRestartCause + ")");
 
+    // dev8: dirty boot (panic/WDT/brownout/oom_gate) → queue a Telegram notice
+    // with everything the previous run left behind; the loop delivers it once
+    // the network is up. Clean boots (OTA, user restart, power-cycle) stay quiet.
+    if (bootOutageIsDirty(reasonStr.c_str(), prevRestartCause.c_str())) {
+        BootOutageInfo oi;
+        oi.resetReason  = reasonStr.c_str();
+        oi.restartCause = prevRestartCause.c_str();
+        oi.fwVersion    = FW_VERSION;
+        oi.uptimeS      = crashUptime;
+        oi.prevHeap     = preferences.getULong("last_heap", 0);
+        oi.prevMaxAlloc = preferences.getULong("last_maxalloc", 0);
+        oi.prevMinHeap  = preferences.getULong("last_minheap", 0);
+        size_t cdAddr = 0, cdSize = 0;
+        oi.coredumpPresent = (esp_core_dump_image_get(&cdAddr, &cdSize) == ESP_OK && cdSize > 0);
+        char noticeBuf[400];
+        formatBootOutageNotice(noticeBuf, sizeof(noticeBuf), oi);
+        g_bootOutageNotice = noticeBuf;
+        formatBootOutageEventJson(noticeBuf, sizeof(noticeBuf), oi);
+        g_bootOutageEventJson = noticeBuf;
+    }
+
+    // dev7: web low-heap gate config + OOM last-resort handler. Registered
+    // after the marker read above so the loop guard sees this boot's origin.
+    {
+        HeapGateConfig gcfg;   // dev12: defaults are byte-addressable-heap bytes
+        gcfg.enabled = preferences.getBool("web_gate_en", true);
+        // dev12 key rename. The dev7 keys (web_gate_close/web_gate_open) held
+        // kB values calibrated against MALLOC_CAP_INTERNAL readings, ~42 kB too
+        // high for this board; reusing them would let a stale NVS entry hold the
+        // gate permanently closed against honest numbers. Abandon, don't reuse.
+        // Defaults come from the struct so the calibration lives in one place.
+        gcfg.closeFreeBytes    = preferences.getUInt("wg8_close",  gcfg.closeFreeBytes    / 1024) * 1024;
+        gcfg.openFreeBytes     = preferences.getUInt("wg8_open",   gcfg.openFreeBytes     / 1024) * 1024;
+        gcfg.closeLargestBytes = preferences.getUInt("wg8_lclose", gcfg.closeLargestBytes / 1024) * 1024;
+        gcfg.openLargestBytes  = preferences.getUInt("wg8_lopen",  gcfg.openLargestBytes  / 1024) * 1024;
+        g_webHeapGate.configure(gcfg);
+        g_oomRestartEnabled.store(preferences.getBool("oom_restart_en", true));
+        std::set_new_handler(oomNewHandler);
+        DBG("SYSTEM", "Web heap gate: %s free %u/%ukB largest %u/%ukB (8bit heap), OOM restart: %s",
+            gcfg.enabled ? "on" : "off",
+            (unsigned)(gcfg.closeFreeBytes / 1024), (unsigned)(gcfg.openFreeBytes / 1024),
+            (unsigned)(gcfg.closeLargestBytes / 1024), (unsigned)(gcfg.openLargestBytes / 1024),
+            g_oomRestartEnabled.load() ? "on" : "off");
+        // One-off boot audit: how far the pre-dev12 readings were off on THIS
+        // board. Same line proves the fix took effect on any future hardware.
+        {
+            HeapReading hr = heapReadingNow();
+            DBG("SYSTEM", "Heap 8bit free=%u largest=%u | internal free=%u largest=%u | unusable=%u%s",
+                (unsigned)hr.freeUsable, (unsigned)hr.largestUsable,
+                (unsigned)hr.freeInternal, (unsigned)hr.largestInternal,
+                (unsigned)heapUnusableInternalBytes(hr),
+                heapInternalIsMisleading(hr) ? " (INTERNAL MISLEADING)" : "");
+        }
+    }
+
     uint8_t minGate = preferences.getUInt("radar_min", 0);
     uint8_t maxGate = preferences.getUInt("radar_max", 13);
 
-    if (!radar.begin(Serial2, minGate, maxGate)) {
+    bool radarPresent = radar.begin(Serial2, minGate, maxGate);
+    if (!radarPresent) {
         Serial.println("[RADAR] Failed to init LD2412");
         systemLog.error("Radar init failed");
     } else {
@@ -678,8 +865,11 @@ void setup() {
         }
     }
 
-    // Run radar update in a dedicated task on core 1
-    xTaskCreatePinnedToCore(radarTask, "radar_task", 8192, nullptr, 2, &radarTaskHandle, 1);
+    // Run radar update in a dedicated task on core 1 — only if a radar answered
+    ensureRadarTask(radarPresent);
+    if (!radarPresent) {
+        systemLog.warn("Radar absent: radar task not started, 8 kB stack reclaimed");
+    }
 
     // --- Start Ethernet ---
     Serial.println("[ETH] Initializing LAN8720A...");
@@ -777,6 +967,14 @@ void setup() {
     // Init SSE
 #ifndef LITE_BUILD
     events.onConnect([](AsyncEventSourceClient *client){
+        // dev7 L1b: SSE reconnect storms (browser tabs + HA after a link flap)
+        // are a heap spike — refuse new streams while the heap gate is closed
+        // and cap concurrent clients. onConnect fires BEFORE the client is
+        // added to the list, so count() excludes the one connecting here.
+        if (g_webHeapGate.isClosed() || events.count() >= WEB_SSE_MAX_CLIENTS) {
+            client->close();
+            return;
+        }
         if (client->lastId()) {
             DBG("SSE", "Client reconnected! Last message ID: %u", client->lastId());
         }
@@ -1141,6 +1339,8 @@ void setup() {
         // csi9: ML MLP runtime settings from NVS (defaults: enabled=true, threshold=0.50)
         if (preferences.isKey("csi_ml_en"))  csiService.setMlEnabled(preferences.getBool("csi_ml_en", true));
         if (preferences.isKey("csi_ml_thr")) csiService.setMlThreshold(preferences.getFloat("csi_ml_thr", 0.50f));
+        // #13: adaptive-threshold quantile (P95 default / P99) from NVS
+        if (preferences.isKey("csi_adapt_pct")) csiService.setAdaptivePercentile(preferences.getFloat("csi_adapt_pct", 0.95f));
 
         // csi10c: prefer NVS-stored SSID/pass (GUI-editable) over compile-time defaults
         const SystemConfig& cfg = configManager.getConfig();
@@ -1232,7 +1432,7 @@ void otaRuntimeRestoreServices(const char* reason, bool restartRadar) {
     if (restartRadar) {
         uint8_t minGate = preferences.getUInt("radar_min", 0);
         uint8_t maxGate = preferences.getUInt("radar_max", 13);
-        radar.begin(Serial2, minGate, maxGate);
+        ensureRadarTask(radar.begin(Serial2, minGate, maxGate));
     }
     if (radarTaskHandle && eTaskGetState(radarTaskHandle) == eSuspended) {
         vTaskResume(radarTaskHandle);
@@ -1309,6 +1509,41 @@ void loop() {
     // v5.0.2-rc1: RTC uptime tracker — every loop tick. Survives Task WDT/panic
     // so reset_history gets ~1s resolution on crash time instead of hourly.
     rtc_last_uptime_s = now / 1000;
+
+    // dev17: the watermark already records the worst moment since boot; what was
+    // missing is WHEN it moved and what was running then. Sampled here rather
+    // than over HTTP — an /api/health request allocates more than the ~40 kB
+    // spike being hunted, and at 15 s the field sampler never once caught it.
+    // The line lands in the RTC-mirrored log, so it survives a panic reboot.
+    static uint32_t lastHeapTripwireMs = 0;
+    if ((uint32_t)(now - lastHeapTripwireMs) >= 100) {
+        lastHeapTripwireMs = now;
+        if (g_heapWatermarkTripwire.evaluate(heapMinFreeUsable())) {
+            int rssiNow = 0;
+#ifdef USE_CSI
+            rssiNow = csiService.getWifiRSSI();
+#endif
+            HeapWatermarkRecord wm{};
+            wm.uptimeS        = now / 1000;
+            wm.prevWatermark  = g_heapWatermarkTripwire.previousWatermark();
+            wm.watermark      = g_heapWatermarkTripwire.lastRecorded();
+            wm.largest        = heapLargestUsable();
+            wm.freeNow        = heapFreeUsable();
+            wm.mqttReconnects = mqttService.getReconnectTotal();
+            wm.rssi           = (int16_t)rssiNow;
+            wm.discoveryIndex = (int16_t)mqttService.discoveryIndex();
+            wm.mqttConnected  = mqttService.connected() ? 1 : 0;
+            wm.runtimeOp      = (uint8_t)g_runtimeOperationCoordinator.status().operation;
+            heapWmRingAppend(g_heapWmRing, wm);
+            // DBG only — deliberately NOT systemLog: that path feeds the shared
+            // 20-slot RTC ring this record was moved out of.
+            DBG("HEAP", "heapmin %u->%u lg=%u fr=%u mq=%d/%u d=%d op=%u r=%d",
+                (unsigned)wm.prevWatermark, (unsigned)wm.watermark,
+                (unsigned)wm.largest, (unsigned)wm.freeNow,
+                wm.mqttConnected, (unsigned)wm.mqttReconnects,
+                wm.discoveryIndex, (unsigned)wm.runtimeOp, rssiNow);
+        }
+    }
 
 #ifndef LITE_BUILD
     handleOtaRuntimeWatchdog(now);
@@ -1424,6 +1659,32 @@ void loop() {
     securityMonitor.update();
     telegramBot.update();
     eventLog.flush();
+
+    // dev8: MQTT outage event — retried every pass until the (cheap,
+    // non-retained) publish lands; HA forwards it to Telegram.
+    if (g_bootOutageEventJson.length() && mqttService.connected()) {
+        if (mqttService.publish(mqttService.getTopics().system_outage,
+                                g_bootOutageEventJson.c_str(), false)) {
+            g_bootOutageEventJson = "";
+        }
+    }
+
+    // dev8: deliver the boot outage notice once the network is up. MQTT
+    // connectivity is the readiness proxy; Telegram TLS may lag it, so retry
+    // every 30 s and drop after 5 attempts (or immediately when Telegram is
+    // disabled) instead of holding the String forever.
+    if (g_bootOutageNotice.length() && mqttService.connected()) {
+        static uint8_t outageAttempts = 0;
+        static unsigned long outageLastTry = 0;
+        if (outageLastTry == 0 || now - outageLastTry >= 30000) {
+            outageLastTry = now;
+            outageAttempts++;
+            bool sent = telegramBot.isEnabled() && notificationService.sendTelegram(g_bootOutageNotice);
+            if (sent || outageAttempts >= 5 || !telegramBot.isEnabled()) {
+                g_bootOutageNotice = "";
+            }
+        }
+    }
 
     // ETH link restore notification (flag set by connectivityTask)
     if (ethLinkRestoredNotify) {
@@ -1596,6 +1857,54 @@ void loop() {
         lastSecCheck = now;
         securityMonitor.checkTamperState(data.tamper_alert);
         securityMonitor.checkRadarHealth(radar.isRadarConnected());
+
+        // dev7 L2: keep the heap gate honest without traffic and log its
+        // transitions. The CLOSE snapshot answers "what was eating the heap" —
+        // systemLog mirrors into the RTC ring, so it survives a follow-up
+        // crash/restart. Logging allocates, but at the close threshold
+        // (14 kB usable free, dev12) that is still safe — this runs on the
+        // loop task, not in the OOM handler.
+        {
+            static bool lastGateClosed = false;
+            static unsigned long gateClosedSinceMs = 0;
+            g_webHeapGate.probe(heapFreeUsable(), heapLargestUsable());
+            bool gateClosed = g_webHeapGate.isClosed();
+            if (gateClosed != lastGateClosed) {
+                if (gateClosed) {
+                    gateClosedSinceMs = now;
+                    String snap = "Web heap gate CLOSED: free=" + String(heapFreeUsable()) +
+                                  " largest=" + String(heapLargestUsable());
+                    #ifndef LITE_BUILD
+                    snap += " sse=" + String(events.count());
+                    #endif
+                    snap += " mqtt=" + String(mqttService.connected() ? 1 : 0);
+                    systemLog.warn(snap);
+                } else {
+                    unsigned long closedForS = gateClosedSinceMs ? (now - gateClosedSinceMs) / 1000 : 0;
+                    systemLog.info("Web heap gate reopened (rejected " +
+                                   String(g_webHeapGate.rejectsTotal()) + " total)");
+                    // dev8: heap-pressure episode survived without a crash —
+                    // report it while the evidence is fresh. Sent on REOPEN,
+                    // not close: at close the heap can't afford Telegram TLS.
+                    char gateEv[200];
+                    formatHeapGateEventJson(gateEv, sizeof(gateEv), closedForS,
+                                            g_webHeapGate.rejectsTotal(),
+                                            heapFreeUsable(), heapMinFreeUsable());
+                    if (mqttService.connected()) {
+                        mqttService.publish(mqttService.getTopics().system_outage, gateEv, false);
+                    }
+                    if (telegramBot.isEnabled()) {
+                        notificationService.sendTelegram(
+                            String("⚠️ Heap-pressure episode survived\n") +
+                            "gate closed for: " + String(closedForS) + "s\n" +
+                            "rejected connections (total): " + String(g_webHeapGate.rejectsTotal()) + "\n" +
+                            "heap now: " + String(heapFreeUsable()) +
+                            " (min " + String(heapMinFreeUsable()) + ")");
+                    }
+                }
+                lastGateClosed = gateClosed;
+            }
+        }
         // RSSI anomaly detection removed — Ethernet doesn't have RSSI
 
 #ifdef USE_CSI
@@ -1759,7 +2068,30 @@ void loop() {
     // for the upload pbuf chain.
     bool sseSkipForOta =
         g_runtimeOperationCoordinator.status().operation == RuntimeOperation::OTA;
-    if (!sseSkipForOta && now - lastSSE > INTERVAL_SSE_UPDATE_MS && ESP.getFreeHeap() >= HEAP_MIN_FOR_PUBLISH) {
+    // dev13: an undrained SSE client is what collapses this heap. The library
+    // bounds its per-client queue by MESSAGE COUNT, not by bytes, and this
+    // payload is ~1.5 kB every 250 ms — so at the library default of 32 one
+    // stalled dashboard tab pins ~48 kB in separately allocated Strings, more
+    // than the whole free heap on this board. Field log at the collapse:
+    // "gate CLOSED free=10800 largest=5876 sse=1" then "oom_gate heap=916/148".
+    // The accept gate cannot help, the client is already connected. Two bounds
+    // now: the count cap is pinned to 8 where the compiler actually sees it
+    // (platformio.ini), and this gate stops producing entirely once a client
+    // falls behind — a dashboard only ever wants the newest reading, so drop
+    // the tick rather than queue it behind one that never went out.
+    bool sseBacklogged = (events.count() > 0 &&
+                          events.avgPacketsWaiting() >= WEB_SSE_MAX_BACKLOG);
+    if (sseBacklogged) g_sseBacklogSkips.fetch_add(1, std::memory_order_relaxed);
+    // dev19: this gate used to drop the telemetry tick silently whenever the
+    // heap dipped, so a dashboard going quiet looked the same as a node with
+    // nothing to say. Count it, and only when the heap is the actual reason —
+    // OTA and backlog have their own accounting above.
+    bool sseDue = !sseSkipForOta && !sseBacklogged && now - lastSSE > INTERVAL_SSE_UPDATE_MS;
+    uint32_t sseFree = heapFreeUsable();
+    if (sseDue && sseFree < HEAP_MIN_FOR_PUBLISH) {
+        g_sseHeapSkips.record((uint32_t)now, sseFree);
+    }
+    if (sseDue && sseFree >= HEAP_MIN_FOR_PUBLISH) {
         lastSSE = now;
         JsonDocument doc;
         radar.getTelemetryJson(doc);
@@ -1822,11 +2154,12 @@ void loop() {
         }
         #endif
 
-        // Buffer must fit full telemetry JSON (~700-900 B incl. eng_mode arrays,
-        // +~120 B pri zapnutem CSI). v4.1.4: zvyseno z 1024 -> 1536 kvuli CSI poli.
-        // Predchozi 256 B (pred v4.1.3) silently dropped every event since
-        // serializeJson returns sizeof(buf) on overflow -> guard byl false.
-        char sseBuf[1536];
+        // Buffer must fit full telemetry JSON. Worst case ~1.55 KB: radar incl.
+        // eng_mode gate arrays ~980 B + CSI with ML + learning ~395 B + fusion
+        // block ~240 B (v5.6.0). v5.7.0-dev2: 2048 (z 1536 — fusion blok sezral
+        // rezervu). Overflow je tichy: serializeJson vrati sizeof(buf), guard
+        // nize zahodi KAZDY event a cely dashboard zamrzne (pre-v4.1.3 mod).
+        char sseBuf[2048];
         size_t sseLen = serializeJson(doc, sseBuf, sizeof(sseBuf));
         if (sseLen > 0 && sseLen < sizeof(sseBuf)) {
             events.send(sseBuf, "telemetry", millis());
@@ -1838,9 +2171,26 @@ void loop() {
     // MQTT Publish-on-Change with Deadband (3-tier system)
     // =====================================================================
 
-    if (ESP.getFreeHeap() < HEAP_MIN_FOR_PUBLISH) {
-        static unsigned long lastHeapWarn = 0;
-        if (now - lastHeapWarn > 10000) { lastHeapWarn = now; Serial.println("[WARN] Low heap — skipping MQTT publish"); }
+    uint32_t publishFree = heapFreeUsable();
+    if (publishFree < HEAP_MIN_FOR_PUBLISH) {
+        // dev19: read the free heap ONCE and report that same value. The old
+        // line printed nothing at all, and re-reading here would report a heap
+        // that had already recovered — which is precisely how this dip stayed
+        // invisible for a week. in_flight answers whether an AsyncTCP request
+        // was being served at the moment loop() saw the heap collapse.
+        if (g_mqttHeapSkips.record((uint32_t)now, publishFree)) {
+            uint8_t inFlight = 0;
+            if (GatedAsyncWebServer* gs = GatedAsyncWebServer::active()) {
+                inFlight = gs->admission().inFlight();
+            }
+            DBG("HEAP", "publish skip free=%u lg=%u min=%u inflight=%u sse=%u/%u op=%u n=%u/%u low=%u",
+                (unsigned)publishFree, (unsigned)heapLargestUsable(),
+                (unsigned)heapMinFreeUsable(), (unsigned)inFlight,
+                (unsigned)events.count(), (unsigned)events.avgPacketsWaiting(),
+                (unsigned)g_runtimeOperationCoordinator.status().operation,
+                (unsigned)g_mqttHeapSkips.skips(), (unsigned)g_mqttHeapSkips.suppressed(),
+                (unsigned)g_mqttHeapSkips.lowestFree());
+        }
     }
     else if (configManager.getConfig().mqtt_enabled) {
         const MQTTTopics& topics = mqttService.getTopics();
@@ -2078,8 +2428,10 @@ void loop() {
             mqttService.publish(topics.uptime, numBuf);
             lastPub.uptime_s = curUptime;
 
-            // ETH link status (replaces WiFi RSSI)
-            mqttService.publish(topics.rssi, ETH.linkUp() ? "ON" : "OFF", true);
+            // ETH PHY link state. The topic was called "rssi" until
+            // v5.7.0-dev14 — it never carried a dBm value, and reading the
+            // broker suggested the node published RSSI when it never has.
+            mqttService.publish(topics.eth_link, ETH.linkUp() ? "ON" : "OFF", true);
 
             uint8_t curHealth = radar.getHealthScore();
             if (changedU8(curHealth, lastPub.health_score, DEADBAND_HEALTH_SCORE)) {
@@ -2113,7 +2465,7 @@ void loop() {
                 }
             }
 
-            uint32_t curHeap = ESP.getFreeHeap() / 1024;
+            uint32_t curHeap = heapFreeUsable() / 1024;
             if (changedU32(curHeap, lastPub.free_heap_kb, DEADBAND_FREE_HEAP_KB)) {
                 snprintf(numBuf, sizeof(numBuf), "%u", curHeap);
                 if (mqttService.publish(topics.free_heap, numBuf)) {
@@ -2121,7 +2473,7 @@ void loop() {
                 }
             }
 
-            uint32_t curMaxAlloc = ESP.getMaxAllocHeap() / 1024;
+            uint32_t curMaxAlloc = heapLargestUsable() / 1024;
             if (changedU32(curMaxAlloc, lastPub.max_alloc_kb, DEADBAND_FREE_HEAP_KB)) {
                 snprintf(numBuf, sizeof(numBuf), "%u", curMaxAlloc);
                 if (mqttService.publish(topics.max_alloc_heap, numBuf)) {
@@ -2138,7 +2490,7 @@ void loop() {
 
             // Heap Telegram alerts
             if (telegramBot.isEnabled()) {
-                uint32_t freeHeap = ESP.getFreeHeap();
+                uint32_t freeHeap = heapFreeUsable();
                 bool heapCooldownOk = (now - lastPub.lastHeapAlert) > COOLDOWN_HEAP_ALERT_MS;
                 if (freeHeap <= HEAP_CRIT_BYTES && heapCooldownOk) {
                     telegramBot.sendMessage("🔴 *CRITICALLY LOW RAM*\n💾 Free: " + String(freeHeap / 1024) + " KB (limit " + String(HEAP_CRIT_BYTES / 1024) + " KB)\nCrash risk!");
@@ -2242,9 +2594,9 @@ void loop() {
             data.moving_energy,
             data.static_energy,
             ETH.linkUp() ? "UP" : "DOWN",
-            ESP.getFreeHeap(),
-            ESP.getMinFreeHeap(),
-            ESP.getMaxAllocHeap(),
+            heapFreeUsable(),
+            heapMinFreeUsable(),
+            heapLargestUsable(),
             securityMonitor.getAlarmStateStr(),
             mqttService.connected() ? "CONNECTED" : "DISCONNECTED"
         );

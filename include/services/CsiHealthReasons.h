@@ -136,6 +136,16 @@ inline bool csiMlVoteTrusted(float packetRate, float packetRateFloorPps) {
     return packetRate >= packetRateFloorPps;
 }
 
+// dev7: the threshold path had no starvation gate at all (field false trigger
+// 2026-08-17 12:32) — at pps=0 the running variance freezes at its last value
+// and a frozen value above the threshold keeps feeding motion votes into the
+// smoothing window. Unlike the ML gate above, the floor here is only "some
+// fresh packets arrived this tick": genuinely slow links still detect (with
+// packet_rate_low warning them), while a zero-data tick can never vote.
+inline bool csiVarianceVoteTrusted(float packetRate, float packetRateFloorPps) {
+    return packetRate >= packetRateFloorPps;
+}
+
 // v5.3.1: debounce for health-change event logging. A flag set must hold for
 // `stableTicks` consecutive feeds before it is reported — a boundary-oscillating
 // flag (packet_rate_unstable flipping every tick filled the whole 256-event ring

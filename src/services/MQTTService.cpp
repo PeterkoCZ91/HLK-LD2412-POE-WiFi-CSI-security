@@ -5,6 +5,7 @@
 #include "services/OtaTlsTrustPolicy.h"
 #include "services/TlsMemoryPolicy.h"
 #include <ETH.h>
+#include "services/HeapMetrics.h"
 
 MQTTService* MQTTService::_instance = nullptr;
 // cppcheck-suppress uninitMemberVar ; globální singleton (zero-init), membery nastavuje begin()
@@ -47,7 +48,7 @@ void MQTTService::generateTopics() {
     snprintf(_topics.energy_stat,     sizeof(_topics.energy_stat),     "security/%s/presence/energy_stat", _deviceId);
     snprintf(_topics.light,           sizeof(_topics.light),           "security/%s/presence/light", _deviceId);
     snprintf(_topics.tamper,          sizeof(_topics.tamper),          "security/%s/tamper", _deviceId);
-    snprintf(_topics.rssi,            sizeof(_topics.rssi),            "security/%s/rssi", _deviceId);
+    snprintf(_topics.eth_link,        sizeof(_topics.eth_link),        "security/%s/eth_link", _deviceId);
     snprintf(_topics.uptime,          sizeof(_topics.uptime),          "security/%s/uptime", _deviceId);
     snprintf(_topics.ip,              sizeof(_topics.ip),              "security/%s/ip", _deviceId);
     snprintf(_topics.current_zone,    sizeof(_topics.current_zone),    "security/%s/presence/zone", _deviceId);
@@ -98,6 +99,7 @@ void MQTTService::generateTopics() {
 
     // System restart diagnostics
     snprintf(_topics.restart_cause,   sizeof(_topics.restart_cause),   "security/%s/system/restart_cause", _deviceId);
+    snprintf(_topics.system_outage,   sizeof(_topics.system_outage),   "security/%s/system/outage", _deviceId);
     snprintf(_topics.chip_temp,       sizeof(_topics.chip_temp),       "security/%s/system/chip_temp", _deviceId);
 
     // Supervision heartbeat
@@ -153,7 +155,27 @@ void MQTTService::setupClient() {
     _mqttClient.setBufferSize(2048);
     _mqttClient.setCallback(mqttCallbackStatic);
 
-    DBG("MQTT", "Server: %s, Port: %d", _server, portInt);
+    // PubSubClient ships MQTT_KEEPALIVE 15 s and MQTT_SOCKET_TIMEOUT 15 s and
+    // this firmware never overrode either. Two field consequences:
+    //  - update() shares loopTask with CSI work that blocks for up to a second
+    //    at a time (traffic-gen teardown, WiFi STA reconnect). Miss the 15 s
+    //    keepalive twice and the library silently stop()s the socket; our
+    //    connect() then replays all 59 Home Assistant discovery entities. A
+    //    production node logged four such reconnects within five minutes of
+    //    boot settling, each one a burst of ~120-180 short-lived allocations.
+    //  - readByte() busy-waits on yield() for up to socketTimeout seconds
+    //    (PubSubClient.cpp:288-296), so one truncated packet parks loopTask for
+    //    15 s — long enough to starve CSI and to miss the very keepalive that
+    //    then tears the connection down.
+    // Raising the keepalive does not delay detection of a genuinely dead
+    // broker: publishResult() short-circuits on !connected() and the
+    // fail-streak logic stops the transport on the next publish, and telemetry
+    // publishes run continuously.
+    _mqttClient.setKeepAlive(MQTT_KEEPALIVE_SECONDS);
+    _mqttClient.setSocketTimeout(MQTT_SOCKET_TIMEOUT_SECONDS);
+
+    DBG("MQTT", "Server: %s, Port: %d, keepalive %us, sock timeout %us",
+        _server, portInt, (unsigned)MQTT_KEEPALIVE_SECONDS, (unsigned)MQTT_SOCKET_TIMEOUT_SECONDS);
 }
 
 void MQTTService::mqttCallbackStatic(char* topic, byte* payload, unsigned int length) {
@@ -199,6 +221,21 @@ void MQTTService::update() {
     } else {
         _mqttClient.loop();
 
+        // Replay only a small batch per loop. A long MQTT outage may leave a
+        // large event buffer, and replaying it all inside connect() previously
+        // caused an oom_gate restart when the broker returned.
+        if (_offlineBuffer && _offlineBuffer->count() > 0) {
+            uint32_t before = _offlineBuffer->count();
+            uint16_t sent = _offlineBuffer->replay([this](const char* t, const char* p, bool r) {
+                return _mqttClient.publish(t, p, r);
+            });
+            if (sent == 0 && _offlineBuffer->count() == before) {
+                _espClient.stop();
+                return;
+            }
+            return;
+        }
+
         // Non-blocking discovery: publish one entity per update() cycle
         if (_discoveryIndex >= 0) {
             publishDiscoveryStep();
@@ -210,9 +247,9 @@ void MQTTService::connect() {
     DBG("MQTT", "Connecting to %s...", _server);
     #if defined(MQTTS_ENABLED) && MQTTS_ENABLED == 1
     if (!_tlsTrustReady) return;
-    if (!tlsMemoryAllowsHandshake(ESP.getFreeHeap(), ESP.getMaxAllocHeap(), _tlsCa.length())) {
+    if (!tlsMemoryAllowsHandshake(heapFreeUsable(), heapLargestUsable(), _tlsCa.length())) {
         DBG("MQTT", "MQTTS deferred: insufficient heap (%u/%u)",
-            ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+            heapFreeUsable(), heapLargestUsable());
         return;
     }
     #endif
@@ -249,13 +286,6 @@ void MQTTService::connect() {
         _lastRuntimeOperation = 0xFF;
         _publishFailStreak = 0;
         _reconnectTotal++;
-
-        // Replay any messages buffered while offline
-        if (_offlineBuffer && _offlineBuffer->count() > 0) {
-            _offlineBuffer->replay([this](const char* t, const char* p, bool r) {
-                return _mqttClient.publish(t, p, r);
-            });
-        }
 
         // Start non-blocking discovery (one entity per update() cycle)
         char devInfoBuf[256];
@@ -321,7 +351,8 @@ PublishResult MQTTService::publishResult(const char* topic, const char* payload,
     // publish() callers (radar, security, telemetry) kept storing.
     if (_isOtaInProgress()) return PublishResult::FAILED;
     if (!_mqttClient.connected()) {
-        if (_offlineBuffer && _offlineBuffer->store(topic, payload, retained, eventId)) {
+        if (_offlineBuffer && mqttOfflineBufferShouldStore(eventId) &&
+            _offlineBuffer->store(topic, payload, retained, eventId)) {
             return PublishResult::QUEUED_OFFLINE;
         }
         return PublishResult::FAILED;
@@ -373,18 +404,21 @@ PublishResult MQTTService::publishResult(const char* topic, const char* payload,
     _lastFailState     = _mqttClient.state();
     strncpy(_lastFailTopic, topic, sizeof(_lastFailTopic) - 1);
     _lastFailTopic[sizeof(_lastFailTopic) - 1] = '\0';
-    bool queued = _offlineBuffer &&
-                  _offlineBuffer->store(topic, payload, retained, eventId);
-
     if (_publishFailStreak == 1) {
         // Log OK→fail transition only (throttled: subsequent fails in same cycle
         // short-circuit at connected()==false before reaching here)
         DBG("MQTT", "Publish FAIL '%s' (state=%d) — transport stopped (fail-fast)",
             _lastFailTopic, _lastFailState);
-        _espClient.stop();
         // _publishFailStreak intentionally not reset here — connect() resets it
         // on successful reconnect; health API shows streak=1 while disconnected
     }
+
+    // Close the dead transport before touching the filesystem. The event-only
+    // queue is intentionally small, but keeping network teardown first makes
+    // the failure path deterministic if an event must still be persisted.
+    _espClient.stop();
+    bool queued = _offlineBuffer && mqttOfflineBufferShouldStore(eventId) &&
+                  _offlineBuffer->store(topic, payload, retained, eventId);
     return queued ? PublishResult::QUEUED_OFFLINE : PublishResult::FAILED;
 }
 
@@ -458,7 +492,7 @@ void MQTTService::publishDiscoveryStep() {
         case 3:  publishOneDiscovery("sensor", "mov_energy", "Moving Energy", _topics.energy_mov, "%", "mdi:run", "", "{\"ent_cat\":\"diagnostic\"}"); break;
         case 4:  publishOneDiscovery("sensor", "stat_energy", "Static Energy", _topics.energy_stat, "%", "mdi:motion-pause", "", "{\"ent_cat\":\"diagnostic\"}"); break;
         case 5:  publishOneDiscovery("sensor", "light", "Light Level", _topics.light, "lx", "mdi:brightness-5", "illuminance", ""); break;
-        case 6:  publishOneDiscovery("binary_sensor", "eth_link", "ETH Link", _topics.rssi, "", "mdi:ethernet", "connectivity", "{\"ent_cat\":\"diagnostic\",\"pl_on\":\"ON\",\"pl_off\":\"OFF\"}"); break;
+        case 6:  publishOneDiscovery("binary_sensor", "eth_link", "ETH Link", _topics.eth_link, "", "mdi:ethernet", "connectivity", "{\"ent_cat\":\"diagnostic\",\"pl_on\":\"ON\",\"pl_off\":\"OFF\"}"); break;
         case 7:  publishOneDiscovery("sensor", "uptime", "Uptime", _topics.uptime, "s", "mdi:clock-outline", "", "{\"ent_cat\":\"diagnostic\"}"); break;
         case 8:  publishOneDiscovery("sensor", "mdir", "Motion Direction", _topics.motion_direction, "", "mdi:arrow-decision", "", ""); break;
         case 9:  publishOneDiscovery("sensor", "zone", "Current Zone", _topics.current_zone, "", "mdi:map-marker-radius", "", ""); break;

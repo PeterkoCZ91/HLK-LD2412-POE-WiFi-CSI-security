@@ -24,6 +24,19 @@ constexpr uint8_t  DEADBAND_HEALTH_SCORE             = 3;
 constexpr float    DEADBAND_FRAME_RATE               = 2.0f;
 constexpr uint8_t  DEADBAND_GATE_ENERGY              = 3;
 
+// dev7: hard cap on concurrent SSE streams — each client holds an AsyncTCP
+// connection + send queue; reconnect storms after a link flap were part of
+// the heap-collapse pattern (field coredump 2026-08-15).
+constexpr uint8_t  WEB_SSE_MAX_CLIENTS               = 4;
+// Max SSE packets a client may still owe us before we stop producing new
+// telemetry for it. The library caps its per-client queue by MESSAGE COUNT, not
+// bytes (SSE_MAX_QUEUED_MESSAGES, now pinned to 8 in platformio.ini — it had
+// been sitting in [common] where PlatformIO silently dropped it, so the shipped
+// firmware ran the default 32 = ~48 kB of queued Strings). This backlog gate is
+// the inner bound: stop producing at all once a client falls behind, so the
+// count cap is never approached. See the send site in main.cpp.
+constexpr size_t   WEB_SSE_MAX_BACKLOG               = 3;
+
 // Timeouts
 constexpr unsigned long TIMEOUT_OTA_VALIDATION_MS    = 60000;     // OTA boot validation
 constexpr unsigned long TIMEOUT_DMS_NO_PUBLISH_MS    = 1800000;   // Dead Man's Switch (30 min)
@@ -48,8 +61,15 @@ constexpr uint8_t DEFAULT_ALARM_ENERGY_THRESHOLD     = 15;        // Min energy 
 // =============================================================================
 // Memory Thresholds
 // =============================================================================
-constexpr uint32_t HEAP_MIN_FOR_PUBLISH              = 20000;     // Min heap for MQTT publish
-constexpr uint32_t HEAP_LOW_WARNING                  = 30000;     // Low memory warning threshold
+// PubSubClient timing. Its own defaults (MQTT_KEEPALIVE 15 s, MQTT_SOCKET_TIMEOUT
+// 15 s) were never overridden, which made bounded loopTask stalls look like a
+// dead broker and parked loopTask for 15 s on a truncated packet. See the
+// rationale block in MQTTService::setupClient().
+constexpr uint16_t MQTT_KEEPALIVE_SECONDS            = 60;        // tolerate bounded loopTask stalls
+constexpr uint16_t MQTT_SOCKET_TIMEOUT_SECONDS       = 4;         // cap the busy-wait in readByte()
+
+constexpr uint32_t HEAP_MIN_FOR_PUBLISH              = 12000;     // Min usable heap for MQTT/SSE publish (dev12: was 20000 vs inflated reading)
+constexpr uint32_t HEAP_LOW_WARNING                  = 18000;     // Low usable memory warning (dev12: was 30000 vs inflated reading)
 
 // =============================================================================
 // Hardware Configuration
@@ -74,9 +94,9 @@ constexpr uint8_t DMS_MAX_RESTARTS                   = 3;         // Dead Man's 
 // Security Monitor Intervals
 // =============================================================================
 constexpr unsigned long INTERVAL_HEALTH_CHECK_MS     = 60000;     // Health check interval (1 min)
-constexpr uint32_t HEAP_WARN_BYTES                   = 40000;     // Free heap warning threshold (40KB)
-constexpr uint32_t HEAP_CRIT_BYTES                   = 20000;     // Free heap critical threshold (20KB)
-constexpr uint32_t HEAP_RECOVER_BYTES                = 60000;     // Free heap recovery threshold (60KB)
+constexpr uint32_t HEAP_WARN_BYTES                   = 24000;     // Usable free heap warning (dev12: was 40000)
+constexpr uint32_t HEAP_CRIT_BYTES                   = 12000;     // Usable free heap critical (dev12: was 20000)
+constexpr uint32_t HEAP_RECOVER_BYTES                = 32000;     // Usable free heap recovery (dev12: was 60000 — unreachable once measured honestly, so a warning could never clear)
 constexpr unsigned long COOLDOWN_HEAP_ALERT_MS       = 600000;    // Heap alert cooldown (10 min)
 
 constexpr float CHIP_TEMP_WARN_C                     = 80.0f;     // Chip temp warning threshold

@@ -7,6 +7,7 @@
 #include <ArduinoJson.h>
 #include <ETH.h>
 #include <WiFiClientSecure.h>
+#include "services/HeapMetrics.h"
 
 // cppcheck-suppress uninitMemberVar ; globální singleton (zero-init), membery nastavuje begin()
 NotificationService::NotificationService() {}
@@ -86,7 +87,7 @@ void NotificationService::processWebhookQueue() {
         const char* trustKey = req.type == WebhookType::DISCORD ? "dc_tls_ca" : "gen_tls_ca";
         String tlsCa = _prefs ? _prefs->getString(trustKey, "") : "";
         if (!otaTlsHttpsUrl(req.url) || !otaTlsPemValid(tlsCa.c_str()) ||
-            !tlsMemoryAllowsHandshake(ESP.getFreeHeap(), ESP.getMaxAllocHeap(), tlsCa.length())) {
+            !tlsMemoryAllowsHandshake(heapFreeUsable(), heapLargestUsable(), tlsCa.length())) {
             _tlsBlockedMask.fetch_or(blockedBit, std::memory_order_relaxed);
             DBG("Notif", "Webhook blocked: HTTPS trust or heap unavailable (retry %d)", req.retries);
         } else {
@@ -147,7 +148,8 @@ void NotificationService::processWebhookQueue() {
 
 // --- Alert dispatch ---
 
-bool NotificationService::sendAlert(NotificationType type, const String& message, const String& details) {
+bool NotificationService::sendAlert(NotificationType type, const String& message, const String& details,
+                                    AlertSource source) {
     if (!_config.enabled) return false;
 
     // Check notification filters
@@ -172,6 +174,8 @@ bool NotificationService::sendAlert(NotificationType type, const String& message
         case NotificationType::ALARM_TRIGGERED:
             shouldSend = true;  // Always send security-critical events
             break;
+        case NotificationType::COUNT:
+            break;              // sentinel, never a real alert
     }
 
     if (!shouldSend) return false;
@@ -180,7 +184,7 @@ bool NotificationService::sendAlert(NotificationType type, const String& message
     bool isCritical = (type == NotificationType::ALARM_TRIGGERED ||
                        type == NotificationType::ALARM_STATE_CHANGE ||
                        type == NotificationType::ENTRY_DETECTED);
-    if (!isCritical && !checkCooldown(type)) {
+    if (!isCritical && !checkCooldown(type, source)) {
         DBG("Notif", "Cooldown active for %s", getTypeString(type));
         return false;
     }
@@ -216,7 +220,7 @@ bool NotificationService::sendAlert(NotificationType type, const String& message
     }
 
     if (success) {
-        _lastNotification[(int)type] = millis();
+        _cooldown.stamp(millis(), type, source);
     }
 
     return success;
@@ -300,19 +304,9 @@ String NotificationService::formatMessage(NotificationType type, const String& m
     return result;
 }
 
-bool NotificationService::checkCooldown(NotificationType type) {
-    unsigned long now = millis();
-    unsigned long lastTime = _lastNotification[(int)type];
-
-    if (lastTime == 0) return true;  // First notification
-
-    // Special cooldown for WiFi Anomaly (2 hours) to prevent spam
-    unsigned long requiredCooldown = _config.cooldown_ms;
-    if (type == NotificationType::WIFI_ANOMALY) {
-        requiredCooldown = 7200000; // 2 hours
-    }
-
-    return (now - lastTime >= requiredCooldown);
+bool NotificationService::checkCooldown(NotificationType type, AlertSource source) {
+    _cooldown.defaultCooldownMs = _config.cooldown_ms;   // config is runtime-settable
+    return _cooldown.allow(millis(), type, source);
 }
 
 const char* NotificationService::getTypeString(NotificationType type) {
@@ -326,6 +320,7 @@ const char* NotificationService::getTypeString(NotificationType type) {
         case NotificationType::ALARM_STATE_CHANGE: return "Alarm State Change";
         case NotificationType::ENTRY_DETECTED: return "Entry Detected";
         case NotificationType::ALARM_TRIGGERED: return "ALARM TRIGGERED";
+        case NotificationType::COUNT: return "Unknown";
         default: return "Unknown";
     }
 }

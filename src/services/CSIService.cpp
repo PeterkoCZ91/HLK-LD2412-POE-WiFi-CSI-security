@@ -154,39 +154,63 @@ void CSIService::_initWiFiForCSI(const char* ssid, const char* password) {
 // Thread-context constraint: must be called from a non-TCPIP thread (main loop / Arduino
 // setup / generic task). LOCK_TCPIP_CORE() is non-reentrant; calling this from inside a
 // WiFi/lwIP event callback (which already runs on the TCPIP thread) would deadlock.
-void CSIService::_restoreEthDefaultNetif() {
+// Returns true only when the default netif actually MOVED to Ethernet. That
+// distinction matters: an established TCP socket keeps the route it was opened
+// on, so a real move means live sessions (MQTT) are still pinned to the old
+// interface and have to be torn down. A no-op must not trigger that.
+bool CSIService::_restoreEthDefaultNetif() {
     if (_isOtaInProgress()) {
         Serial.println("[CSI] restoreEthDefault: OTA in progress, skip");
-        return;
+        return false;
     }
     if (!ETH.linkUp()) {
         Serial.println("[CSI] restoreEthDefault: ETH link down, skip");
-        return;
+        return false;
     }
 
     esp_netif_t* ethNetif = esp_netif_get_handle_from_ifkey("ETH_DEF");
     if (!ethNetif) {
         Serial.println("[CSI] restoreEthDefault: ETH_DEF netif not found");
-        return;
+        return false;
     }
 
     esp_netif_ip_info_t ethIpInfo;
     if (esp_netif_get_ip_info(ethNetif, &ethIpInfo) != ESP_OK || ethIpInfo.ip.addr == 0) {
         Serial.println("[CSI] restoreEthDefault: ETH has no IP yet, skip");
-        return;
+        return false;
     }
 
     struct netif* ethLwip = (struct netif*)esp_netif_get_netif_impl(ethNetif);
     if (!ethLwip) {
         Serial.println("[CSI] restoreEthDefault: failed to get ETH lwIP netif");
-        return;
+        return false;
     }
 
     LOCK_TCPIP_CORE();
+    bool moved = (netif_default != ethLwip);
     netif_set_default(ethLwip);
     UNLOCK_TCPIP_CORE();
 
-    Serial.println("[CSI] Set Ethernet as lwIP default netif (core-locked)");
+    if (moved) {
+        Serial.println("[CSI] Set Ethernet as lwIP default netif (core-locked)");
+    }
+    return moved;
+}
+
+// Cheap pointer compare, deliberately without the core lock: a torn read is not
+// possible and the worst case is one redundant assertion a moment later.
+bool CSIService::_ethIsDefaultNetif() const {
+    esp_netif_t* ethNetif = esp_netif_get_handle_from_ifkey("ETH_DEF");
+    if (!ethNetif) return false;
+    struct netif* ethLwip = (struct netif*)esp_netif_get_netif_impl(ethNetif);
+    return ethLwip != nullptr && netif_default == ethLwip;
+}
+
+bool CSIService::_ethHasIp() const {
+    esp_netif_t* ethNetif = esp_netif_get_handle_from_ifkey("ETH_DEF");
+    if (!ethNetif) return false;
+    esp_netif_ip_info_t ip;
+    return esp_netif_get_ip_info(ethNetif, &ip) == ESP_OK && ip.ip.addr != 0;
 }
 
 void CSIService::begin(const char* ssid, const char* password,
@@ -216,6 +240,12 @@ void CSIService::begin(const char* ssid, const char* password,
     snprintf(_tMlProb,     sizeof(_tMlProb),     "%s/ml_probability",  _topicPrefix);
     snprintf(_tMlMotion,   sizeof(_tMlMotion),   "%s/ml_motion",       _topicPrefix);
     snprintf(_tShadow,     sizeof(_tShadow),     "%s/model/shadow",    _topicPrefix);
+    snprintf(_tEvent,      sizeof(_tEvent),      "%s/event",           _topicPrefix);
+
+    // Passage-edge boot id: random per boot so HA can reject retained/offline
+    // replays of a previous boot's motion edges (variant S). esp_random() is
+    // seeded by the RF/ADC entropy source and is fine before WiFi is up.
+    snprintf(_bootId, sizeof(_bootId), "%08lx", (unsigned long)esp_random());
 
     // Allocate turbulence buffer
     _turbBuffer = new (std::nothrow) float[_windowSize];
@@ -316,33 +346,27 @@ void CSIService::setWindowSize(uint16_t ws) {
     _runningM2 = 0;
 }
 
+// dev9: these run on async_tcp (web API). They MUST NOT touch the generator
+// task directly — see _trafficGenRestartPending. They update config and defer
+// the restart to update() on loopTask (the task owner).
 void CSIService::setTrafficRate(uint32_t pps) {
     if (pps < 10) pps = 10;
     if (pps > 500) pps = 500;
     _trafficRatePps = pps;
-    // Restart traffic gen if running
-    if (_trafficGenRunning.load()) {
-        _stopTrafficGen();
-        _startTrafficGen();
-    }
+    if (_trafficGenRunning.load()) _trafficGenRestartPending.store(true);
 }
 
 void CSIService::setTrafficPort(uint16_t port) {
     if (port == 0) port = 7;
     _trafficPort = port;
-    if (_trafficGenRunning.load() && !_trafficICMP) {
-        _stopTrafficGen();
-        _startTrafficGen();
-    }
+    // Port only matters in UDP mode; no need to restart an ICMP generator.
+    if (_trafficGenRunning.load() && !_trafficICMP) _trafficGenRestartPending.store(true);
 }
 
 void CSIService::setTrafficICMP(bool icmp) {
     if (_trafficICMP == icmp) return;
     _trafficICMP = icmp;
-    if (_trafficGenRunning.load()) {
-        _stopTrafficGen();
-        _startTrafficGen();
-    }
+    if (_trafficGenRunning.load()) _trafficGenRestartPending.store(true);
 }
 
 // ============================================================================
@@ -351,6 +375,17 @@ void CSIService::setTrafficICMP(bool icmp) {
 
 void CSIService::_startTrafficGen() {
     if (_trafficGenRunning.load()) return;
+
+    // dev9 defense-in-depth: never spawn a second generator while a previous
+    // task is still tearing down (handle non-null = _stopTrafficGen could not
+    // confirm eDeleted). Two tasks on the TCPIP core lock is the WDT trigger.
+    if (_trafficGenHandle != nullptr) {
+        if (eTaskGetState(_trafficGenHandle) != eDeleted) {
+            DBG("CSI", "TrafficGen: previous task still alive — start skipped");
+            return;
+        }
+        _trafficGenHandle = nullptr;
+    }
 
     esp_netif_t* esp_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
     if (!esp_netif) { DBG("CSI", "TrafficGen: no WiFi netif"); return; }
@@ -383,7 +418,16 @@ void CSIService::_stopTrafficGen() {
         for (int i = 0; i < 10 && eTaskGetState(_trafficGenHandle) != eDeleted; i++) {
             vTaskDelay(pdMS_TO_TICKS(100));
         }
-        _trafficGenHandle = nullptr;
+        // dev9: only clear the handle once the task has actually terminated.
+        // Nulling a still-running task's handle orphans it, and _startTrafficGen
+        // would then spawn a second generator (two tasks on the TCPIP core lock
+        // → loopTask Task WDT). If it didn't finish, keep the handle so the
+        // start guard above refuses to double-spawn.
+        if (eTaskGetState(_trafficGenHandle) == eDeleted) {
+            _trafficGenHandle = nullptr;
+        } else {
+            DBG("CSI", "TrafficGen: task did not terminate in 1s — handle kept");
+        }
     }
 
     DBG("CSI", "TrafficGen stopped");
@@ -851,6 +895,21 @@ void CSIService::_updateMotionState() {
     // clamped by the link-relative floor — see getEffectiveThreshold().
     float effThr = getEffectiveThreshold();
 
+    // dev7: no fresh packets this tick — the turbulence buffer and running
+    // variance are FROZEN at their last values, so comparing them against the
+    // threshold is not evidence of anything (armed field false trigger
+    // 2026-08-17 12:32: variance frozen above eff_thr for ~8 s at pps=0
+    // accumulated enter votes). Freeze the whole decision: no smoothing shift,
+    // no state change, no shadow, no baseline drift. Health events still run —
+    // starvation is exactly what packet_rate_low exists to record.
+    if (!csiVarianceVoteTrusted(_packetRate, VAR_MIN_PACKET_RATE_PPS)) {
+        _starvedTickCount++;
+        _recordDecisionTrace(true, _runningVariance > effThr, _motionState,
+                             false, 0, _smoothCount, effThr, true);
+        _updateHealthEvents(effThr);
+        return;
+    }
+
     bool prevMotion = _motionState;  // P1.3: detect motion edges for the event ring
 
     bool rawMotion;
@@ -941,11 +1000,14 @@ void CSIService::_updateMotionState() {
 // diagnostic — never influences detection. Called at every exit of
 // _updateMotionState() so /api/csi/decision explains the current verdict.
 void CSIService::_recordDecisionTrace(bool bufferReady, bool rawMotion, bool finalMotion,
-                                      bool breathHold, uint8_t votes, uint8_t window, float effThr) {
+                                      bool breathHold, uint8_t votes, uint8_t window, float effThr,
+                                      bool dataStarved) {
     CsiDecisionTrace& t = _decisionTrace;
     t.valid               = bufferReady;
     t.decision            = finalMotion;
-    t.reason              = csiClassifyDecision(bufferReady, rawMotion, finalMotion, breathHold);
+    t.reason              = csiClassifyDecision(bufferReady, rawMotion, finalMotion, breathHold, dataStarved);
+    t.dataStarved         = dataStarved;
+    t.packetRate          = _packetRate;
     t.variance            = _runningVariance;
     t.configuredThreshold = _threshold;
     t.adaptiveThreshold   = _adaptiveThresholdEnabled ? _adaptiveThreshold : 0.0f;
@@ -1267,6 +1329,25 @@ void CSIService::setDetectionDataOk(bool ok) {
 // MQTT Publishing
 // ============================================================================
 
+// Publish one passage edge (NON-RETAINED). Loop-task only. seq advances only on
+// a successful publish so the delivered sequence stays gap-free.
+bool CSIService::_publishMotionEdge(bool enter, const char* source, uint32_t now) {
+    if (!_mqtt || !_mqtt->connected()) return false;
+    char ev[192];
+    uint32_t seq = _edgeSeq + 1;
+    int w = formatCsiMotionEdge(ev, sizeof(ev), _bootId, seq, enter, now,
+                                source, _runningVariance, getEffectiveThreshold());
+    if (w > 0 && _mqtt->publish(_tEvent, ev, false)) { _edgeSeq = seq; return true; }
+    return false;
+}
+
+// Queue a synthetic edge for the next publish tick. Thread-safe: called from the
+// async web task, drained in _publishMQTT on the loop task (MQTT stays one-task).
+bool CSIService::emitTestEdge(bool enter) {
+    _pendingTestEdge.store(enter ? 1 : 0, std::memory_order_release);
+    return true;
+}
+
 void CSIService::_publishMQTT() {
     if (!_mqtt || !_mqtt->connected()) return;
 
@@ -1298,6 +1379,23 @@ void CSIService::_publishMQTT() {
         if (_mqtt->publish(_tMotion, _motionState ? "ON" : "OFF", true))
             _pubMotion = _motionState;
     }
+
+    // Passage EDGE (NON-RETAINED) on a real transition — HA correlates edges,
+    // not the pinned retained state above. Fired only on an actual change (never
+    // on the 60 s force-heartbeat). Best-effort: if the broker is down the edge
+    // is dropped, not retried — a stale replayed edge would fake a passage,
+    // whereas a missed one still leaves the retained state for HA to read.
+    if (_motionState != _edgePubState) {
+        _publishMotionEdge(_motionState, "csi_variance", now);
+        _edgePubState = _motionState;
+    }
+
+    // Self-test injection (deferred from the web task to keep MQTT single-task):
+    // POST /api/csi/selftest/edge sets _pendingTestEdge; drain it here so the
+    // synthetic edge is published from the same task as every other edge. Marked
+    // source="selftest" so it can never be mistaken for a real passage.
+    int8_t testEdge = _pendingTestEdge.exchange(-1, std::memory_order_acq_rel);
+    if (testEdge >= 0) _publishMotionEdge(testEdge != 0, "selftest", now);
 
     pubFloat(_tTurbulence, _lastTurbulence,     _pubTurbulence);
     pubFloat(_tVariance,   _runningVariance,    _pubVariance);
@@ -1370,6 +1468,28 @@ void CSIService::update() {
     // set this flag at OTA start and clear it at end/error.
     if (_isOtaInProgress()) return;
 
+    // dev15 (field 2026-08-30): keep Ethernet as the outbound default. WiFi STA
+    // outranks ETH on esp_netif route_prio, so lwIP hands the default back to
+    // WiFi on every DHCP renewal of the capture interface. csi7 already fixed
+    // this once, but its three call sites are boot, a WiFi-scan completion, and
+    // a branch gated behind "traffic gen NOT running" — none of which fire in
+    // steady state. A node therefore ran 177 h with MQTT pinned to a -71 dBm
+    // WiFi link, failing rc=-2 while its Ethernet sat up and healthy.
+    {
+        NetifAction act = _ethNetifPolicy.evaluate(
+            millis(), _isOtaInProgress(), ETH.linkUp(), _ethHasIp(),
+            _ethIsDefaultNetif());
+        if (act == NetifAction::Assert) {
+            _ethNetifPolicy.noteAsserted(_restoreEthDefaultNetif());
+            if (_ethNetifPolicy.takeRoutingChanged()) {
+                // The default moved under a live socket. MQTT's session is still
+                // bound to the old interface, so it has to be re-opened.
+                DBG("CSI", "default netif moved to ETH — forcing MQTT reconnect");
+                if (_mqtt) _mqtt->forceReconnect();
+            }
+        }
+    }
+
     // Force reconnect requested by user
     if (_reconnectRequested) {
         _reconnectRequested = false;
@@ -1400,6 +1520,15 @@ void CSIService::update() {
         return;
     }
 
+    // dev9: apply a deferred traffic-gen restart HERE, on loopTask (the task
+    // that owns the generator), not on async_tcp where the web-API setters run.
+    // Doing the stop/start on the owner avoids the cross-task TCPIP-lock deadlock
+    // that tripped the loopTask Task WDT (field 2026-08-18).
+    if (_trafficGenRestartPending.exchange(false) && _trafficGenRunning.load()) {
+        _stopTrafficGen();
+        _startTrafficGen();
+    }
+
     // Restart traffic gen after WiFi reconnect
     if (!_trafficGenRunning.load() && WiFi.status() == WL_CONNECTED) {
         static uint32_t lastAttempt = 0;
@@ -1423,10 +1552,15 @@ void CSIService::update() {
             _packetRate, (unsigned long)_totalPackets,
             _trafficGenRunning.load() ? 1 : 0,
             WiFi.status(), WiFi.localIP().toString().c_str(), rssi);
-        if (rssi > -40) {
-            DBG("CSI", "RSSI WARN: %d dBm — too strong, may saturate near-AP", rssi);
-        } else if (rssi < -70) {
-            DBG("CSI", "RSSI WARN: %d dBm — too weak, low SNR", rssi);
+        // Same thresholds as the /api/health placement warnings (rssi==0 =
+        // not associated, no verdict) — the serial diag must not contradict
+        // health during live placement tuning.
+        if (rssi != 0) {
+            if (rssi > CSI_RSSI_HOT_DBM) {
+                DBG("CSI", "RSSI WARN: %d dBm — too strong, may saturate near-AP", rssi);
+            } else if (rssi < CSI_RSSI_WEAK_DBM) {
+                DBG("CSI", "RSSI WARN: %d dBm — too weak, low SNR", rssi);
+            }
         }
     }
 
@@ -1580,13 +1714,12 @@ void CSIService::update() {
             _p95TickSinceUpdate++;
             if (_p95TickSinceUpdate >= P95_UPDATE_EVERY && _p95BufCount >= 30) {
                 _p95TickSinceUpdate = 0;
-                // Copy circular buffer to scratch (O(n)) then nth_element (O(n) avg)
+                // Copy circular buffer to scratch (O(n)) then quantile (nth_element,
+                // O(n) avg). #13: percentile is configurable — P95 (default) or P99.
                 static float scratch[P95_BUFFER_SIZE];
                 uint16_t n = _p95BufCount;
                 for (uint16_t i = 0; i < n; i++) scratch[i] = _p95Buffer[i];
-                uint16_t idx95 = (uint16_t)((n - 1) * 0.95f);
-                std::nth_element(scratch, scratch + idx95, scratch + n);
-                _adaptiveThreshold = scratch[idx95] * P95_FACTOR;
+                _adaptiveThreshold = csiAdaptiveThreshold(scratch, n, _adaptivePercentile, P95_FACTOR);
             }
         }
 
@@ -2365,6 +2498,11 @@ void CSIService::_resetShortTermState() {
 void CSIService::_switchDetectionToActive() {
     const CsiSiteModel& a = _modelMgr.active();
     if (!a.valid) return;
+    // Drop any pending EMA stash — it was derived from the PREVIOUS active
+    // model; consuming it now would overwrite the fresh slot's threshold and
+    // stats (RAM + NVS csi_thr) with stale drift. Runs on csi_proc, the same
+    // task as _processPendingEmaPersist(), so this cannot race the consumer.
+    _emaPersistPending.store(false, std::memory_order_release);
     _applyActiveToRuntime();
     setThreshold(a.threshold);            // moves _threshold + _baseThreshold, resets stuck counters
     _resetShortTermState();

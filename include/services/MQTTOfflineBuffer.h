@@ -23,11 +23,12 @@ struct MQTTBufHeader {
     uint32_t head;
 };  // 16 bytes
 
-static constexpr uint32_t MQTT_BUF_MAGIC    = 0x4D510002;
+static constexpr uint32_t MQTT_BUF_MAGIC    = 0x4D510003;
 // 200 slots × 296 B = ~59.2 KB on LittleFS (well within 16 MB partition).
 // Sized for ~5 min outage at typical state-change publish rate so HA timeline
 // stays continuous; pre-fix 50 dropped most messages on long ETH/MQTT gaps.
 static constexpr size_t   MQTT_BUF_CAPACITY = 200;
+static constexpr uint16_t MQTT_BUF_REPLAY_BATCH = 4;
 // Keep room for security events during a telemetry-heavy broker outage. Alarm
 // messages carry a non-zero event_id; ordinary retained state uses zero.
 static constexpr size_t   MQTT_BUF_EVENT_RESERVE = 8;
@@ -43,14 +44,17 @@ public:
     // Call after LittleFS is mounted
     void begin();
 
-    // Store a message when MQTT is offline
+    // Store a security/alarm event when MQTT is offline. Ordinary state and
+    // telemetry messages are intentionally not persisted (see
+    // mqttOfflineBufferShouldStore); LittleFS writes must not become a
+    // high-rate loopTask workload during a broker outage.
     // Returns false if topic/payload too long or buffer unavailable
     bool store(const char* topic, const char* payload, bool retained,
                uint64_t eventId = 0);
 
-    // Replay all buffered messages via publishFn; clears buffer on success
-    // publishFn should return true on success; stops on first failure
-    uint16_t replay(ReplayFn publishFn);
+    // Replay a small batch via publishFn; keeps the remainder for the next
+    // loop iteration. publishFn should return true on success.
+    uint16_t replay(ReplayFn publishFn, uint16_t maxMessages = MQTT_BUF_REPLAY_BATCH);
 
     uint32_t count() const { return _count; }
     bool     available() const { return _fsAvailable; }

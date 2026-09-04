@@ -16,6 +16,7 @@ enum class CsiDecisionReason : uint8_t {
     SMOOTHING_ENTER_PENDING,    // raw motion seen but not enough votes to enter → stays idle
     SMOOTHING_EXIT_PENDING,     // raw idle but not enough votes to exit → stays motion (hysteresis)
     BREATHING_HOLD,             // detector idle but breathing/phase hold keeps motion (stationary person)
+    DATA_STARVED,               // dev7: no fresh CSI packets this tick — frozen variance, decision frozen
 };
 
 inline const char* csiDecisionReasonStr(CsiDecisionReason r) {
@@ -26,6 +27,7 @@ inline const char* csiDecisionReasonStr(CsiDecisionReason r) {
         case CsiDecisionReason::SMOOTHING_ENTER_PENDING: return "smoothing_enter_pending";
         case CsiDecisionReason::SMOOTHING_EXIT_PENDING:  return "smoothing_exit_pending";
         case CsiDecisionReason::BREATHING_HOLD:          return "breathing_hold";
+        case CsiDecisionReason::DATA_STARVED:            return "data_starved";
     }
     return "unknown";
 }
@@ -37,8 +39,10 @@ inline const char* csiDecisionReasonStr(CsiDecisionReason r) {
 //   finalMotion       — motion state after this tick (post smoothing/hold)
 //   breathHoldApplied — breathing-hold branch kept the previous MOTION state
 inline CsiDecisionReason csiClassifyDecision(bool bufferReady, bool rawMotion,
-                                             bool finalMotion, bool breathHoldApplied) {
+                                             bool finalMotion, bool breathHoldApplied,
+                                             bool dataStarved = false) {
     if (!bufferReady)        return CsiDecisionReason::INSUFFICIENT_SAMPLES;
+    if (dataStarved)         return CsiDecisionReason::DATA_STARVED;
     if (breathHoldApplied)   return CsiDecisionReason::BREATHING_HOLD;
     if (finalMotion)         return rawMotion ? CsiDecisionReason::VARIANCE_ABOVE_THRESHOLD
                                               : CsiDecisionReason::SMOOTHING_EXIT_PENDING;
@@ -61,6 +65,8 @@ struct CsiDecisionTrace {
     uint8_t  smoothingWindow = 0;                            // populated bits in the window
     uint8_t  enterVotes = 0;                                 // votes required to enter MOTION
     uint8_t  exitVotes = 0;                                  // idle votes required to exit MOTION
+    bool     dataStarved = false;                            // dev7: tick had no fresh packets — values above are frozen
+    float    packetRate = 0.0f;                              // capture rate of the tick that produced this trace
     bool     breathingHold = false;
     uint16_t breathHoldCount = 0;
     bool     mlMotion = false;

@@ -5,6 +5,7 @@
 #include "secrets.h"
 #include "services/OtaTlsTrustPolicy.h"
 #include "services/TlsMemoryPolicy.h"
+#include "services/HeapMetrics.h"
 #ifndef FW_VERSION
 #define FW_VERSION "unknown"
 #endif
@@ -43,7 +44,7 @@ void TelegramService::begin(Preferences* prefs) {
 
     if (_enabled && strlen(_token) > 10 && strlen(_chatId) > 0) {
         _tlsCa = _prefs->getString("tg_tls_ca", "");
-        if (!otaTlsPemValid(_tlsCa.c_str()) || !tlsMemoryAllowsHandshake(ESP.getFreeHeap(), ESP.getMaxAllocHeap(), _tlsCa.length())) {
+        if (!otaTlsPemValid(_tlsCa.c_str()) || !tlsMemoryAllowsHandshake(heapFreeUsable(), heapLargestUsable(), _tlsCa.length())) {
             DBG("Telegram", "Direct mode blocked: TLS trust or heap unavailable");
             _enabled = false;
             return;
@@ -133,7 +134,7 @@ void TelegramService::update() {
 
 bool TelegramService::tlsHandshakeAllowed() const {
     return otaTlsPemValid(_tlsCa.c_str()) &&
-           tlsMemoryAllowsHandshake(ESP.getFreeHeap(), ESP.getMaxAllocHeap(), _tlsCa.length());
+           tlsMemoryAllowsHandshake(heapFreeUsable(), heapLargestUsable(), _tlsCa.length());
 }
 
 // Non-blocking: enqueue message for background task
@@ -340,7 +341,7 @@ void TelegramService::processCommand(const String& command, const String& chatId
         msg += "⚙️ *Info*\n";
         msg += "FW: " + String(FW_VERSION) + "\n";
         msg += "Uptime: " + String(millis() / 60000) + " min\n";
-        msg += "Heap: " + String(ESP.getFreeHeap() / 1024) + " kB\n";
+        msg += "Heap: " + String(heapFreeUsable() / 1024) + " kB\n";
 
         sendMessage(msg);
     }

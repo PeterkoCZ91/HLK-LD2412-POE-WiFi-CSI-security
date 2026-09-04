@@ -53,10 +53,29 @@ static void test_radar_resolution_validation() {
     TEST_ASSERT_FALSE(configImportRadarResolutionValid(0.70f));
 }
 
+static void test_webhook_validation() {
+    // prázdná = clear, jinak https-only (NotificationService mluví jen TLS)
+    TEST_ASSERT_TRUE(configImportWebhookValid(""));
+    TEST_ASSERT_TRUE(configImportWebhookValid("https://discord.com/api/webhooks/1/abc"));
+    TEST_ASSERT_FALSE(configImportWebhookValid("http://insecure.lan/hook"));
+    TEST_ASSERT_FALSE(configImportWebhookValid("discord.com/api/webhooks/1/abc"));
+    TEST_ASSERT_FALSE(configImportWebhookValid("https://"));
+    TEST_ASSERT_FALSE(configImportWebhookValid(nullptr));
+
+    char tooLong[300];
+    memset(tooLong, 'a', sizeof(tooLong));
+    memcpy(tooLong, "https://", 8);
+    tooLong[256] = '\0';
+    TEST_ASSERT_FALSE(configImportWebhookValid(tooLong));
+    tooLong[255] = '\0';
+    TEST_ASSERT_TRUE(configImportWebhookValid(tooLong));
+}
+
 int main(int, char**) {
     UNITY_BEGIN();
     RUN_TEST(test_text_bounds);
     RUN_TEST(test_redacted_marker);
+    RUN_TEST(test_webhook_validation);
     RUN_TEST(test_port_validation);
     RUN_TEST(test_ipv4_or_empty_validation);
     RUN_TEST(test_schedule_validation);

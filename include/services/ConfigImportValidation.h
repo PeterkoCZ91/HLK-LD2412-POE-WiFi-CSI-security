@@ -15,6 +15,14 @@ inline bool configImportValueIsRedacted(const char* value) {
     return value != nullptr && strcmp(value, "***") == 0;
 }
 
+inline bool configImportWebhookValid(const char* value) {
+    if (value == nullptr) return false;
+    if (*value == '\0') return true;  // prázdná = smazat webhook
+    const size_t len = strlen(value);
+    if (len <= 8 || len > 255) return false;  // buffer 256 vč. terminátoru
+    return strncmp(value, "https://", 8) == 0;  // NotificationService mluví jen TLS
+}
+
 inline bool configImportPortValid(const char* value) {
     if (!configImportTextFits(value, 1, 5)) return false;
     uint32_t port = 0;

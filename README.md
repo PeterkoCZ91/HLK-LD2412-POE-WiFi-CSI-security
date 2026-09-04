@@ -3,7 +3,7 @@
 [![PlatformIO](https://img.shields.io/badge/PlatformIO-ESP32-orange?logo=platformio)](https://platformio.org/)
 [![ESP32](https://img.shields.io/badge/MCU-ESP32--WROOM--32-blue?logo=espressif)](https://www.espressif.com/)
 [![License](https://img.shields.io/badge/License-GPL--3.0-blue)](LICENSE)
-[![Version](https://img.shields.io/badge/Version-5.6.0-blue)]()
+[![Version](https://img.shields.io/badge/Version-5.7.0-blue)]()
 [![Discussions](https://img.shields.io/badge/GitHub-Discussions-purple?logo=github)](https://github.com/PeterkoCZ91/HLK-LD2412-POE-WiFi-CSI-security/discussions)
 
 **Dual-sensor intrusion detection system** — ESP32 + HLK-LD2412 24 GHz mmWave radar + **WiFi CSI (Channel State Information) passive motion detection** over **wired Ethernet with Power over Ethernet**. Full alarm state machine, zone management, Home Assistant integration, Telegram bot, and a dark-mode web dashboard. No cloud required.
@@ -11,6 +11,9 @@
 WiFi CSI detection algorithms based on [ESPectre](https://github.com/francescopace/espectre) by Francesco Pace (GPLv3).
 
 > [!NOTE]
+> **v5.7.0** — reliability release, driven by a multi-day field soak. Three defects that only a long run exposes: (1) every heap decision read `MALLOC_CAP_INTERNAL`, which also counts a leftover IRAM-only region that `malloc()` / `operator new` can never obtain — the figures ran ~41 kB high, so the dev7 **web low-heap gate could never close** (`close_count: 0` across nine OOM deaths); all heap now reads the byte-addressable `MALLOC_CAP_8BIT`, with both capabilities reported side by side in `/api/health` → `heap{}`. (2) A single **sleeping dashboard tab held ~48 kB** in its SSE queue — `AsyncEventSource` bounds that queue by message *count*, and the `SSE_MAX_QUEUED_MESSAGES=8` override was a dead define (PlatformIO `build_flags` **replace** an inherited list instead of extending it); now bounded, with a send-site backlog gate and `sse{}` counters. (3) **MQTT was leaving over the weak CSI WiFi radio instead of Ethernet** — on a flat LAN the WiFi STA outranks Ethernet on lwIP `route_prio` and silently takes the default route, so alarm delivery shared the fate of the sensor radio; the new `EthDefaultNetifPolicy` re-asserts Ethernet periodically and forces an MQTT reconnect only on a genuine routing change, never on a link flap (`/api/health` → `ethernet.route{}`). Plus self-reported outage alerts after a dirty boot, a selectable P95/P99 adaptive CSI percentile, an Ethernet flap-rate counter, CSI starvation gating and runtime webhook provisioning (`/api/notifications/config`). Validated on a seven-day field soak (177 h, zero reboots); 385/385 native tests, all five shipped builds green. See [CHANGELOG](CHANGELOG.md#570---2026-09-04).
+
+> [!TIP]
 > **v5.6.0** — placement-awareness, fusion explainability and a concurrency/persistence hardening pass. CSI health surfaces **sensor-placement warnings** (`rssi_too_strong` when the node is near-field enough to saturate detection, `rssi_too_weak` when the link is too faint). A **live fusion explainability panel** in the dashboard shows per-modality radar/CSI/ML bars, a confidence gauge and a plain-language reason. Fixes a cluster of race/atomicity issues: the CSI **model-import** and **continuous-EMA** writes are now serialized on the `csi_proc` worker (no torn `_active` / spurious `STORE_FAILED`), and **`/api/config/import` is now all-or-nothing** (rolls back on a mid-sequence NVS failure instead of leaving a half-written auth/network state). Validated across a multi-day dual-node soak (32 h+ armed on production, zero triggers/crashes); 240/240 native tests, all five shipped builds green. See [CHANGELOG](CHANGELOG.md#560---2026-08-01).
 
 > [!TIP]
@@ -415,6 +418,40 @@ this as the diagnostic entities **CSI WiFi Scan** and **CSI Capture Active**.
 The MQTT payload deliberately contains no SSIDs, BSSIDs or credentials. Nearby
 network details are available only through the authenticated HTTP API and GUI.
 
+### CSI Passage-Edge Event (non-retained)
+
+CSI motion is exposed two ways. The retained state topic `<csi_prefix>/motion`
+(`ON`/`OFF`, e.g. `poe2412_device/csi/motion`) always reflects the *current*
+variance-based motion state — but because it is retained it pins `ON`, is
+replayed to every new subscriber, and re-fires after a Home Assistant restart,
+so it can't tell a live passage from a stale replay. For passage detection,
+subscribe instead to the **non-retained** edge topic `<csi_prefix>/event`
+(e.g. `poe2412_device/csi/event`), published once on every motion transition:
+
+```json
+{"v":1,"boot_id":"a3f19c04","seq":42,"event":"motion_started","uptime_ms":918230,"source":"csi_variance","variance":0.004212,"threshold":0.003152}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `v` | Payload schema version (currently `1`) |
+| `boot_id` | Random hex, stable for one boot — lets a consumer reject a retained / offline-buffer replay of a *previous* boot |
+| `seq` | Monotonic counter per boot (dedup + ordering; resets only on reboot) |
+| `event` | `motion_started` or `motion_ended` |
+| `uptime_ms` | Milliseconds since boot — reject an event older than the last known state to defeat offline-buffer replay of a stale edge |
+| `source` | `csi_variance` for a real transition, `selftest` for a synthetic edge (see below) |
+| `variance` / `threshold` | Running variance and effective threshold at the edge |
+
+The edge is **best-effort**: if the broker is down at the moment of the
+transition the event is dropped rather than retried, so a stale replayed edge
+can never fake a passage — a missed one still leaves the retained
+`<csi_prefix>/motion` state for HA to read.
+
+To validate the wire and an HA passage automation without walking in front of
+the node, POST a synthetic edge: `POST /api/csi/selftest/edge?state=1`
+(`motion_started`, the default) or `?state=0` (`motion_ended`). It publishes an
+edge marked `source:"selftest"` so it can never be mistaken for a real passage.
+
 ### Site Learning Workflow (CSI)
 
 **Site learning** builds a long-term quiet-room baseline that the CSI detector uses to set its motion threshold. It is the single most important step for low false-positive operation in your specific environment.
@@ -485,6 +522,45 @@ After the timed run completes, the firmware **continues to refresh the baseline 
 | Chip temperature | MQTT + Telegram alerts on thermal events |
 | Heap monitoring | Telegram alerts on low RAM (warn/critical/recover) |
 | Factory reset | GPIO 0 long press (5 seconds) |
+
+### Self-Protection Under Heap Pressure (dev7)
+
+A collapsing heap used to end in a panic inside the web stack — the async
+web server allocates with a throwing `new`, so once memory ran out, the next
+incoming HTTP request rebooted the node through `std::terminate` (observed in
+the field as `Exception/Panic` reset loops). Three layers now contain this:
+
+- **Low-heap accept gate.** New HTTP connections are refused with an
+  allocation-free TCP RST while free heap is under 28 kB (or the largest
+  allocatable block under 12 kB), reopening with hysteresis above
+  40 kB / 16 kB. Existing connections, MQTT and the alarm core are untouched.
+  NVS: `web_gate_en`, `web_gate_close`, `web_gate_open` (kB). State:
+  `/api/health` → `web_gate{...}`; close/reopen transitions are logged with a
+  heap snapshot.
+- **SSE client cap.** At most 4 concurrent event streams; new streams are also
+  refused while the gate is closed (reconnect storms after a link flap were a
+  main heap-spike source).
+- **`oom_gate` controlled restart.** If a throwing allocation still fails
+  anywhere, an allocation-free `std::set_new_handler` records the incident in
+  RTC RAM and restarts cleanly instead of panicking; the next boot logs it in
+  `reset_history` as `oom_gate heap=<free>/<largest>`. Set NVS
+  `oom_restart_en=0` to get the old panic + coredump for debugging; an OOM
+  during an OTA write, or a repeat OOM within 60 s of an `oom_gate` boot,
+  still aborts so a restart loop stays visible.
+
+The CSI threshold path is starvation-gated too: a decision tick with no fresh
+CSI packets freezes the motion state machine (frozen variance is not evidence
+— see `data_starved` in `/api/csi/decision` and `csi.starved_ticks` in
+`/api/health`), so a packet outage on an armed node can no longer walk the
+smoothing window into a false `motion_enter`.
+
+And the node reports its own outages (dev8): after a dirty boot (panic,
+watchdog, brownout, `oom_gate` restart) it sends a Telegram notice with the
+reset reason, uptime before the crash, the pre-crash heap snapshot and the
+coredump flag — no more silent panic streaks discovered days later in
+`reset_history`. A survived heap-pressure episode (gate closed → reopened)
+is reported the same way. Clean boots (OTA, user restart, power-cycle) stay
+quiet.
 
 ---
 
@@ -583,7 +659,7 @@ All endpoints require Digest auth except where noted.
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| GET | `/api/health` | Uptime, Ethernet info, MQTT, heap, CSI status, `crossmodal_desync`, reset history |
+| GET | `/api/health` | Uptime, Ethernet info, MQTT, heap (`heap{}` reports byte-addressable and internal capabilities separately since v5.7.0-dev12), CSI status, `crossmodal_desync`, reset history |
 | GET | `/api/operation/status` | Runtime operation coordinator snapshot: current operation (idle / OTA / WiFi scan / calibration / site-learning), owner and typed failure reason. Mirrored to a retained MQTT `security/<device>/system/operation` topic + an HA "Runtime Operation" sensor |
 | GET | `/metrics` | Prometheus text exposition — heap, chip temp, radar health, ETH/MQTT state, alarm state, fusion confidence, CSI stats. **Basic auth**. See [Prometheus Metrics](#prometheus-metrics) |
 | GET | `/healthz` | Unauthenticated liveness probe — heap + uptime. Use for external monitoring when auth may be degraded. |
@@ -614,6 +690,7 @@ All endpoints require Digest auth except where noted.
 | POST | `/api/events/clear` | Clear event history |
 | GET/DELETE | `/api/logs` | Structured log query / clear (entries restored from before a crash carry `"prev": true`) |
 | GET | `/api/coredump` | Core dump summary (present, size, crashed task, PC) |
+| GET | `/api/heap/watermarks` | Every recorded drop of the heap low-water mark, with the context live at that moment (`from`/`to`, `largest`, `free`, `mqtt_conn`/`mqtt_rec`, `discovery` index, `runtime_op`, `rssi`). Kept in a dedicated RTC ring, so `previous_boot` survives a panic. Separate from `/api/health` on purpose — that payload is large enough that polling it is itself a memory event |
 | GET | `/api/coredump/download` | Download raw core dump (`espcoredump.py info_corefile -t raw`) |
 | POST | `/api/coredump/erase` | Erase stored core dump |
 
@@ -639,7 +716,7 @@ All endpoints require Digest auth except where noted.
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| GET/POST | `/api/csi` | CSI metrics, config, diagnostics (incl. site learning, MLP, NBVI, adaptive threshold, `ht_ltf_seen`); `POST ?nbvi=0\|1` toggles NBVI subcarrier auto-selection at runtime (diagnostic/A-B use, not persisted across reboot) |
+| GET/POST | `/api/csi` | CSI metrics, config, diagnostics (incl. site learning, MLP, NBVI, adaptive threshold, `ht_ltf_seen`); `POST ?nbvi=0\|1` toggles NBVI subcarrier auto-selection at runtime (diagnostic/A-B use, not persisted across reboot); `POST ?adaptive_pct=95\|99` selects the adaptive-threshold percentile (fraction `0.95`–`0.999` or whole percent; persisted in NVS + config export/import; invalid/out-of-band input rejected). Current value is reported as `adaptive_percentile` in the `/api/health` csi block |
 | POST | `/api/csi/calibrate` | Auto-calibrate CSI threshold |
 | POST | `/api/csi/site_learning` | Start long-term site-learning baseline (`?duration_s=...` or `?duration_h=...`, default 48 h); stop with `?stop=1`; discard model with `?clear_model=1`; `action=start\|stop` aliases accepted, other `action` values → 400 |
 | GET | `/api/csi/site_model` | Active/candidate/previous model slots + runtime generation + `apply_required` + per-slot `ap_compat` (`compatible`/`incompatible`/`unknown` vs the current AP BSSID) |
@@ -653,6 +730,7 @@ All endpoints require Digest auth except where noted.
 | GET | `/api/csi/health` | **P1.4** Sensor health reasons + 0–100 score (`no_ht_ltf`, `packet_rate_low/unstable`, `wifi_roamed`, `model_missing/stale`, `learning_contaminated`, `radar_unavailable`, `mqtt_disconnected`, `clock_invalid`, `ml_saturated`) — motion=false ≠ healthy |
 | GET/DELETE | `/api/csi/events` | **P1.3** RAM diagnostic event ring (`?limit=100&after_seq=N`) — motion edges, variance spikes, model disagreements; DELETE clears it |
 | GET | `/api/csi/shadow` | **P1.1** Shadow-evaluation status (candidate verdict computed in parallel) — **diagnostic only, no alarm effect** |
+| POST | `/api/csi/selftest/edge` | Emit a **synthetic** passage edge (`source:"selftest"`) on the non-retained `<csi_prefix>/event` topic to validate the event wire + HA automation without physical motion. `?state=1` → `motion_started` (default), `?state=0` → `motion_ended`. Returns `202` |
 | POST | `/api/csi/reset_baseline` | Reset CSI idle baselines |
 | POST | `/api/csi/reconnect` | Force WiFi reconnect for CSI |
 | GET/POST | `/api/csi/wifi` | Read configured SSID / set runtime SSID + password (NVS-persisted, requires reboot; omitted/empty password preserves the current one, `clear_pass=1` clears it) |
@@ -685,6 +763,7 @@ The `note`, `active`, `shadow`, `agree`, `disagree`, `active_thr`, `shadow_thr` 
 | GET/POST | `/api/telegram/config` | Telegram bot token and chat id |
 | POST | `/api/telegram/test` | Enqueue a test Telegram message (async — returns `202`, then poll `/api/telegram/test/status`) |
 | GET | `/api/telegram/test/status` | Poll the result of the last enqueued Telegram test (`pending` / `ok` / `failed`) |
+| GET/POST | `/api/notifications/config` | Discord / generic **webhook provisioning** — no compile-time defaults. `GET` returns `{enabled, dc_webhook, gen_webhook}` with a stored URL reported as `***` (never the URL itself); `POST` takes `dc_webhook`, `gen_webhook`, `enabled=0\|1` (form body or query) — `***` leaves a value unchanged, an empty value clears it, URLs must be `https://` and ≤255 B (`400` otherwise). A change applied while notifications are enabled reboots the node (the webhook queue and task are built at boot) |
 | POST | `/api/auth/config` | Change web admin user/password |
 | GET/POST | `/api/network/config` | Static IP and DNS |
 | GET | `/api/config/export` | Download settings JSON; credentials and Telegram chat ID are `***`-redacted |
@@ -748,6 +827,26 @@ Exported metric families (`poe2412_` prefix):
 | Network | `eth_link_up`, `eth_speed_mbps`, `mqtt_connected`, `mqtt_publish_fails_total`, `mqtt_reconnects_total` |
 | Security | `alarm_state` (0=DISARMED … 4=TRIGGERED), `alarm_armed`, `http_auth_ok_total`, `http_auth_fail_total` |
 | Fusion / CSI | `fusion_enabled`, `fusion_presence`, `fusion_confidence`, `csi_active`, `csi_data_ok` (0 = associated but no CSI frames), `csi_packets_total`, `csi_packet_rate`, `csi_wifi_rssi_dbm`, `csi_effective_threshold`, `csi_motion`, `csi_ml_probability` |
+
+Since v5.7.0-dev12 every heap figure — here, in `/api/health` and on the
+`free_heap` / `max_alloc_heap` MQTT topics — reports the **byte-addressable**
+heap (`MALLOC_CAP_8BIT`): the memory `malloc()` and `operator new` can actually
+obtain. Earlier builds reported `MALLOC_CAP_INTERNAL`, which on ESP32 also
+counts the leftover IRAM-only region (~42 kB on this firmware) that no ordinary
+allocation can use, so recorded history from before dev12 reads roughly that
+much higher for the same physical state. `/api/health` now carries a `heap`
+object with both capabilities side by side (`free_8bit`, `largest_8bit`,
+`min_free_8bit`, `free_internal`, `largest_internal`, `unusable_internal`,
+`internal_misleading`) for exactly that comparison.
+
+Alongside it, `heap_skips` records what the node gave up when memory ran short:
+`mqtt` counts every publish cycle dropped because free heap was under
+`HEAP_MIN_FOR_PUBLISH`, `sse` the telemetry ticks dropped for the same reason,
+`mqtt_logged` how many of those actually produced a serial line (the warning is
+rate-limited to one per 10 s), and `lowest_free` the deepest reading seen —
+absent until a skip has happened. A `mqtt` count well above `mqtt_logged` means
+the dip repeats faster than the log admits, which is precisely how it stayed
+invisible before dev19.
 
 CSI metrics are omitted on radar-only builds. Example `prometheus.yml` scrape config:
 
@@ -875,7 +974,8 @@ A: HA auto-discovery publishes a device with the following entities (names prefi
 - `sensor.<id>_fusion_source` — `radar`, `csi`, `ml`, `radar+csi`, `csi+ml`, `all`
 - `sensor.<id>_fusion_confidence` — 0.0 – 1.0
 - `sensor.<id>_csi_wifi_scan` — WiFi scan state and diagnostic attributes
-- `sensor.<id>_rssi`, `_packets_per_sec`, `_chip_temp`, `_uptime`, `_heap`
+- `binary_sensor.<id>_eth_link` — Ethernet PHY link state (no RSSI is published over MQTT)
+- `sensor.<id>_chip_temperature`, `_uptime`, `_free_memory`, `_max_alloc_heap`
 - `switch.<id>_arm`, `switch.<id>_engineering_mode`
 - `button.<id>_calibrate`, `button.<id>_restart`
 
@@ -951,6 +1051,7 @@ A: Yes. Each device gets a unique `device_id` (auto-derived from MAC) so HA disc
 | v5.4.1-poe-wifi | **Crash-forensics + reliability-first release.** Core-dump read-out API (`GET /api/coredump`), system-log persistence across panic/reset, ML-saturation guard (`ml_saturated`). Full reliability roadmap: model-lifecycle correctness + disarm-PIN hardening (Release A); a single `RuntimeOperationCoordinator` serializing OTA / WiFi scan / calibration / site-learning with unified status (`GET /api/operation/status`, retained `security/<device>/system/operation`, HA sensor, fail-closed `409` on conflict) (Release B); central log/export secret redaction + per-service TLS trust management (write-only CA PEM in NVS via `/api/{ota,mqtt,telegram,discord,webhook}/trust`, all HTTPS fail-closed) (Release C). Nearby-WiFi scan in the CSI dashboard (`POST /api/csi/wifi/scan`). 213/213 native tests, all five shipped builds green. |
 | v5.5.0 | **Fusion liveness + HA explainability.** Passive radar↔CSI cross-modal desync health warning; opt-in 8 s low-confidence corroboration gate before the unchanged AlarmFSM; retained alarm reason with radar/CSI/ML attributes; `Empty`/`Home`/`Paranoid` security preset over API, MQTT and HA select. 228/228 native tests, all five shipped builds green. |
 | v5.6.0 | **Placement-awareness + fusion explainability + concurrency/persistence hardening.** CSI sensor-placement health warnings (`rssi_too_strong` near-field saturation, `rssi_too_weak` faint link); a live fusion explainability dashboard panel (per-modality radar/CSI/ML bars + confidence gauge + plain-language reason). Race/atomicity fixes: CSI model-import and continuous-EMA slot writes serialized on the `csi_proc` worker (no torn `_active` / spurious `STORE_FAILED`), and all-or-nothing `/api/config/import` (rollback journal instead of a half-written auth/network state). Multi-day dual-node soak (32 h+ armed on production, zero triggers/crashes); 240/240 native tests, all five shipped builds green. |
+| v5.7.0 | **Reliability release.** Every heap decision now reads the byte-addressable `MALLOC_CAP_8BIT` instead of `MALLOC_CAP_INTERNAL` (figures had run ~41 kB high, so the web low-heap gate could never close); a bounded SSE per-client queue fixes a dead `build_flags` override that let one stalled dashboard tab pin ~48 kB; `EthDefaultNetifPolicy` stops MQTT from riding the CSI WiFi radio on dual-homed hardware, reconnecting only on a genuine routing change, never a link flap. Adds a web admission gate (bounds in-flight requests so a request burst can't outrun the heap gate's own reading), a dedicated heap-watermark tripwire ring (`GET /api/heap/watermarks`) and a `heap_skips` counter that tracks every dropped publish/SSE tick regardless of log rate-limiting. Plus self-reported outage alerts, a selectable P95/P99 adaptive CSI percentile, an Ethernet flap-rate counter and CSI starvation gating. Validated on a seven-day field soak (177 h, zero reboots); 385/385 native tests, all five shipped builds green. |
 ---
 
 ## Related Projects

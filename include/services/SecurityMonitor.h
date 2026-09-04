@@ -236,7 +236,10 @@ public:
     int getRSSIDropThreshold() const { return _rssiDropThreshold; }
 
 private:
-    void triggerAlert(NotificationType type, const String& message, const String& details = "", int16_t explicitDist = -1);
+    // `source` is the producer identity used for cooldown keying — several
+    // call sites here share a NotificationType and must not mute each other.
+    void triggerAlert(NotificationType type, const String& message, const String& details = "",
+                      int16_t explicitDist = -1, AlertSource source = AlertSource::GENERIC);
     void activateSiren();
     void deactivateSiren();
     // T6: copy live config (delays/timeout/autoRearm/debounce) into _fsm before each FSM call.

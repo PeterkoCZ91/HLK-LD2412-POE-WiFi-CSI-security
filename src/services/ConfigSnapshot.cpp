@@ -1,5 +1,5 @@
 #include "services/ConfigSnapshot.h"
-#include "services/SensitiveDataRedaction.h"
+#include "services/ConfigSnapshotPolicy.h"
 #include "debug.h"
 #include <time.h>
 #include <cstring>
@@ -117,7 +117,13 @@ bool ConfigSnapshot::saveSnapshot(Preferences* prefs, const char* fwVersion, con
         if (!prefs->isKey(k)) continue;
 
         switch (NVS_KEYS[i].type) {
-            case 's': cfg[k] = prefs->getString(k, "");         break;
+            // Tajemství se do plaintext LittleFS nezapisují — jen sentinel,
+            // že byla nakonfigurovaná (restore je přeskočí a nechá NVS být).
+            case 's': {
+                String value = prefs->getString(k, "");
+                cfg[k] = configSnapshotMaskedString(k, value.c_str());
+                break;
+            }
             case 'u': cfg[k] = prefs->getULong(k, 0);          break;
             case 'b': cfg[k] = prefs->getBool(k, false);        break;
             case 'f': cfg[k] = prefs->getFloat(k, 0.0f);        break;
@@ -173,7 +179,12 @@ bool ConfigSnapshot::restoreSnapshot(Preferences* prefs, int slot) {
         if (cfg[k].isNull()) continue;
 
         switch (NVS_KEYS[i].type) {
-            case 's': prefs->putString(k, cfg[k].as<const char*>()); break;
+            case 's': {
+                const char* value = cfg[k].as<const char*>();
+                if (!configSnapshotShouldRestoreString(value)) continue;
+                prefs->putString(k, value);
+                break;
+            }
             case 'u': prefs->putULong(k,  cfg[k].as<uint32_t>());    break;
             case 'b': prefs->putBool(k,   cfg[k].as<bool>());         break;
             case 'f': prefs->putFloat(k,  cfg[k].as<float>());        break;
@@ -234,17 +245,13 @@ bool ConfigSnapshot::getSnapshotJSON(JsonDocument& doc, int slot) {
     f.close();
     if (err) return false;
 
-    // Mask sensitive keys in-place. "user" alone isn't a sensitive token
-    // (isSensitiveKeyName doesn't flag it), but auth_user/mqtt_user is half a
-    // credential pair — /api/config/export masks both explicitly, match it here.
+    // Nové sloty už mají tajemství maskovaná při uložení; tohle kryje
+    // starší sloty s raw hodnotami (stejná policy jako save).
     if (doc["cfg"].is<JsonObject>()) {
         JsonObject cfg = doc["cfg"].as<JsonObject>();
         for (JsonPair pair : cfg) {
-            const char* key = pair.key().c_str();
-            if (isSensitiveKeyName(key) ||
-                std::strcmp(key, "auth_user") == 0 ||
-                std::strcmp(key, "mqtt_user") == 0) {
-                pair.value().set("***");
+            if (configSnapshotKeyIsSecret(pair.key().c_str())) {
+                pair.value().set(CONFIG_SNAPSHOT_REDACTED);
             }
         }
     }

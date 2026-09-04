@@ -210,6 +210,24 @@ void test_ml_vote_trusted_at_floor_boundary() {
     TEST_ASSERT_TRUE(csiMlVoteTrusted(5.0f, 5.0f));
 }
 
+// ---- variance (threshold-path) vote trust gate (dev7: field false trigger
+// 2026-08-17 — at pps=0 the running variance freezes at its last value; a
+// frozen value above the threshold kept feeding motion votes into the
+// smoothing window until the alarm fired. The threshold path had no
+// starvation gate at all; the floor is lower than the ML one because the
+// variance only needs SOME fresh packets, not a trained-in packet rate) ----
+void test_variance_vote_untrusted_at_zero_rate() {
+    TEST_ASSERT_FALSE(csiVarianceVoteTrusted(0.0f, 0.5f));
+}
+
+void test_variance_vote_trusted_with_fresh_packets() {
+    TEST_ASSERT_TRUE(csiVarianceVoteTrusted(1.0f, 0.5f));
+}
+
+void test_variance_vote_trusted_at_floor_boundary() {
+    TEST_ASSERT_TRUE(csiVarianceVoteTrusted(0.5f, 0.5f));
+}
+
 int main(int, char**) {
     UNITY_BEGIN();
     RUN_TEST(test_healthy_has_no_flags_and_full_score);
@@ -235,5 +253,8 @@ int main(int, char**) {
     RUN_TEST(test_ml_vote_untrusted_below_packet_rate_floor);
     RUN_TEST(test_ml_vote_trusted_above_packet_rate_floor);
     RUN_TEST(test_ml_vote_trusted_at_floor_boundary);
+    RUN_TEST(test_variance_vote_untrusted_at_zero_rate);
+    RUN_TEST(test_variance_vote_trusted_with_fresh_packets);
+    RUN_TEST(test_variance_vote_trusted_at_floor_boundary);
     return UNITY_END();
 }

@@ -18,10 +18,14 @@
 #include "services/CsiEventRing.h"
 #include "services/CsiShadowDetector.h"
 #include "services/CsiHealthReasons.h"
+#include "services/CsiAdaptiveThreshold.h"
 #include "services/CsiDetectionSnapshot.h"
 #include "services/CsiModelCommand.h"
+#include "services/CsiMotionEdge.h"
 #include "services/RuntimeOperationCoordinator.h"
 #include "services/WifiScanResults.h"
+
+#include "services/EthDefaultNetifPolicy.h"
 
 class MQTTService;
 
@@ -62,6 +66,20 @@ public:
     void update();
 
     bool isActive() const { return _active; }
+
+    // True only while CSI is genuinely trying to see the room. isActive() is
+    // latched true once at startup and never cleared, so on its own it cannot
+    // tell "blinded" from "deliberately idle" — the tamper detector needs the
+    // difference, or a WiFi scan or an OTA reads as sabotage.
+    bool isSensing() const {
+        return _active && isWifiCaptureActive() && !_isOtaInProgress();
+    }
+
+    // dev15 outbound-routing observability. Without these the only way to learn
+    // which interface MQTT actually leaves by was a tcpdump on the LAN segment.
+    bool     ethIsDefaultNetif()    const { return _ethIsDefaultNetif(); }
+    uint32_t ethNetifAssertCount()  const { return _ethNetifPolicy.assertCount(); }
+    uint32_t ethNetifChangeCount()  const { return _ethNetifPolicy.changeCount(); }
 
     // Accessors
     float getTurbulence() const { return _lastTurbulence; }
@@ -109,6 +127,8 @@ public:
 
     // Runtime stats
     float getPacketRate() const { return _packetRate; }
+    // dev7: motion-decision ticks frozen because no fresh packets arrived
+    uint32_t getStarvedTickCount() const { return _starvedTickCount; }
     // P1.4 health: capture rate swinging far from its own running average
     bool  isPacketRateUnstable() const {
         return _packetRateEma > 1.0f &&
@@ -281,6 +301,10 @@ public:
     float    getAdaptiveThreshold()       const { return _adaptiveThreshold; }
     float    getEffectiveThreshold() const;
     uint16_t getP95SampleCount()    const { return _p95BufCount; }
+    // #13: quantile of the adaptive rolling threshold — 0.95 (sensitive default)
+    // or 0.99 (fewer false positives on noisy links). Clamped to [0.50, 0.999].
+    void     setAdaptivePercentile(float q) { _adaptivePercentile = csiClampAdaptivePercentile(q); }
+    float    getAdaptivePercentile() const { return _adaptivePercentile; }
 
     // csi5: NBVI subcarrier auto-selection (port from espectre NBVICalibrator, EWMA-lite)
     void     setNbviEnabled(bool enabled) {
@@ -305,6 +329,11 @@ public:
     float getMlProbability()  const { return _mlProbability; }
     uint32_t getQueueDrops()  const { return _csiQueueDrops.load(); }
     bool  isMlSaturated()     const { return _mlSatGuard.saturated(); }
+
+    // Queue a synthetic passage edge (source="selftest") for the next publish
+    // tick. Thread-safe (called from the web task); deterministic validation of
+    // the whole event wire + HA automation without physical motion.
+    bool  emitTestEdge(bool enter);
     uint8_t getMlDutyPct()    const { return _mlSatGuard.dutyPct(); }
     bool  getMlMotionState()  const { return _mlMotion; }
     float getMlThreshold()    const { return _mlThreshold; }
@@ -327,6 +356,7 @@ private:
     std::atomic<uint32_t> _csiQueueDrops{0};
     CsiModelCommandSlot _modelCommandSlot;
     std::atomic<uint8_t> _pendingModelPublish{0};
+    std::atomic<int8_t>  _pendingTestEdge{-1};  // -1 none, 0 end, 1 start (selftest)
     // #6: the continuous-EMA drift is computed on the main loop but its ACTIVE-slot
     // write must run on csi_proc, serialized with apply/rollback/import. The main
     // loop stashes the drifted values and raises _emaPersistPending (release); the
@@ -337,9 +367,11 @@ private:
     float _emaPersistMean = 0.0f;
     float _emaPersistStd = 0.0f;
     void _publishMQTT();
+    bool _publishMotionEdge(bool enter, const char* source, uint32_t now);  // loop task only
     void _updateMotionState();
     void _recordDecisionTrace(bool bufferReady, bool rawMotion, bool finalMotion,
-                              bool breathHold, uint8_t votes, uint8_t window, float effThr);
+                              bool breathHold, uint8_t votes, uint8_t window, float effThr,
+                              bool dataStarved = false);
     void _pushEvent(CsiEventType type, float effThr, float shadowThr = 0.0f,
                     bool shadowMotion = false, uint16_t healthFlags = 0);
     float _relativeFloor() const;  // v5.4: 3x learned quiet mean (link-relative)
@@ -354,7 +386,9 @@ private:
         return _runtimeOperationCoordinator != nullptr &&
                _runtimeOperationCoordinator->status().operation == RuntimeOperation::OTA;
     }
-    void _restoreEthDefaultNetif();
+    bool _restoreEthDefaultNetif();
+    bool _ethIsDefaultNetif() const;
+    bool _ethHasIp() const;
     void _pollWifiScan();
     void _finishWifiScanOperation();
     bool _restoreCsiAfterWifiScan();
@@ -584,6 +618,7 @@ private:
     uint16_t _p95TickSinceUpdate = 0;
     bool     _adaptiveThresholdEnabled = true;
     float    _adaptiveThreshold = 0.0f;
+    float    _adaptivePercentile = 0.95f;   // #13: P95 default, P99 selectable
 
     // csi5: NBVI-lite subcarrier auto-selection
     static constexpr float    NBVI_ALPHA        = 0.01f;
@@ -657,6 +692,12 @@ private:
     // below it, DSER/turbulence time constants are stretched far past their trained
     // real-time window and ml_probability saturates regardless of actual motion.
     static constexpr float ML_MIN_PACKET_RATE_PPS = 5.0f;
+    // dev7 threshold-path starvation gate: a tick with no fresh packets carries a
+    // FROZEN running variance — it must not vote into the smoothing window (field
+    // false trigger 2026-08-17). Unlike the ML floor above, any fresh data counts:
+    // 0.5 pps rejects only zero-packet ticks at the 1 s publish cadence.
+    static constexpr float VAR_MIN_PACKET_RATE_PPS = 0.5f;
+    uint32_t _starvedTickCount = 0;   // dev7 diag: motion ticks frozen by starvation
     // Independent N/M smoothing over ML raw decisions (shape-aligned with variance path)
     uint8_t  _mlSmoothHistory = 0;
     uint8_t  _mlSmoothCount   = 0;
@@ -665,12 +706,22 @@ private:
     TaskHandle_t _trafficGenHandle = nullptr;
     int _trafficGenSock = -1;
     std::atomic<bool> _trafficGenRunning{false};
+    // dev9: web-API traffic-gen setters run on async_tcp, but the generator task
+    // is owned by loopTask (update() starts it). Restarting it from async_tcp —
+    // a blocking _stopTrafficGen() wait plus a task respawn while async_tcp holds
+    // the TCPIP core lock — orphaned the old task and spawned a second one, two
+    // tasks contending the lock, starving loopTask into a Task WDT panic (field
+    // 2026-08-18). Setters now only raise this flag; update() (loopTask, the
+    // owner) performs the stop/start where it is safe. Mirrors the model-command
+    // slot pattern (async_tcp never touches another task's resources directly).
+    std::atomic<bool> _trafficGenRestartPending{false};
 
     // State
     bool _active = false;
     bool _detectionDataOk = true;
     CsiDetectionSnapshotStore _detectionSnapshot;
     MQTTService* _mqtt = nullptr;
+    EthDefaultNetifPolicy _ethNetifPolicy;
     char _topicPrefix[64] = {};
 
     // Publish topics
@@ -687,6 +738,14 @@ private:
     char _tMlProb[80] = {};
     char _tMlMotion[80] = {};
     char _tShadow[80] = {};   // P1.1: diagnostic candidate-shadow JSON (retained)
+
+    // Passage-edge event (variant S): NON-RETAINED motion_started/ended on
+    // <prefix>/event so HA sees edges, not the pinned retained state. _bootId +
+    // _edgeSeq let the consumer reject retained/offline replays of a past boot.
+    char     _tEvent[80]  = {};
+    char     _bootId[9]   = {};   // 8 hex chars from esp_random(), set in begin()
+    uint32_t _edgeSeq     = 0;    // monotonic per boot
+    bool     _edgePubState = false; // last motion state published as an edge
 };
 
 #endif // CSI_SERVICE_H

@@ -3,6 +3,7 @@
 #include <esp_task_wdt.h>
 #include <esp_idf_version.h>
 #include <new>
+#include "services/HeapMetrics.h"
 
 // esp_task_wdt_reset() from a task that isn't subscribed is a silent no-op on
 // IDF4 but logs "task_wdt: task not found" errors on IDF5 (boot-time radar
@@ -41,7 +42,7 @@ bool LD2412Service::begin(HardwareSerial& serial, uint8_t minGate, uint8_t maxGa
     delay(500);
     _radar = new(std::nothrow) LD2412(*_serial);
     if (!_radar) {
-        DBG("RADAR", "CRIT: LD2412 alloc failed, heap=%u", ESP.getFreeHeap());
+        DBG("RADAR", "CRIT: LD2412 alloc failed, heap=%u", heapFreeUsable());
         return false;
     }
 
@@ -60,7 +61,7 @@ bool LD2412Service::begin(HardwareSerial& serial, uint8_t minGate, uint8_t maxGa
         delay(500);
         _radar = new(std::nothrow) LD2412(*_serial);
         if (!_radar) {
-            DBG("RADAR", "CRIT: LD2412 alloc failed, heap=%u", ESP.getFreeHeap());
+            DBG("RADAR", "CRIT: LD2412 alloc failed, heap=%u", heapFreeUsable());
             return false;
         }
 

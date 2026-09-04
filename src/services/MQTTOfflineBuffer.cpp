@@ -93,6 +93,11 @@ bool MQTTOfflineBuffer::store(const char* topic, const char* payload, bool retai
                               uint64_t eventId) {
     if (!_fsAvailable || !topic || !payload) return false;
 
+    // Defense in depth: only event-bearing messages may reach LittleFS.
+    // Ordinary MQTT state/telemetry is intentionally shed while offline so a
+    // long broker outage cannot turn this synchronous path into a WDT trigger.
+    if (!mqttOfflineBufferShouldStore(eventId)) return false;
+
     // Don't buffer HA Discovery — they're replayed via publishDiscoveryStep on reconnect
     if (strncmp(topic, "homeassistant/", 14) == 0) return false;
 
@@ -201,28 +206,26 @@ bool MQTTOfflineBuffer::readMsg(uint32_t index, BufferedMsg& out) {
 }
 
 // -------------------------------------------------------------------------
-// replay — publish all buffered messages oldest-first
-// Stops on first publish failure (network issue); clears buffer on full success
+// replay — publish a bounded batch oldest-first
+// Stops on first publish failure and keeps the remainder for retry
 // Returns number of successfully replayed messages
 // -------------------------------------------------------------------------
-uint16_t MQTTOfflineBuffer::replay(ReplayFn publishFn) {
-    if (!_fsAvailable || _count == 0 || !publishFn) return 0;
+uint16_t MQTTOfflineBuffer::replay(ReplayFn publishFn, uint16_t maxMessages) {
+    if (!_fsAvailable || _count == 0 || !publishFn || maxMessages == 0) return 0;
 
     uint32_t total = _count;
+    uint32_t batch = (total < maxMessages) ? total : maxMessages;
     uint16_t sent  = 0;
 
-    DBG("MQTTBuf", "Replaying %u buffered messages...", total);
+    DBG("MQTTBuf", "Replaying %u/%u buffered messages...", (unsigned)batch, (unsigned)total);
 
-    for (uint32_t i = 0; i < total; i++) {
+    for (uint32_t i = 0; i < batch; i++) {
         BufferedMsg msg;
         if (!readMsg(i, msg)) {
-            // Keep the first two attempts non-destructive for transient FS
-            // faults. A persistently unreadable head would otherwise block all
-            // newer messages forever, so skip just that one record on attempt 3.
             _replayReadFailureStreak++;
             _head  = (_head + sent) % MQTT_BUF_CAPACITY;
             _count = total - sent;
-            if (_replayReadFailureStreak >= 3) {
+            if (_replayReadFailureStreak >= 3 && _count > 0) {
                 _head = (_head + 1) % MQTT_BUF_CAPACITY;
                 _count--;
                 _replayReadFailureStreak = 0;
@@ -236,10 +239,8 @@ uint16_t MQTTOfflineBuffer::replay(ReplayFn publishFn) {
         }
 
         _replayReadFailureStreak = 0;
-
         if (!publishFn(msg.topic, msg.payload, msg.retained)) {
             DBG("MQTTBuf", "Replay stopped at msg %u — publish failed", i);
-            // Shift remaining messages to front and update head/count
             _head  = (_head + sent) % MQTT_BUF_CAPACITY;
             _count = total - sent;
             updateHeader();
@@ -248,10 +249,15 @@ uint16_t MQTTOfflineBuffer::replay(ReplayFn publishFn) {
         sent++;
     }
 
-    // All replayed — clear buffer
-    clear();
-    _replayReadFailureStreak = 0;
-    DBG("MQTTBuf", "Replayed %u messages, buffer cleared", sent);
+    _head  = (_head + sent) % MQTT_BUF_CAPACITY;
+    _count = total - sent;
+    updateHeader();
+    if (_count == 0) {
+        _replayReadFailureStreak = 0;
+        DBG("MQTTBuf", "Replayed %u messages, buffer cleared", sent);
+    } else {
+        DBG("MQTTBuf", "Replayed %u messages, %u remain", sent, (unsigned)_count);
+    }
     return sent;
 }
 

@@ -4,6 +4,9 @@
 #include <vector>
 #include "ConfigManager.h"
 #include <ETH.h>
+#include "services/HeapMetrics.h"
+#include "services/HeapWatermarkRing.h"
+#include "services/HeapSkipTracker.h"
 
 // Radar OUT pin - must match main.cpp definition
 #ifndef RADAR_OUT_PIN
@@ -18,12 +21,17 @@
 #include "services/EventLog.h"
 #include "services/ConfigSnapshot.h"
 #include "services/ConfigImportValidation.h"
+#include "services/HeapGatePolicy.h"
+#include "services/WebAdmissionPolicy.h"
+#include "services/GatedWebServer.h"
+#include "services/EthLinkFlapTracker.h"
 #include "services/OtaTlsTrustPolicy.h"
 #include "services/AuthLockout.h"
 #include "services/metrics_text.h"
 #include "services/SensitiveDataRedaction.h"
 #ifdef USE_CSI
 #include "services/CSIService.h"
+#include "services/CsiAdaptiveThreshold.h"
 #include "services/CsiHealthReasons.h"
 #include "services/CsiModelExport.h"
 #endif
@@ -57,6 +65,14 @@ extern std::atomic<bool> g_espotaMaintenance;
 extern std::atomic<uint32_t> g_espotaMaintenanceSeconds;
 extern std::atomic<unsigned long> g_espotaMaintenanceUntilMs;
 extern std::atomic<bool> g_csiDataStarved;
+extern HeapWatermarkRtcRing g_heapWmRing;
+extern HeapWatermarkRtcRing g_heapWmPrevBoot;
+extern bool g_heapWmPrevBootValid;
+extern std::atomic<uint32_t> g_sseBacklogSkips;
+extern HeapSkipTracker g_mqttHeapSkips;   // dev19 low-heap publish skips
+extern HeapSkipTracker g_sseHeapSkips;
+extern HeapGatePolicy g_webHeapGate;   // dev7 L1: web low-heap accept gate
+extern EthLinkFlapTracker g_ethFlap;   // real PHY link edges, not the 60 s poll
 extern const char* otaRuntimeOwnerName(uint8_t owner);
 extern uint8_t otaRuntimeOwner();
 extern bool otaRuntimeTransferActive();
@@ -92,7 +108,7 @@ static void sendJsonBuffered(AsyncWebServerRequest* request, const JsonDocument&
                              bool noStore = false) {
     const size_t len = measureJson(doc);
     char* raw = new (std::nothrow) char[len];
-    if (raw == nullptr) { request->send(503, "text/plain", "Low memory"); return; }
+    if (raw == nullptr) { request->abort(); return; }  // OOM: abort() is alloc-free; request->send() would re-alloc & panic in async_tcp (coredump 2026-08-12)
     serializeJson(doc, raw, len);
     std::shared_ptr<char> buf(raw, std::default_delete<char[]>());
     AsyncWebServerResponse* response = request->beginResponse(
@@ -365,10 +381,75 @@ void setupTelemetryRoutes() {
         doc["csi_data_ok"] = !g_csiDataStarved.load();
         doc["crossmodal_desync"] = (_deps.securityMonitor->getCrossModalFlags() != 0);
         doc["coredump_present"] = coredumpPresent();
-        doc["free_heap"] = ESP.getFreeHeap();
-        doc["min_heap"] = ESP.getMinFreeHeap();
+        doc["free_heap"] = heapFreeUsable();
+        doc["min_heap"] = heapMinFreeUsable();
+        // dev12: free_heap/min_heap above are now MALLOC_CAP_8BIT — the heap a
+        // failing `new` actually sees. Before dev12 they read MALLOC_CAP_INTERNAL
+        // and ran ~42 kB higher for the same physical state on this board, which
+        // is how nine field OOMs hid behind an apparently healthy 78-87 kB. Both
+        // capabilities are published so that inflation stays auditable from the
+        // outside on any hardware (see HeapMetrics.h).
+        {
+            HeapReading hr = heapReadingNow();
+            JsonObject hp = doc["heap"].to<JsonObject>();
+            hp["free_8bit"]           = hr.freeUsable;
+            hp["largest_8bit"]        = hr.largestUsable;
+            hp["min_free_8bit"]       = hr.minFreeUsable;
+            hp["free_internal"]       = hr.freeInternal;
+            hp["largest_internal"]    = hr.largestInternal;
+            hp["unusable_internal"]   = heapUnusableInternalBytes(hr);
+            hp["internal_misleading"] = heapInternalIsMisleading(hr);
+        }
+        // dev13: SSE was invisible from outside, which is why an undrained
+        // client could drain the heap unnoticed. Publish its depth.
+        if (_deps.events) {
+            JsonObject se = doc["sse"].to<JsonObject>();
+            se["clients"]       = _deps.events->count();
+            se["avg_waiting"]   = _deps.events->avgPacketsWaiting();
+            se["backlog_skips"] = g_sseBacklogSkips.load();
+        }
+
+        // dev19: how often the node dropped a publish/telemetry cycle because
+        // the heap was under HEAP_MIN_FOR_PUBLISH, and how deep it went. The
+        // serial line is rate-limited; these counters are not, so `skips` well
+        // above `logged` means the dip repeats faster than the log admits.
+        {
+            JsonObject hs = doc["heap_skips"].to<JsonObject>();
+            hs["mqtt"]          = g_mqttHeapSkips.skips();
+            hs["mqtt_logged"]   = g_mqttHeapSkips.logged();
+            hs["sse"]           = g_sseHeapSkips.skips();
+            uint32_t low = g_mqttHeapSkips.lowestFree() < g_sseHeapSkips.lowestFree()
+                         ? g_mqttHeapSkips.lowestFree() : g_sseHeapSkips.lowestFree();
+            // Sentinel stays out of the JSON — a literal 4294967295 in a
+            // dashboard reads as a number, not as "never happened".
+            if (low != HEAP_SKIP_NO_READING) hs["lowest_free"] = low;
+        }
         doc["chip_temp"] = temperatureRead();
         doc["reboot_inhibit"] = g_rebootInhibit.load();
+
+        // dev7 L1: low-heap accept gate state (see HeapGatePolicy.h)
+        JsonObject wg = doc["web_gate"].to<JsonObject>();
+        wg["enabled"]       = g_webHeapGate.config().enabled;
+        wg["closed"]        = g_webHeapGate.isClosed();
+        wg["rejects_total"] = g_webHeapGate.rejectsTotal();
+        wg["close_count"]   = g_webHeapGate.closeCount();
+        // dev17: concurrent-request admission control. The gate above reads the
+        // heap at accept time, which lags what an admitted connection will
+        // spend — a burst of 15-20 parallel requests passed it and still ran
+        // the node out of heap. These counters say which limit is actually
+        // biting in the field (see WebAdmissionPolicy.h).
+        if (GatedAsyncWebServer* gs = GatedAsyncWebServer::active()) {
+            const WebAdmissionPolicy& adm = gs->admission();
+            JsonObject ac = wg["admission"].to<JsonObject>();
+            ac["max_in_flight"]   = adm.config().maxInFlight;
+            ac["reserve_bytes"]   = adm.config().reserveBytes;
+            ac["in_flight"]       = adm.inFlight();
+            ac["peak_in_flight"]  = adm.peakInFlight();
+            ac["admitted_total"]  = adm.admittedTotal();
+            ac["rejects_conc"]    = adm.rejectsConcurrency();
+            ac["rejects_reserve"] = adm.rejectsReserve();
+            ac["slots_expired"]   = adm.slotsExpired();
+        }
 
         // OTA rollback state
         const esp_partition_t* running = esp_ota_get_running_partition();
@@ -396,6 +477,33 @@ void setupTelemetryRoutes() {
         eth["ip"] = ETH.localIP().toString();
         eth["mac"] = ETH.macAddress();
         eth["speed"] = ETH.linkSpeed();
+        // Flap accounting straight off the driver's own edges. link_up above is
+        // a single sample and says nothing about a link that drops for 2 s at a
+        // time; down_permille is the number that shows whether it is healthy.
+        EthLinkFlapStats flap = g_ethFlap.stats(millis());
+        JsonObject ethFlap = eth["flap"].to<JsonObject>();
+        ethFlap["count"]           = flap.downCount;
+        ethFlap["down_total_s"]    = flap.downTotalMs / 1000;
+        ethFlap["longest_down_s"]  = flap.longestDownMs / 1000;
+        ethFlap["current_down_s"]  = flap.currentDownMs / 1000;
+        ethFlap["down_permille"]   = flap.downPermille;
+        ethFlap["window_s"]        = flap.sinceMs / 1000;
+
+        // dev15: which interface outbound TCP actually leaves by. This node is
+        // dual-homed with both interfaces on one subnet, and WiFi STA outranks
+        // ETH on route_prio, so the default silently moves. Until this field
+        // existed the only way to answer it was a tcpdump on the LAN segment.
+        // USE_CSI-only: the routing contest exists solely because the CSI
+        // capture interface is a second netif. A runtime null check is not
+        // enough — without the flag CSIService is an incomplete type here.
+        #ifdef USE_CSI
+        if (_deps.csiService) {
+            JsonObject route = eth["route"].to<JsonObject>();
+            route["eth_is_default"] = _deps.csiService->ethIsDefaultNetif();
+            route["asserts"]        = _deps.csiService->ethNetifAssertCount();
+            route["changes"]        = _deps.csiService->ethNetifChangeCount();
+        }
+        #endif
 
         JsonObject mqtt = doc["mqtt"].to<JsonObject>();
         mqtt["enabled"] = _deps.config->mqtt_enabled;
@@ -437,6 +545,8 @@ void setupTelemetryRoutes() {
             csi["wifi_rssi"]     = rssi;
             csi["rssi_low_snr"]  = (rssi != 0 && rssi < CSI_RSSI_WEAK_DBM);
             csi["rssi_too_hot"]  = (rssi != 0 && rssi > CSI_RSSI_HOT_DBM);
+            // dev7: motion ticks frozen by packet starvation (threshold-path gate)
+            csi["starved_ticks"]    = _deps.csiService->getStarvedTickCount();
             // csi2 stuck-motion state
             csi["stuck_motion_count"] = _deps.csiService->getStuckMotionCount();
             csi["stuck_raise_count"]  = _deps.csiService->getStuckRaiseCount();
@@ -451,6 +561,7 @@ void setupTelemetryRoutes() {
             csi["adaptive_threshold"] = _deps.csiService->getAdaptiveThreshold();
             csi["effective_threshold"]= _deps.csiService->getEffectiveThreshold();
             csi["p95_samples"]        = _deps.csiService->getP95SampleCount();
+            csi["adaptive_percentile"]= _deps.csiService->getAdaptivePercentile();
             // csi5 NBVI subcarrier auto-selection
             csi["nbvi_enabled"]       = _deps.csiService->isNbviEnabled();
             csi["nbvi_ready"]         = _deps.csiService->isNbviReady();
@@ -606,9 +717,9 @@ void setupTelemetryRoutes() {
         MetricsSnapshot m;
         m.fw_version = _deps.fwVersion ? _deps.fwVersion : "";
         m.uptime_s   = millis() / 1000;
-        m.heap_free  = ESP.getFreeHeap();
-        m.heap_min   = ESP.getMinFreeHeap();
-        m.heap_largest = ESP.getMaxAllocHeap();
+        m.heap_free  = heapFreeUsable();
+        m.heap_min   = heapMinFreeUsable();
+        m.heap_largest = heapLargestUsable();
         m.chip_temp_c  = temperatureRead();
         m.radar_connected    = _deps.radar->isRadarConnected();
         m.radar_monitoring_disabled = _deps.securityMonitor->isRadarMonitoringDisabled();
@@ -616,6 +727,10 @@ void setupTelemetryRoutes() {
         m.radar_error_count  = _deps.radar->getErrorCount();
         m.radar_health_score = _deps.radar->getHealthScore();
         m.eth_link_up    = ETH.linkUp();
+        EthLinkFlapStats flapMetrics = g_ethFlap.stats(millis());
+        m.eth_flap_count     = flapMetrics.downCount;
+        m.eth_down_total_s   = flapMetrics.downTotalMs / 1000;
+        m.eth_down_permille  = flapMetrics.downPermille;
         m.eth_speed_mbps = ETH.linkSpeed();
         m.mqtt_connected = _deps.mqttService->connected();
         m.mqtt_publish_fail_total = _deps.mqttService->getPublishFailTotal();
@@ -654,7 +769,7 @@ void setupTelemetryRoutes() {
         // build buffer: the response is asynchronous and a later request may
         // overwrite that buffer before this response has drained.
         char* raw = new (std::nothrow) char[len];
-        if (raw == nullptr) { request->send(503, "text/plain", "Low memory"); return; }
+        if (raw == nullptr) { request->abort(); return; }  // OOM: abort() is alloc-free; request->send() would re-alloc & panic in async_tcp (coredump 2026-08-12)
         memcpy(raw, buf, len);
         std::shared_ptr<char> responseBuf(raw, std::default_delete<char[]>());
         AsyncWebServerResponse* response2 = request->beginResponse(
@@ -743,6 +858,8 @@ static bool validateConfigImport(const JsonDocument& doc, const char*& badField)
         !configImportTextField(obj, "sched_disarm", 0, 5, false, badField, fields) ||
         !configImportTextField(obj, "csi_ssid", 0, 32, false, badField, fields) ||
         !configImportTextField(obj, "csi_pass", 0, 64, true, badField, fields) ||
+        !configImportTextField(obj, "dc_webhook", 0, 255, true, badField, fields) ||
+        !configImportTextField(obj, "gen_webhook", 0, 255, true, badField, fields) ||
         !configImportTextField(obj, "zones", 0, 999, false, badField, fields)) return false;
 
     JsonVariantConst mqttPort = obj["mqtt_port"];
@@ -760,6 +877,14 @@ static bool validateConfigImport(const JsonDocument& doc, const char*& badField)
     for (const char* key : scheduleKeys) {
         JsonVariantConst value = obj[key];
         if (!value.isNull() && !configImportScheduleValid(value.as<const char*>())) {
+            badField = key; return false;
+        }
+    }
+    const char* webhookKeys[] = {"dc_webhook", "gen_webhook"};
+    for (const char* key : webhookKeys) {
+        JsonVariantConst value = obj[key];
+        if (!value.isNull() && !configImportValueIsRedacted(value.as<const char*>()) &&
+            !configImportWebhookValid(value.as<const char*>())) {
             badField = key; return false;
         }
     }
@@ -798,7 +923,8 @@ static bool validateConfigImport(const JsonDocument& doc, const char*& badField)
         !configImportFloatField(obj, "radar_res", 0.20f, 0.75f, badField, fields) ||
         !configImportFloatField(obj, "csi_thr", 0.001f, 100.0f, badField, fields) ||
         !configImportFloatField(obj, "csi_hyst", 0.10f, 0.99f, badField, fields) ||
-        !configImportFloatField(obj, "csi_ml_thr", 0.05f, 0.95f, badField, fields)) return false;
+        !configImportFloatField(obj, "csi_ml_thr", 0.05f, 0.95f, badField, fields) ||
+        !configImportFloatField(obj, "csi_adapt_pct", 0.50f, 0.999f, badField, fields)) return false;
 
     JsonVariantConst radarRes = obj["radar_res"];
     if (!radarRes.isNull() && !configImportRadarResolutionValid(radarRes.as<float>())) {
@@ -829,11 +955,16 @@ static bool validateConfigImport(const JsonDocument& doc, const char*& badField)
 // keys that did not exist before the import. This kills the durable half-state
 // that could otherwise persist e.g. auth_pass without auth_user and lock the
 // device out on the next reboot. Best-effort: a restore write can itself fail
-// under a genuinely full NVS (the caller logs it); full atomicity would need a
-// versioned CRC blob + verify-then-switch, deferred as a larger rework.
+// under a genuinely full NVS (rollback() returns the failure count and the
+// caller logs an error); full atomicity would need a versioned CRC blob +
+// verify-then-switch, deferred as a larger rework.
 class ConfigImportWriter {
 public:
-    explicit ConfigImportWriter(Preferences* prefs) : _prefs(prefs) {}
+    // reserve: the import writes ~45 keys; grabbing the journal storage up
+    // front keeps push_back from reallocating mid-import — with -fno-exceptions
+    // a low-heap realloc aborts (panic reboot) AFTER keys were written but
+    // BEFORE rollback() could run, recreating the half-state this class kills.
+    explicit ConfigImportWriter(Preferences* prefs) : _prefs(prefs) { _journal.reserve(64); }
 
     bool putString(const char* key, const String& value) {
         if (!ready(key)) return false;
@@ -888,23 +1019,39 @@ public:
     const char* failedKey() const { return _failedKey; }
 
     // Restore every key changed by this import to its pre-import state. Reverse
-    // order so a key touched twice ends on its oldest value. Best-effort.
-    void rollback() {
-        if (_prefs == nullptr) return;
+    // order so a key touched twice ends on its oldest value. Best-effort:
+    // returns the number of keys whose restore itself failed (0 = clean
+    // rollback) so the caller can log an error instead of a false success —
+    // under a genuinely full NVS the restore writes can fail too and the
+    // half-state this class exists to prevent would otherwise persist silently.
+    size_t rollback() {
+        if (_prefs == nullptr) return 0;
+        size_t failed = 0;
         for (auto it = _journal.rbegin(); it != _journal.rend(); ++it) {
             const Rec& r = *it;
-            if (!r.existed) { _prefs->remove(r.key); continue; }
-            switch (r.type) {
-                case TStr:   _prefs->putString(r.key, r.s);   break;
-                case TBool:  _prefs->putBool(r.key, r.v.b);   break;
-                case TU16:   _prefs->putUShort(r.key, r.v.u16); break;
-                case TUInt:  _prefs->putUInt(r.key, r.v.u32);  break;
-                case TULong: _prefs->putULong(r.key, r.v.u32); break;
-                case TInt:   _prefs->putInt(r.key, r.v.i32);   break;
-                case TFloat: _prefs->putFloat(r.key, r.v.f);   break;
+            if (!r.existed) {
+                // Journalled before the forward put — the key may not exist if
+                // that put itself failed, which is the desired end state.
+                if (_prefs->isKey(r.key) && !_prefs->remove(r.key)) failed++;
+                continue;
             }
+            bool ok = false;
+            switch (r.type) {
+                // putString returns 0 both on error and for a stored empty
+                // string — isKey disambiguates the empty-string success.
+                case TStr:   ok = _prefs->putString(r.key, r.s) == r.s.length()
+                                  && _prefs->isKey(r.key);                        break;
+                case TBool:  ok = _prefs->putBool(r.key, r.v.b) == sizeof(uint8_t); break;
+                case TU16:   ok = _prefs->putUShort(r.key, r.v.u16) == sizeof(uint16_t); break;
+                case TUInt:  ok = _prefs->putUInt(r.key, r.v.u32) == sizeof(uint32_t);  break;
+                case TULong: ok = _prefs->putULong(r.key, r.v.u32) == sizeof(uint32_t); break;
+                case TInt:   ok = _prefs->putInt(r.key, r.v.i32) == sizeof(int32_t);    break;
+                case TFloat: ok = _prefs->putFloat(r.key, r.v.f) == sizeof(float);      break;
+            }
+            if (!ok) failed++;
         }
         _journal.clear();
+        return failed;
     }
 
 private:
@@ -1227,6 +1374,54 @@ void setupConfigRoutes() {
         if (enabled) *_deps.shouldReboot = true;
     });
 
+    // Webhook provisioning (docs/PHYSICAL_SECURITY_HARDENING_CZ.md §6.4 —
+    // všechna tajemství musí jít nahrát za běhu, bez compile-time defaultů).
+    _deps.server->on("/api/notifications/config", HTTP_GET, [](AsyncWebServerRequest *request) {
+        if (!checkAuth(request)) return;
+        JsonDocument doc;
+        doc["enabled"] = _deps.notificationService->isEnabled();
+        doc["dc_webhook"] = strlen(_deps.notificationService->getConfig().discord_webhook) > 0 ? "***" : "";
+        doc["gen_webhook"] = strlen(_deps.notificationService->getConfig().generic_webhook) > 0 ? "***" : "";
+        sendJsonBuffered(request, doc);
+    });
+
+    _deps.server->on("/api/notifications/config", HTTP_POST, [](AsyncWebServerRequest *request) {
+        if (!checkAuth(request)) return;
+        auto getP = [&](const char* n, bool& present) -> String {
+            if (request->hasParam(n, true)) { present = true; return request->getParam(n, true)->value(); }
+            if (request->hasParam(n))       { present = true; return request->getParam(n)->value(); }
+            present = false;
+            return "";
+        };
+        bool hasDc = false, hasGen = false, hasEn = false;
+        String dc  = getP("dc_webhook", hasDc);
+        String gen = getP("gen_webhook", hasGen);
+        String en  = getP("enabled", hasEn);
+
+        // "***" = beze změny (parita s config export/import); prázdná = smazat.
+        if (hasDc && configImportValueIsRedacted(dc.c_str())) hasDc = false;
+        if (hasGen && configImportValueIsRedacted(gen.c_str())) hasGen = false;
+
+        if (hasDc && !configImportWebhookValid(dc.c_str())) {
+            request->send(400, "text/plain", "Invalid dc_webhook (https:// only, max 255)");
+            return;
+        }
+        if (hasGen && !configImportWebhookValid(gen.c_str())) {
+            request->send(400, "text/plain", "Invalid gen_webhook (https:// only, max 255)");
+            return;
+        }
+
+        if (hasDc)  _deps.notificationService->setDiscordWebhook(dc.c_str());
+        if (hasGen) _deps.notificationService->setGenericWebhook(gen.c_str());
+        if (hasEn)  _deps.notificationService->setEnabled(en == "1");
+
+        request->send(200, "text/plain", "Notification config saved");
+        // Webhook fronta a task vznikají v begin() — změny se projeví po restartu.
+        if ((hasDc || hasGen || hasEn) && _deps.notificationService->isEnabled()) {
+            *_deps.shouldReboot = true;
+        }
+    });
+
     _deps.server->on(AsyncURIMatcher::exact("/api/telegram/test"), HTTP_POST, [](AsyncWebServerRequest *request) {
         if (!checkAuth(request)) return;
         String testMsg = "🔔 *Test Notifikace*\n";
@@ -1396,6 +1591,10 @@ void setupConfigRoutes() {
         doc["tg_chat"] = (_deps.telegramBot && strlen(_deps.telegramBot->getChatId()) > 0)
             ? "***" : "";
 
+        // Webhooks (URL redacted — obsahuje credential path)
+        doc["dc_webhook"] = strlen(_deps.notificationService->getConfig().discord_webhook) > 0 ? "***" : "";
+        doc["gen_webhook"] = strlen(_deps.notificationService->getConfig().generic_webhook) > 0 ? "***" : "";
+
         // Timezone
         doc["tz_offset"] = _deps.config->tz_offset;
         doc["dst_offset"] = _deps.config->dst_offset;
@@ -1437,6 +1636,7 @@ void setupConfigRoutes() {
         doc["csi_tpps"] = _deps.preferences->getUInt("csi_tpps", 100);
         doc["csi_ml_en"] = _deps.preferences->getBool("csi_ml_en", true);
         doc["csi_ml_thr"] = _deps.preferences->getFloat("csi_ml_thr", 0.50f);
+        doc["csi_adapt_pct"] = _deps.preferences->getFloat("csi_adapt_pct", 0.95f);
 
         if (_deps.zonesMutex && xSemaphoreTake(*_deps.zonesMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
             doc["zones"] = *_deps.zonesJson;
@@ -1527,6 +1727,8 @@ void setupConfigRoutes() {
                 writeBool("tg_enabled", "tg_direct_en");
                 writeString("tg_token", "tg_token", true);
                 writeString("tg_chat", "tg_chat", true);
+                writeString("dc_webhook", "dc_webhook", true);
+                writeString("gen_webhook", "gen_webhook", true);
                 writeInt("tz_offset", "tz_offset");
                 writeInt("dst_offset", "dst_offset");
                 writeString("sched_arm", "sched_arm");
@@ -1554,6 +1756,7 @@ void setupConfigRoutes() {
                 writeUInt("csi_tpps", "csi_tpps");
                 writeBool("csi_ml_en", "csi_ml_en");
                 writeFloat("csi_ml_thr", "csi_ml_thr");
+                writeFloat("csi_adapt_pct", "csi_adapt_pct");
                 writeString("zones", "zones_json");
 
                 // Connectivity and access-control settings last. Write the
@@ -1578,8 +1781,15 @@ void setupConfigRoutes() {
                     if (_deps.systemLog) _deps.systemLog->error(String("Config import NVS failure at key=") + failed);
                     // #5: undo the keys already written so a partial import never
                     // leaves a durable half-state (e.g. auth_pass without auth_user).
-                    writer.rollback();
-                    if (_deps.systemLog) _deps.systemLog->warn("Config import rolled back to pre-import state");
+                    const size_t unrestored = writer.rollback();
+                    if (unrestored == 0) {
+                        if (_deps.systemLog) _deps.systemLog->warn("Config import rolled back to pre-import state");
+                    } else {
+                        DBG("CONFIG", "Import rollback incomplete: %u keys not restored", (unsigned)unrestored);
+                        if (_deps.systemLog) _deps.systemLog->error(
+                            String("Config import rollback INCOMPLETE - ") + (unsigned)unrestored +
+                            " keys not restored (NVS full?); verify settings before reboot");
+                    }
                     free(slab);
                     request->_tempObject = nullptr;
                     request->send(500, "text/plain", String("Config write failed at field: ") + failed);
@@ -1768,9 +1978,16 @@ void setupSystemRoutes() {
         unsigned long now = millis();
         doc["fw"] = _deps.fwVersion ? _deps.fwVersion : "";
         doc["uptime_s"] = now / 1000;
-        doc["heap_free"] = ESP.getFreeHeap();
-        doc["heap_largest"] = ESP.getMaxAllocHeap();      // largest free block (fragmentation indicator)
-        doc["heap_min_ever"] = ESP.getMinFreeHeap();
+        doc["heap_free"] = heapFreeUsable();
+        doc["heap_largest"] = heapLargestUsable();      // largest free block (fragmentation indicator)
+        doc["heap_min_ever"] = heapMinFreeUsable();
+        // dev12: bytes MALLOC_CAP_INTERNAL counts that no allocation can reach
+        doc["heap_unusable_internal"] = heapUnusableInternalBytes(heapReadingNow());
+        // ETH flap rate — an unauthenticated observer can watch the link
+        // quality without polling the whole /api/health document.
+        EthLinkFlapStats ethFlapz = g_ethFlap.stats(now);
+        doc["eth_flaps"] = ethFlapz.downCount;
+        doc["eth_down_permille"] = ethFlapz.downPermille;
         doc["auth_ok"]   = _authOkCount;
         doc["auth_fail"] = _authFailCount;
         doc["notification_tls_blocked"] = _deps.notificationService &&
@@ -1852,7 +2069,7 @@ void setupSystemRoutes() {
                 Update.abort();
             }
             // The successful coordinator claim is the sole CSI/MQTT freeze authority.
-            uint32_t heapAtStart = ESP.getFreeHeap();
+            uint32_t heapAtStart = heapFreeUsable();
             // csi10w: same treatment for MQTT. PubSubClient's blocking
             // WiFiClient.connect() on a failing reconnect was causing
             // non-deterministic upload stalls (42-90% completion).
@@ -1904,7 +2121,7 @@ void setupSystemRoutes() {
             // jump to 10 ms when free heap < 80 KB so the AsyncTCP task can
             // drain pbufs and let RAM recover before the next chunk. Higher
             // values (5+ ms unconditional) caused server-side parse stalls.
-            uint32_t freeHeap = ESP.getFreeHeap();
+            uint32_t freeHeap = heapFreeUsable();
             TickType_t yieldMs = (freeHeap < 80000) ? 10 : 1;
             vTaskDelay(pdMS_TO_TICKS(yieldMs));
         }
@@ -2319,8 +2536,8 @@ void setupSystemRoutes() {
         doc["ota_timeout_ms"] = otaRuntimeTimeoutMs();
         doc["maintenance_until_ms"] = until;
         doc["maintenance_remaining_s"] = (g_espotaMaintenance.load() && until != 0 && (long)(until - now) > 0) ? (uint32_t)((until - now) / 1000UL) : 0;
-        doc["heap_free"] = ESP.getFreeHeap();
-        doc["heap_largest"] = ESP.getMaxAllocHeap();
+        doc["heap_free"] = heapFreeUsable();
+        doc["heap_largest"] = heapLargestUsable();
         doc["reboot_inhibit"] = g_rebootInhibit.load();
         sendJsonBuffered(request, doc);
     });
@@ -2923,9 +3140,60 @@ void setupCoredumpRoutes() {
         else
             request->send(500, "text/plain", "Erase failed");
     });
+
+#ifdef DEV_STRESS
+    // dev7 lab-only OOM stressor (build with -D DEV_STRESS, never in release
+    // envs): exhaust the heap with throwing allocations until the
+    // std::set_new_handler last resort fires — bench validation of the
+    // oom_gate restart + RTC marker + reset_history path.
+    _deps.server->on("/api/dev/oom", HTTP_POST, [](AsyncWebServerRequest *request) {
+        if (!checkAuth(request)) return;
+        request->send(200, "text/plain", "OOM stress started");
+        for (;;) {
+            volatile char* p = new char[4096];   // throwing new → oomNewHandler
+            memset((void*)p, 0xAA, 4096);
+        }
+    });
+#endif
+}
+
+static void _heapWmRingToJson(const HeapWatermarkRtcRing& r, JsonArray out) {
+    if (!heapWmRingValid(r)) return;
+    uint32_t n = heapWmRingCount(r);
+    for (uint32_t i = 0; i < n; i++) {
+        const HeapWatermarkRecord& e = r.records[i];
+        JsonObject o = out.add<JsonObject>();
+        o["uptime_s"]   = e.uptimeS;
+        o["from"]       = e.prevWatermark;
+        o["to"]         = e.watermark;
+        o["largest"]    = e.largest;
+        o["free"]       = e.freeNow;
+        o["mqtt_conn"]  = e.mqttConnected != 0;
+        o["mqtt_rec"]   = e.mqttReconnects;
+        o["discovery"]  = e.discoveryIndex;
+        o["runtime_op"] = e.runtimeOp;
+        o["rssi"]       = e.rssi;
+    }
 }
 
 void setupLogRoutes() {
+    // dev18: every recorded drop of the heap low-water mark, with the context
+    // that was live at that moment. Deliberately NOT part of /api/health — that
+    // payload is already 3.9 kB and its size is precisely what makes a burst of
+    // concurrent requests expensive.
+    _deps.server->on("/api/heap/watermarks", HTTP_GET, [](AsyncWebServerRequest *request) {
+        if (!checkAuth(request)) return;
+        JsonDocument doc;
+        doc["capacity"] = (uint32_t)HEAP_WM_RING_CAPACITY;
+        doc["min_free_8bit"] = heapMinFreeUsable();
+        _heapWmRingToJson(g_heapWmRing, doc["current_boot"].to<JsonArray>());
+        if (g_heapWmPrevBootValid)
+            _heapWmRingToJson(g_heapWmPrevBoot, doc["previous_boot"].to<JsonArray>());
+        String out;
+        serializeJson(doc, out);
+        request->send(200, "application/json", out);
+    });
+
     _deps.server->on("/api/logs", HTTP_GET, [](AsyncWebServerRequest *request) {
         if (!checkAuth(request)) return;
         JsonDocument doc;
@@ -2979,7 +3247,7 @@ void setupLogRoutes() {
                 obj["msg"].as<const char*>());
         }
         char* raw = new (std::nothrow) char[total + 1];
-        if (raw == nullptr) { request->send(503, "text/plain", "Low memory"); return; }
+        if (raw == nullptr) { request->abort(); return; }  // OOM: abort() is alloc-free; request->send() would re-alloc & panic in async_tcp (coredump 2026-08-12)
         size_t pos = strlen(CSV_HEADER);
         memcpy(raw, CSV_HEADER, pos);
         for (JsonObject obj : arr) {
@@ -3717,6 +3985,8 @@ void setupCSIRoutes() {
         doc["effective_threshold"]   = t.effectiveThreshold;
         doc["hysteresis_threshold"]  = t.hysteresisThreshold;
         doc["raw_motion"]            = t.rawMotion;
+        doc["data_starved"]          = t.dataStarved;
+        doc["packet_rate"]           = t.packetRate;
         doc["smoothing_votes"]       = t.smoothingVotes;
         doc["smoothing_window"]      = t.smoothingWindow;
         doc["enter_votes"]           = t.enterVotes;
@@ -3805,7 +4075,7 @@ void setupCSIRoutes() {
         if (limit > 100) limit = 100;   // cap transient memory of the response
 
         CsiEvent* buf = new (std::nothrow) CsiEvent[limit];
-        if (buf == nullptr) { request->send(500, "text/plain", "OOM"); return; }
+        if (buf == nullptr) { request->abort(); return; }  // OOM: abort() is alloc-free; request->send() would re-alloc & panic in async_tcp (coredump 2026-08-12)
         uint16_t n = _deps.csiService->copyEventsAfter(afterSeq, limit, buf, limit);
 
         JsonDocument doc;
@@ -3882,6 +4152,23 @@ void setupCSIRoutes() {
         }
         _deps.csiService->resetIdleBaseline();
         request->send(200, "text/plain", "Idle baseline reset");
+    });
+
+    // POST /api/csi/selftest/edge?state=1|0 — emit a SYNTHETIC passage edge
+    // (source="selftest") on <prefix>/csi/event to validate the event wire and
+    // the HA passage automation without physical motion. state=1 -> motion_started
+    // (default), state=0 -> motion_ended. Never asserts a real passage.
+    _deps.server->on("/api/csi/selftest/edge", HTTP_POST, [](AsyncWebServerRequest *request) {
+        if (!checkAuth(request)) return;
+        if (_deps.csiService == nullptr) {
+            request->send(503, "text/plain", "CSI not available");
+            return;
+        }
+        bool enter = true;
+        if (request->hasParam("state")) enter = request->getParam("state")->value() != "0";
+        _deps.csiService->emitTestEdge(enter);
+        request->send(202, "text/plain", enter ? "selftest edge queued: motion_started"
+                                               : "selftest edge queued: motion_ended");
     });
 
     // POST /api/csi/reconnect — force WiFi.reconnect() (useful if RSSI dropped)
@@ -4091,6 +4378,19 @@ void setupCSIRoutes() {
         if (request->hasParam("nbvi")) {
             bool en = request->getParam("nbvi")->value() == "1";
             if (_deps.csiService) { _deps.csiService->setNbviEnabled(en); changed = true; }
+        }
+
+        // #13: adaptive-threshold quantile. Accepts a fraction (0.95/0.99) or a
+        // whole percent (95/99). Persisted. Strict parse — toFloat() returns 0
+        // for garbage (e.g. a decimal comma), which the setter clamp would turn
+        // into a persisted P50; invalid input is ignored like hysteresis below.
+        if (request->hasParam("adaptive_pct") && _deps.csiService) {
+            float p;
+            if (csiParseAdaptivePercentile(request->getParam("adaptive_pct")->value().c_str(), &p)) {
+                _deps.csiService->setAdaptivePercentile(p);
+                _deps.preferences->putFloat("csi_adapt_pct", _deps.csiService->getAdaptivePercentile());
+                changed = true;
+            }
         }
 
         if (request->hasParam("hysteresis")) {

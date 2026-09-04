@@ -26,6 +26,11 @@ struct MetricsSnapshot {
     int      radar_health_score = 0;
     bool     eth_link_up = false;
     int      eth_speed_mbps = 0;
+    // Real PHY link edges. eth_link_up is one sample and hides a link that
+    // drops for 2 s at a time; these three say how often and for how long.
+    uint32_t eth_flap_count = 0;
+    uint32_t eth_down_total_s = 0;
+    uint16_t eth_down_permille = 0;
     bool     mqtt_connected = false;
     uint32_t mqtt_publish_fail_total = 0;
     uint32_t mqtt_reconnect_total = 0;
@@ -79,6 +84,9 @@ inline size_t buildMetricsText(const MetricsSnapshot& m, char* buf, size_t cap) 
     METRIC("poe2412_radar_health_score",      "gauge",   "%d",   m.radar_health_score);
     METRIC("poe2412_eth_link_up",             "gauge",   "%d",   m.eth_link_up ? 1 : 0);
     METRIC("poe2412_eth_speed_mbps",          "gauge",   "%d",   m.eth_speed_mbps);
+    METRIC("poe2412_eth_flaps_total",         "counter", "%lu",  (unsigned long)m.eth_flap_count);
+    METRIC("poe2412_eth_down_seconds_total",  "counter", "%lu",  (unsigned long)m.eth_down_total_s);
+    METRIC("poe2412_eth_down_permille",       "gauge",   "%u",   (unsigned)m.eth_down_permille);
     METRIC("poe2412_mqtt_connected",          "gauge",   "%d",   m.mqtt_connected ? 1 : 0);
     METRIC("poe2412_mqtt_publish_fails_total","counter", "%lu",  (unsigned long)m.mqtt_publish_fail_total);
     METRIC("poe2412_mqtt_reconnects_total",   "counter", "%lu",  (unsigned long)m.mqtt_reconnect_total);

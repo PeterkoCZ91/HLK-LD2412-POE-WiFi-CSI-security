@@ -49,6 +49,31 @@ void test_breathing_hold_dominates_final_state() {
                       csiClassifyDecision(true, true, true, true));
 }
 
+// ---- data starvation (dev7: field false trigger 2026-08-17) ------------
+void test_data_starved_dominates_when_buffer_ready() {
+    // pps=0 froze the variance above the threshold for ~8 s — whatever the
+    // frozen values say, a starved tick must classify as DATA_STARVED.
+    TEST_ASSERT_EQUAL(CsiDecisionReason::DATA_STARVED,
+                      csiClassifyDecision(true, true, true, false, true));
+    TEST_ASSERT_EQUAL(CsiDecisionReason::DATA_STARVED,
+                      csiClassifyDecision(true, false, false, false, true));
+    // starved wins over breathing hold too — stale data is no hold evidence
+    TEST_ASSERT_EQUAL(CsiDecisionReason::DATA_STARVED,
+                      csiClassifyDecision(true, false, true, true, true));
+}
+
+void test_empty_buffer_dominates_starved() {
+    // no buffer at all is the more fundamental "no decision" reason
+    TEST_ASSERT_EQUAL(CsiDecisionReason::INSUFFICIENT_SAMPLES,
+                      csiClassifyDecision(false, false, false, false, true));
+}
+
+void test_default_not_starved_keeps_legacy_classification() {
+    // 4-arg callers (pre-dev7) must classify exactly as before
+    TEST_ASSERT_EQUAL(CsiDecisionReason::VARIANCE_ABOVE_THRESHOLD,
+                      csiClassifyDecision(true, true, true, false));
+}
+
 // ---- reason -> string ------------------------------------------------------
 void test_reason_strings_are_stable() {
     TEST_ASSERT_EQUAL_STRING("insufficient_samples",
@@ -63,6 +88,8 @@ void test_reason_strings_are_stable() {
         csiDecisionReasonStr(CsiDecisionReason::SMOOTHING_EXIT_PENDING));
     TEST_ASSERT_EQUAL_STRING("breathing_hold",
         csiDecisionReasonStr(CsiDecisionReason::BREATHING_HOLD));
+    TEST_ASSERT_EQUAL_STRING("data_starved",
+        csiDecisionReasonStr(CsiDecisionReason::DATA_STARVED));
 }
 
 // ---- struct defaults -------------------------------------------------------
@@ -71,6 +98,8 @@ void test_trace_defaults_invalid() {
     TEST_ASSERT_FALSE(t.valid);
     TEST_ASSERT_FALSE(t.decision);
     TEST_ASSERT_EQUAL(CsiDecisionReason::INSUFFICIENT_SAMPLES, t.reason);
+    TEST_ASSERT_FALSE(t.dataStarved);
+    TEST_ASSERT_EQUAL_FLOAT(0.0f, t.packetRate);
 }
 
 int main(int, char**) {
@@ -81,6 +110,9 @@ int main(int, char**) {
     RUN_TEST(test_raw_motion_not_yet_confirmed_is_enter_pending);
     RUN_TEST(test_holding_motion_without_raw_is_exit_pending);
     RUN_TEST(test_breathing_hold_dominates_final_state);
+    RUN_TEST(test_data_starved_dominates_when_buffer_ready);
+    RUN_TEST(test_empty_buffer_dominates_starved);
+    RUN_TEST(test_default_not_starved_keeps_legacy_classification);
     RUN_TEST(test_reason_strings_are_stable);
     RUN_TEST(test_trace_defaults_invalid);
     return UNITY_END();
