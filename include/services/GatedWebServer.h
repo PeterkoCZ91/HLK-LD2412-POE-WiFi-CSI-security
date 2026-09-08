@@ -47,6 +47,21 @@ public:
             const WebAdmitResult adm =
                 self->_admission.admit((uint32_t)millis(), freeB, gateClosed);
             if (!adm.accepted()) {
+                // dev21 (field coredump 2026-09-06, bench dev7): AsyncClient::_error()
+                // use-after-free crash traced to ESP32Async/AsyncTCP#118 — our
+                // then-pinned v3.4.10 abort() never purged the async event queue
+                // for the client being aborted, so a queued LWIP_TCP_ERROR (or
+                // any other pending event, common under a burst of short-lived
+                // connections — exactly what a high-rejection-rate admission
+                // policy produces) could still fire on this object after
+                // `delete c` freed it. A same-shaped bug was independently found,
+                // fixed and released upstream in AsyncTCP v3.5.0 (merged 2026-07-21,
+                // months after our pin): abort() now synchronously purges the
+                // queue and runs _error(ERR_ABRT) before returning, so by the
+                // time we delete c below nothing can still reference it. See
+                // platformio.ini and docs/RELEASE_5.7.1_VALIDATION.md. A hand-rolled
+                // firmware-side workaround was tried first and tested unreliable
+                // (see doc) — fixing it at the actual source was correct instead.
                 c->abort();    // alloc-free TCP RST — same rationale as the dev6 OOM guards
                 delete c;
                 return;

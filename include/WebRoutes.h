@@ -20,6 +20,7 @@ class UpdateService;
 class ConfigManager;
 class ConfigSnapshot;
 class CSIService;
+class MlFeedbackStore;
 struct SystemConfig;
 
 /**
@@ -63,6 +64,9 @@ namespace WebRoutes {
 
         // WiFi CSI service (nullptr when firmware compiled without -D USE_CSI=1)
         CSIService* csiService;
+
+        // T9: on-device ML false-alarm feedback store (nullptr without USE_CSI)
+        MlFeedbackStore* mlFeedbackStore;
     };
 
     /**

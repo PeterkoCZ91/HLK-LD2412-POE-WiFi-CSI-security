@@ -6,9 +6,7 @@
 #include "services/OtaTlsTrustPolicy.h"
 #include "services/TlsMemoryPolicy.h"
 #include "services/HeapMetrics.h"
-#ifndef FW_VERSION
-#define FW_VERSION "unknown"
-#endif
+#include "FirmwareVersion.h"
 #include <ETH.h>
 #include <inttypes.h>
 

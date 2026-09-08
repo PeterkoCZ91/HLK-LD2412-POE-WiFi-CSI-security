@@ -1,0 +1,723 @@
+<!DOCTYPE HTML>
+<html lang="en">
+<head>
+  <title>LD2412 Zabezpečení</title>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="icon" href="data:,">
+  <style>
+__BUILD_CSS__
+  </style>
+  <script>
+__BUILD_I18N__
+  </script>
+</head>
+<body onload="applyLang()">
+
+  <h2>
+    LD2412 <span style="font-size:0.6em; color:#666" id="fw_ver">...</span>
+    <span id="sse_icon" class="icon" title="Realtime"></span>
+    <span id="wifi_icon" class="icon" title="ETH"></span>
+    <span id="mqtt_icon" class="icon" title="MQTT"></span>
+    <button id="lang_btn" onclick="setLang(LANG==='cs'?'en':'cs')" style="width:auto; padding:2px 8px; font-size:0.7rem; background:#333; border-radius:4px; margin:0; min-height:auto">🇬🇧 EN</button>
+  </h2>
+
+  <div id="security_warning" style="background:#cf6679; color:black; padding:10px; border-radius:8px; margin-bottom:10px; display:none; text-align:center; font-weight:bold;">
+    <span data-i18n="default_pass_warn">⚠️ Výchozí heslo admin/admin — změňte v sekci Síť &amp; Cloud</span>
+  </div>
+
+  <div class="grid">
+    <!-- MAIN STATUS -->
+    <div class="card">
+        <div class="gauge">
+            <div id="state_text" style="color:#888; font-weight:bold; letter-spacing:2px; margin-bottom:5px" data-i18n="loading">NAČÍTÁM...</div>
+            <div id="alarm_badge" style="margin-bottom:8px; font-size:0.9rem; font-weight:bold; color:#888">---</div>
+            <button id="btn_arm" onclick="toggleArm()" style="width:auto; padding:8px 20px; margin-bottom:10px; background:#3700b3" data-i18n="arm">STŘEŽIT</button>
+            <div id="mw_radar_block" class="radar-only">
+                <div class="section-title" data-nocollapse style="text-align:left" data-i18n="mw_radar_section">MW radar</div>
+                <div class="big-val" id="dist_val" style="color:var(--accent)">---</div>
+                <div class="unit" data-i18n="distance_cm">DISTANCE (cm)</div>
+                <svg class="spark" id="graph_dist"></svg>
+            </div>
+        </div>
+        <div id="mw_movstat" class="radar-only" style="display:flex; gap:10px">
+            <div style="flex:1; text-align:center">
+                <div style="color:#03dac6; font-weight:bold" id="mov_val">0%</div>
+                <div class="unit" data-i18n="movement">POHYB</div>
+                <svg class="spark" id="graph_mov" style="height:30px; stroke:#03dac6"></svg>
+            </div>
+            <div style="flex:1; text-align:center">
+                <div style="color:#bb86fc; font-weight:bold" id="stat_val">0%</div>
+                <div class="unit" data-i18n="static_">STATIKA</div>
+                <svg class="spark" id="graph_stat" style="height:30px; stroke:#bb86fc"></svg>
+            </div>
+        </div>
+        <div id="radar_reveal" class="radar-reveal" style="display:none" onclick="toggleRadarReveal()">
+            <span data-i18n="radar_show">▸ Radar nepřipojen — zobrazit</span>
+        </div>
+        <div id="csi_main_block">
+            <div class="section-title" data-nocollapse data-i18n="csi_section">WiFi CSI</div>
+            <div style="text-align:center; margin-top:4px">
+                <div id="csi_main_state" style="font-weight:bold; font-size:1.3rem; color:#888">—</div>
+                <div id="csi_main_link" class="unit" style="margin-top:2px">—</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- FUSION EXPLAINABILITY (#8) — hidden until the first SSE frame carries a
+         fusion object (CSI disabled / not compiled => permanently dash-filled card) -->
+    <div class="card" id="fusion_panel" style="display:none">
+        <div class="section-title" data-nocollapse data-i18n="fusion_title">Fúze — kdo vidí pohyb</div>
+        <div class="fbars">
+            <div class="fbar" id="fbar_radar"><div class="fbar-track"><div class="fbar-fill" id="fb_radar"></div></div><span data-i18n="radar_lbl">Radar</span></div>
+            <div class="fbar"><div class="fbar-track"><div class="fbar-fill" id="fb_csi"></div></div><span>CSI</span></div>
+            <div class="fbar"><div class="fbar-track"><div class="fbar-fill" id="fb_ml"></div></div><span>ML</span></div>
+        </div>
+        <div class="fgauge"><div class="fgauge-track"><div id="fg_fill" class="fgauge-fill"></div></div><span id="fg_val">–</span></div>
+        <div class="freason" id="fusion_reason">–</div>
+        <div style="display:flex; gap:8px; margin-top:8px">
+            <button class="sec" style="flex:1; padding:5px; font-size:0.8rem" onclick="csiFeedback('no_motion')" data-i18n="feedback_false_alarm">Falešný poplach</button>
+            <button class="sec" style="flex:1; padding:5px; font-size:0.8rem" onclick="csiFeedback('motion')" data-i18n="feedback_confirm_motion">Potvrdit pohyb</button>
+        </div>
+    </div>
+
+    <!-- HEALTH & STATS -->
+    <div class="card">
+        <div class="stat-row radar-only"><span data-i18n="sensor_health">Zdraví senzoru</span><span id="h_score" class="stat-val">---%</span></div>
+        <div class="stat-row radar-only"><span data-i18n="uart_state">UART Stav</span><span id="h_uart">---</span></div>
+        <div class="stat-row radar-only"><span data-i18n="frame_rate">Snímková frekvence</span><span id="h_fps">--- FPS</span></div>
+        <div class="stat-row radar-only"><span data-i18n="comm_errors">Comm Errors</span><span id="h_err" style="color:var(--warn)">0</span></div>
+        <div class="stat-row"><span data-i18n="ram">RAM (Volná/Min)</span><span id="h_heap">--- / --- KB</span></div>
+        <div class="stat-row"><span data-i18n="chip_temp">Teplota čipu</span><span id="h_temp">--- °C</span></div>
+        <div class="stat-row"><span data-i18n="uptime">Doba běhu</span><span id="h_uptime">---</span></div>
+        <div style="display:flex; gap:5px; margin-top:10px; flex-wrap: wrap;">
+            <button class="sec radar-only" style="flex:1; min-width:80px;" onclick="api('radar/restart', {method:'POST'})" data-i18n="restart_radar">Restart Radar</button>
+            <button class="sec" style="flex:1; min-width:80px;" onclick="if(confirm(t('restart_esp_confirm'))) api('restart', {method:'POST'})" data-i18n="restart_esp">Restart ESP</button>
+            <button class="warn radar-only" style="flex:1; min-width:80px;" onclick="if(confirm(t('factory_reset_confirm'))) api('radar/factory_reset', {method:'POST'})" data-i18n="reset_mw">Reset MW</button>
+        </div>
+    </div>
+
+    <!-- CONTROLS -->
+    <div class="card">
+        <div class="tabs">
+            <div class="tab active" onclick="tab(0)" data-i18n="tab_basic">Základní</div>
+            <div class="tab" onclick="tab(1)" data-i18n="tab_security">Bezpečnost</div>
+            <div class="tab radar-only" onclick="tab(2)" data-i18n="tab_gates">Hradla</div>
+            <div class="tab" onclick="tab(3)" data-i18n="tab_network">Síť & Cloud</div>
+            <div class="tab radar-only" onclick="tab(4)" data-i18n="tab_zones">Zóny</div>
+            <div class="tab" onclick="tab(5)" data-i18n="tab_events">Historie</div>
+            <div class="tab" onclick="tab(6)" data-i18n="tab_csi">WiFi CSI</div>
+        </div>
+
+        <!-- TAB 0: BASIC -->
+        <div id="tab0">
+            <div class="stat-row"><span data-i18n="device_name">Jméno zařízení (mDNS)</span></div>
+            <div style="display:flex; gap:5px; margin-bottom:10px">
+                <input type="text" id="txt_hostname" placeholder="e.g. sensor-room1">
+                <button class="sec" style="width:auto; margin:0" onclick="saveHostname()">OK</button>
+            </div>
+
+            <div class="radar-only">
+            <div class="stat-row" style="margin-top:10px"><span data-i18n="move_sens">Citlivost Pohyb (%)</span></div>
+            <input type="number" id="i_sens" min="0" max="100" onchange="saveBasic()">
+            </div>
+
+            <div style="display:flex; align-items:center; gap:8px; margin-top:15px; margin-bottom:5px">
+                <input type="checkbox" id="chk_led" style="width:auto" onchange="saveBasic()">
+                <label for="chk_led" data-i18n="enable_led">Enable LED (Indicator)</label>
+            </div>
+
+            <div class="section-title radar-only" data-collapsed data-i18n="sec_radar_adv">Pokročilá konfigurace radaru</div>
+            <div class="radar-only">
+            <div class="row-input">
+                <span style="flex:1" data-i18n="min_range">Min Range (Gate)</span>
+                <span id="i_min_cm" style="font-size:0.75rem; color:#888; margin-right:6px">—</span>
+                <input type="number" id="i_min" min="0" max="13" style="width:60px" oninput="updGateCm()" onchange="saveBasic()">
+            </div>
+            <div class="row-input">
+                <span style="flex:1" data-i18n="max_range">Max Range (Gate)</span>
+                <span id="i_max_cm" style="font-size:0.75rem; color:#888; margin-right:6px">—</span>
+                <input type="number" id="i_max" min="1" max="13" style="width:60px" oninput="updGateCm()" onchange="saveBasic()">
+            </div>
+
+            <div class="stat-row" style="margin-top:10px"><span data-i18n="hold_time">Doba držení (s)</span></div>
+            <input type="number" id="i_hold" step="0.5" min="0" onchange="saveBasic()">
+
+            <div style="display:flex; align-items:center; gap:8px; margin-bottom:10px; margin-top:10px">
+                <input type="checkbox" id="chk_eng" style="width:auto" onchange="toggleEng()">
+                <label for="chk_eng" title="Enable detailed gate data (14 zones) and faster communication"><span data-i18n="enable_diag">Povolit Diagnostiku</span></label>
+            </div>
+
+            <div style="display:flex; align-items:center; gap:8px; margin-bottom:5px">
+                <input type="checkbox" id="chk_radar_bt" style="width:auto" onchange="toggleRadarBt()">
+                <label for="chk_radar_bt"><span data-i18n="radar_bt">Bluetooth radaru</span></label>
+                <span id="radar_mac_val" style="margin-left:8px; font-size:0.75rem; color:#888; font-family:monospace"></span>
+            </div>
+            <p style="font-size:0.7rem; color:#c80; margin:2px 0 15px 0">
+                <span data-i18n="radar_bt_warn">⚠️ Zapnout jen na dobu potřebnou pro diagnostiku HLK aplikací. Doporučeno vypnuto.</span>
+            </p>
+
+            <button id="btn_calib" onclick="startCalib()" style="margin-top:15px" data-i18n="calib_noise">Calibrate Noise (60s)</button>
+            </div>
+        </div>
+
+        <!-- TAB 1: SECURITY -->
+        <div id="tab1" class="hidden">
+            <div class="radar-only">
+            <div class="section-title"><span data-i18n="antimask_title">ANTI-MASKING (Sabotáž zakrytím)</span></div>
+            <div style="display:flex; align-items:center; gap:8px; margin-bottom:5px">
+                <input type="checkbox" id="chk_am_en" style="width:auto" onchange="saveSec()">
+                <label for="chk_am_en"><span data-i18n="antimask_enable">Povolit alarm při tichu</span></label>
+            </div>
+            <div class="row-input">
+                <span data-i18n="timeout_sec">Časový limit (sec)</span>
+                <input type="number" id="i_am" placeholder="300" min="0" max="3600" step="5" title="0 = disabled / vypnuto (max 3600 s)" style="width:80px" onchange="saveSec()">
+            </div>
+            <p style="font-size:0.7rem; color:#666; margin:2px 0 15px 0">
+                ⚠️ <span data-i18n="antimask_hint">Pro sklady, chaty, serverovny <b>VYPNĚTE</b> - ticho je tam normální.<br>
+                Pro obývané prostory ZAPNĚTE - detekuje zakrytí sensoru.</span>
+            </p>
+
+            <div class="section-title"><span data-i18n="loiter_title">LOITERING (Podezřelé postávání)</span></div>
+            <div style="display:flex; align-items:center; gap:8px; margin-bottom:5px">
+                <input type="checkbox" id="chk_loit_en" style="width:auto" onchange="saveSec()">
+                <label for="chk_loit_en"><span data-i18n="loiter_enable">Notifikace při postávání</span></label>
+            </div>
+            <div class="row-input">
+                <span data-i18n="timeout_sec">Časový limit (sec)</span>
+                <input type="number" id="i_loit" placeholder="15" min="0" max="3600" step="5" title="0 = disabled / vypnuto (max 3600 s)" style="width:80px" onchange="saveSec()">
+            </div>
+            <p style="font-size:0.7rem; color:#666; margin:2px 0 15px 0">
+                <span data-i18n="loiter_hint">Alarm když někdo stojí &lt;2m od sensoru déle než timeout.</span>
+            </p>
+            </div>
+
+            <div class="section-title"><span data-i18n="hb_title">HEARTBEAT (Pravidelný report)</span></div>
+            <div class="row-input">
+                <span data-i18n="interval_h">Interval (h)</span>
+                <input type="number" id="i_hb" placeholder="4" min="0" max="24" style="width:80px" onchange="saveSec()">
+            </div>
+            <p style="font-size:0.7rem; color:#666; margin:2px 0 15px 0">
+                <span data-i18n="hb_hint">0 = vypnuto, 4 = každé 4 hodiny zpráva "jsem OK".</span>
+            </p>
+
+            <div class="radar-only">
+            <div class="section-title" data-i18n="pet_immunity_title">PET IMMUNITY</div>
+            <div class="row-input">
+                <span data-i18n="min_move_energy">Min Move Energy</span>
+                <input type="number" id="i_pet" placeholder="10" min="0" max="50" style="width:80px" onchange="saveSec()">
+            </div>
+            <p style="font-size:0.7rem; color:#666; margin:2px 0">
+                <span data-i18n="pet_hint">Filtruje malé objekty (kočky, psi) s nízkou energií &lt;2m.</span>
+            </p>
+            </div>
+
+            <div class="section-title" data-i18n="alarm_delay_title">ALARM DELAY</div>
+            <div class="row-input">
+                <span data-i18n="entry_delay">Zpoždění vstupu (sec)</span>
+                <input type="number" id="i_entry_dl" placeholder="30" min="0" max="300" style="width:80px" onchange="saveAlarmConfig()">
+            </div>
+            <div class="row-input">
+                <span data-i18n="exit_delay">Zpoždění odchodu (sec)</span>
+                <input type="number" id="i_exit_dl" placeholder="30" min="0" max="300" style="width:80px" onchange="saveAlarmConfig()">
+            </div>
+            <div style="display:flex; align-items:center; gap:8px; margin-bottom:5px">
+                <input type="checkbox" id="chk_dis_rem" style="width:auto" onchange="saveAlarmConfig()">
+                <label for="chk_dis_rem"><span data-i18n="disarm_reminder">Připomínka "Stále NESTŘEŽENO"</span></label>
+            </div>
+
+            <div class="radar-only">
+            <div class="section-title" data-i18n="absence_timeout_title">ABSENCE TIMEOUT</div>
+            <div class="row-input">
+                <span data-i18n="unmanned_duration">Unmanned Duration (sec)</span>
+                <input type="number" id="i_timeout" placeholder="10" min="0" max="255" style="width:80px" onchange="saveTimeout()">
+            </div>
+            <p style="font-size:0.7rem; color:#666; margin:2px 0 15px 0">
+                <span data-i18n="hold_hint">Doba, po které radar hlásí "nepřítomnost" bez detekce.</span>
+            </p>
+
+            <div class="section-title" data-i18n="light_sensor_title">LIGHT SENSOR (OUT pin)</div>
+            <div class="row-input">
+                <span data-i18n="light_func">Funkce světla</span>
+                <select id="sel_light_func" style="width:140px" onchange="saveLightConfig()">
+                    <option value="0" data-i18n="light_off">Off</option>
+                    <option value="1" data-i18n="light_night">Noční režim (pod práh)</option>
+                    <option value="2" data-i18n="light_day">Denní režim (nad práh)</option>
+                </select>
+            </div>
+            <div class="row-input">
+                <span data-i18n="light_thr">Práh světla (0-255)</span>
+                <input type="number" id="i_light_thresh" placeholder="128" min="0" max="255" style="width:80px" onchange="saveLightConfig()">
+            </div>
+            <div class="row-input">
+                <span data-i18n="light_cur">Aktuální světlo</span>
+                <span id="cur_light_val" style="font-weight:bold">---</span>
+            </div>
+            <p style="font-size:0.7rem; color:#666; margin:2px 0 0 0">
+                <span data-i18n="light_hint">OUT pin aktivní jen když je světlo pod/nad prahem.<br>
+                Ideální pro noční zabezpečení (režim "pod práh").</span>
+            </p>
+            </div>
+        </div>
+
+        <!-- TAB 2: GATES -->
+        <div id="tab2" class="hidden">
+            <div id="range_summary" style="font-size:0.8rem; color:#888; margin-bottom:8px; text-align:center"></div>
+
+            <div style="font-size:0.75rem; color:#888; margin-bottom:8px; line-height:1.5">
+                <span style="color:#03dac6; font-weight:bold">&#9632; <span data-i18n="movement">Pohyb</span></span> &middot;
+                <span style="color:#bb86fc; font-weight:bold">&#9632; <span data-i18n="static_">Statika</span></span><br>
+                <span data-i18n="gate_legend">Vyšší = citlivější &middot; <span style="opacity:0.4">šedá = mimo min/max rozsah</span></span>
+            </div>
+
+            <div style="background:#111; border-radius:8px; padding:8px; margin-bottom:8px">
+                <div style="font-size:0.75rem; color:#888; margin-bottom:4px" data-i18n="set_all">Nastavit vše:</div>
+                <div style="display:flex; gap:6px; align-items:center; flex-wrap:wrap">
+                    <span style="color:#03dac6; font-size:0.75rem; width:12px">P</span>
+                    <input type="range" class="mov-slider" id="g_m_all" value="50" min="0" max="100" style="flex:1; min-width:60px" oninput="$('lm_all').innerText=this.value">
+                    <span id="lm_all" style="width:22px; color:#03dac6; font-size:0.75rem; text-align:right">50</span>
+                    <span style="color:#bb86fc; font-size:0.75rem; width:12px; margin-left:4px">S</span>
+                    <input type="range" class="stat-slider" id="g_s_all" value="30" min="0" max="100" style="flex:1; min-width:60px" oninput="$('ls_all').innerText=this.value">
+                    <span id="ls_all" style="width:22px; color:#bb86fc; font-size:0.75rem; text-align:right">30</span>
+                    <button class="sec" style="width:auto; padding:4px 10px; margin:0; font-size:0.75rem" onclick="setAllGates()">OK</button>
+                </div>
+            </div>
+
+            <div style="display:flex; justify-content:space-between; margin-bottom:8px; gap:5px">
+                <button class="sec" style="flex:1; padding:5px; font-size:0.8rem" onclick="setPreset('indoor')" data-i18n="indoor">Interiér</button>
+                <button class="sec" style="flex:1; padding:5px; font-size:0.8rem" onclick="setPreset('outdoor')" data-i18n="outdoor">Exteriér</button>
+                <button class="sec" style="flex:1; padding:5px; font-size:0.8rem" onclick="setPreset('pet')" data-i18n="pets">Zvířata</button>
+            </div>
+
+            <div id="gates_container" style="max-height:400px; overflow-y:auto"></div>
+
+            <button onclick="saveGates()" style="margin-top:8px" data-i18n="save_gates">Uložit Hradla</button>
+        </div>
+
+        <!-- TAB 3: NETWORK & CLOUD -->
+        <div id="tab3" class="hidden">
+            <div class="section-title" data-i18n="net_section">Ethernet síť</div>
+            <label style="font-size:0.85rem; color:#aaa" data-i18n="net_mode">Režim</label>
+            <select id="net_mode_sel" onchange="onNetModeChange()" style="width:100%">
+                <option value="dhcp" data-i18n="net_dhcp">DHCP (automaticky)</option>
+                <option value="static" data-i18n="net_static">Statická IP</option>
+            </select>
+            <div id="net_static_fields" style="display:none">
+                <input type="text" id="net_ip" placeholder="192.168.1.50" data-i18n="net_ip">
+                <input type="text" id="net_subnet" placeholder="255.255.255.0" data-i18n="net_subnet">
+                <input type="text" id="net_gateway" placeholder="192.168.1.1" data-i18n="net_gateway">
+                <input type="text" id="net_dns" placeholder="8.8.8.8" data-i18n="net_dns">
+            </div>
+            <div style="font-size:0.75rem; color:#777; margin:6px 0">
+                <span data-i18n="net_mac">MAC</span>: <span id="net_mac_lbl">—</span>
+                &nbsp;·&nbsp; <span data-i18n="net_link">Link</span>: <span id="net_link_lbl">—</span>
+            </div>
+            <button onclick="saveNetworkConfig()" class="warn" data-i18n="net_save">💾 Uložit a restartovat</button>
+
+            <div class="section-title" data-i18n="tz_section">ČAS &amp; ZÓNA</div>
+            <label style="font-size:0.85rem; color:#aaa" data-i18n="tz_preset">Předvolba</label>
+            <select id="tz_sel" onchange="onTzChange()" style="width:100%">
+                <option value="0,0">UTC (0,0)</option>
+                <option value="3600,3600">Europe/Prague (CET/CEST)</option>
+                <option value="0,3600">Europe/London (GMT/BST)</option>
+                <option value="3600,3600">Europe/Berlin (CET/CEST)</option>
+                <option value="7200,3600">Europe/Athens (EET/EEST)</option>
+                <option value="-18000,3600">America/New_York (EST/EDT)</option>
+                <option value="-21600,3600">America/Chicago (CST/CDT)</option>
+                <option value="-25200,3600">America/Denver (MST/MDT)</option>
+                <option value="-28800,3600">America/Los_Angeles (PST/PDT)</option>
+                <option value="32400,0">Asia/Tokyo (JST)</option>
+                <option value="28800,0">Asia/Shanghai (CST)</option>
+                <option value="19800,0">Asia/Kolkata (IST)</option>
+                <option value="36000,3600">Australia/Sydney (AEST/AEDT)</option>
+                <option value="custom">Custom…</option>
+            </select>
+            <div id="tz_custom_fields" style="display:none">
+                <input type="number" id="tz_std_in" placeholder="Standard offset (s)" data-i18n-ph="ph_tz_std" oninput="updateTzLabel()">
+                <input type="number" id="tz_dst_in" placeholder="DST offset (s)" data-i18n-ph="ph_tz_dst" oninput="updateTzLabel()">
+            </div>
+            <div style="font-size:0.75rem; color:#777; margin:6px 0">
+                UTC offset: <span id="tz_device_time">—</span>
+            </div>
+            <button onclick="saveTimezone()" class="sec" data-i18n="tz_save">💾 Uložit časovou zónu</button>
+
+            <div class="section-title" data-i18n="sched_section">NAPLÁNOVÁNÍ</div>
+            <div style="display:flex; gap:5px; align-items:center">
+                <label style="flex:1; font-size:0.85rem; color:#aaa" data-i18n="sched_arm">Čas auto-armování</label>
+                <input type="time" id="sched_arm_in" style="flex:1" placeholder="HH:MM">
+            </div>
+            <div style="display:flex; gap:5px; align-items:center">
+                <label style="flex:1; font-size:0.85rem; color:#aaa" data-i18n="sched_disarm">Čas auto-odarmování</label>
+                <input type="time" id="sched_disarm_in" style="flex:1" placeholder="HH:MM">
+            </div>
+            <div style="display:flex; gap:5px; align-items:center">
+                <label style="flex:1; font-size:0.85rem; color:#aaa" data-i18n="sched_auto_arm">Auto-arm po nečinnosti (min, 0 = vyp)</label>
+                <input type="number" id="sched_auto_arm_in" min="0" max="1440" style="flex:1" placeholder="0">
+            </div>
+            <div style="font-size:0.75rem; color:#777; margin:6px 0" data-i18n="sched_hint">Zařízení se sám (od)armuje dle nastavené časové zóny. Formát HH:MM, prázdné = vypnuto.</div>
+            <button onclick="saveSchedule()" class="sec" data-i18n="sched_save">💾 Uložit naplánování</button>
+
+            <div class="section-title">MQTT Broker</div>
+            <div style="display:flex; align-items:center; gap:8px;">
+                <input type="checkbox" id="chk_mqtt_en" style="width:auto">
+                <label for="chk_mqtt_en" data-i18n="enable_mqtt">Enable MQTT</label>
+            </div>
+            <input type="text" id="txt_mqtt_server" placeholder="Server IP" data-i18n-ph="ph_mqtt_server">
+            <div style="display:flex; gap:5px">
+                <input type="text" id="txt_mqtt_port" placeholder="Port (1883)" data-i18n-ph="ph_mqtt_port">
+                <input type="text" id="txt_mqtt_user" placeholder="Username" data-i18n-ph="ph_username">
+            </div>
+            <input type="password" id="txt_mqtt_pass" placeholder="Password" data-i18n-ph="ph_password">
+            <button onclick="saveMQTTConfig()" class="sec" data-i18n="save_mqtt">Uložit MQTT</button>
+
+            <div class="section-title" data-i18n="telegram_notifications">Telegram Notifications</div>
+            <div style="display:flex; align-items:center; gap:8px;">
+                <input type="checkbox" id="chk_tg_en" style="width:auto">
+                <label for="chk_tg_en" data-i18n="enable_bot">Enable Bot</label>
+            </div>
+            <input type="text" id="txt_tg_token" placeholder="Bot Token" data-i18n-ph="ph_bot_token">
+            <input type="text" id="txt_tg_chat" placeholder="Chat ID" data-i18n-ph="ph_chat_id">
+            <div style="display:flex; gap:5px">
+                <button onclick="saveTelegram()" class="sec" data-i18n="save">Uložit</button>
+                <button onclick="testTelegram()" class="sec">Test</button>
+            </div>
+            <div class="section-title" data-i18n="credentials_title">CREDENTIALS</div>
+            <input type="text" id="txt_auth_user" placeholder="Username" data-i18n-ph="ph_username">
+            <input type="password" id="txt_auth_pass" placeholder="New Password" data-i18n-ph="ph_new_password">
+            <input type="password" id="txt_auth_pass2" placeholder="Confirm Password" data-i18n-ph="ph_confirm_pass">
+            <button onclick="saveAuth()" class="warn" data-i18n="change_pass">Změnit heslo</button>
+
+            <div class="section-title" data-i18n="cfg_backup">ZÁLOHA KONFIGURACE</div>
+            <div style="display:flex; gap:5px">
+              <button onclick="exportConfig()" class="sec" data-i18n="cfg_export">💾 Exportovat</button>
+              <button onclick="importConfigPrompt()" class="sec" data-i18n="cfg_import">📂 Importovat</button>
+            </div>
+            <input type="file" id="cfg_import_file" accept="application/json" style="display:none" onchange="importConfig(this.files[0])">
+        </div>
+
+        <!-- TAB 4: ZONES -->
+        <div id="tab4" class="hidden">
+            <div class="label" style="margin-bottom:10px; font-size:0.8rem; color:#888" data-i18n="zone_definitions">ZONE DEFINITIONS (cm)</div>
+            <!-- SVG Zone Map -->
+            <div style="position:relative; margin-bottom:10px">
+                <svg id="zone_map" width="100%" height="48" style="display:block"></svg>
+                <div style="position:absolute; bottom:2px; left:4px; font-size:0.65rem; color:#555" id="zone_map_scale"></div>
+            </div>
+            <div id="zones_list"></div>
+            <button onclick="addZone()" class="sec" style="margin-top:10px" data-i18n="add_zone">+ Přidat Zónu</button>
+            <button onclick="saveZones()" data-i18n="save_zones">💾 Uložit Zóny</button>
+            <!-- Auto-learn -->
+            <div style="background:#1a1a2e; border-radius:6px; padding:8px; margin-top:10px">
+                <div style="display:flex; gap:6px; align-items:center; flex-wrap:wrap">
+                    <select id="learn_dur" style="flex:1; min-width:120px">
+                        <option value="60">1 min</option>
+                        <option value="180" selected>3 min</option>
+                        <option value="300">5 min</option>
+                        <option value="600">10 min</option>
+                        <option value="1800">30 min</option>
+                        <option value="3600">60 min</option>
+                        <option value="14400">4h</option>
+                        <option value="28800">8h</option>
+                    </select>
+                    <button onclick="startLearn()" id="btn_learn" class="sec" style="flex:1" data-i18n="learn_static">📡 Naučit statiku</button>
+                </div>
+                <div id="learn_status" style="margin-top:6px; font-size:0.8rem; color:#888; display:none"></div>
+            </div>
+        </div>
+
+        <!-- TAB 5: EVENT TIMELINE -->
+        <div id="tab5" class="hidden">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; flex-wrap:wrap; gap:6px">
+                <div class="section-title" style="margin:0; border:none"><span data-i18n="timeline_title">TIMELINE UDÁLOSTÍ</span></div>
+                <div style="display:flex; gap:4px; align-items:center; flex-wrap:wrap">
+                    <span id="evt_total" style="font-size:0.75rem; color:#666"></span>
+                    <select id="evt_filter" onchange="loadEvents()" style="width:auto; padding:4px 8px; font-size:0.8rem">
+                        <option value="-1" data-i18n="filter_all">Vše</option>
+                        <option value="5" data-i18n="filter_alarm">Alarm</option>
+                        <option value="1" data-i18n="filter_move">Pohyb</option>
+                        <option value="2" data-i18n="filter_tamper">Tamper</option>
+                        <option value="4" data-i18n="filter_hb">Heartbeat</option>
+                        <option value="0" data-i18n="filter_sys">Systém</option>
+                        <option value="3" data-i18n="filter_net">Síť</option>
+                    </select>
+                    <button onclick="exportEvents()" class="sec" style="width:auto; padding:4px 8px; margin:0; font-size:0.8rem">CSV</button>
+                    <button onclick="clearEvents()" class="warn" style="width:auto; padding:4px 8px; margin:0; font-size:0.8rem" data-i18n="delete">Smazat</button>
+                </div>
+            </div>
+            <!-- Timeline visual bar (last 24h density) -->
+            <svg id="evt_timeline" viewBox="0 0 288 32" preserveAspectRatio="none"
+                 style="width:100%; height:32px; background:#111; border-radius:4px; margin-bottom:8px">
+            </svg>
+            <div style="display:flex; justify-content:space-between; font-size:0.65rem; color:#555; margin:-4px 0 8px 0">
+                <span>-24h</span><span>-12h</span><span data-i18n="now">nyní</span>
+            </div>
+            <!-- Event list -->
+            <div id="evt_timeline_list" style="max-height:400px; overflow-y:auto"></div>
+            <button id="evt_load_more" onclick="loadMoreEvents()" class="sec" style="display:none; margin-top:8px; font-size:0.85rem" data-i18n="load_more">Načíst další...</button>
+        </div>
+
+        <!-- TAB 6: WIFI CSI -->
+        <div id="tab6" class="hidden">
+            <div id="csi_compiled_warn" style="display:none; padding:10px; background:#3a1010; border-left:3px solid var(--warn); margin-bottom:12px; font-size:0.85rem">
+                ⚠️ <span data-i18n="csi_warn">Tento firmware nebyl zkompilován s podporou WiFi CSI.</span>
+            </div>
+
+            <div class="section-title" data-i18n="csi_status_title">STAV CSI</div>
+            <div class="stat-row"><span data-i18n="csi_active">Aktivní</span><span id="csi_active_val" style="font-weight:bold">—</span></div>
+            <div class="stat-row"><span>WiFi SSID</span><span id="csi_ssid_val">—</span></div>
+            <div class="stat-row"><span>WiFi RSSI</span><span id="csi_rssi_val">—</span></div>
+            <div class="stat-row"><span data-i18n="csi_rssi_quality">Kvalita WiFi pro CSI</span><span id="csi_rssi_quality_val">—</span></div>
+            <div class="stat-row"><span data-i18n="packets_per_s">Pakety/s</span><span id="csi_pps_val">—</span></div>
+            <div class="stat-row"><span data-i18n="csi_idle">Idle baseline připraven</span><span id="csi_idle_val">—</span></div>
+            <div class="stat-row"><span data-i18n="ap_compat">AP kompatibilita (HT LTF)</span><span id="csi_ap_compat" style="font-weight:bold">—</span></div>
+
+            <div class="section-title" data-i18n="motion_detection_title">DETEKCE POHYBU</div>
+            <div class="stat-row">
+                <span data-i18n="motion_state">Stav pohybu</span>
+                <span id="csi_motion_val" style="font-weight:bold; font-size:1.2rem">—</span>
+            </div>
+            <div class="section-title" data-collapsed data-i18n="csi_metrics_title">CSI METRIKY (expert)</div>
+            <div class="stat-row"><span data-i18n="composite" title="Souhrnné skóre změn v CSI signálu — vyšší = větší pohyb">Composite skóre</span><span id="csi_comp_val">—</span></div>
+            <div class="stat-row"><span data-i18n="variance_window" title="Rozptyl signálu v posledním okně vzorků">Variance (okno)</span><span id="csi_var_val">—</span></div>
+            <svg id="csi_graph" viewBox="0 0 100 50" style="width:100%; height:60px; background:#1a1a1a; margin-top:5px; stroke:#03dac6"></svg>
+
+            <div class="section-title">FÚZE (Radar + CSI)</div>
+            <div class="stat-row">
+                <span data-i18n="fusion_state">Fusion stav</span>
+                <span id="fus_presence_val" style="font-weight:bold; font-size:1.2rem">—</span>
+            </div>
+            <div class="stat-row"><span>Spolehlivost</span><span id="fus_conf_val">—</span></div>
+            <div class="stat-row"><span data-i18n="detection_src">Zdroj detekce</span><span id="fus_source_val">—</span></div>
+            <div class="stat-row">
+                <span data-i18n="fusion_enabled">Fusion povoleno</span>
+                <label class="switch"><input type="checkbox" id="fus_en" onchange="toggleFusion(this.checked)"><span class="slider"></span></label>
+            </div>
+
+            <div class="section-title" data-collapsed><span data-i18n="config">KONFIGURACE</span></div>
+
+            <div class="stat-row">
+                <span data-i18n="enabled">Povoleno</span>
+                <label class="switch"><input type="checkbox" id="csi_en"><span class="slider"></span></label>
+            </div>
+
+            <label style="display:block; margin-top:10px; font-size:0.85rem; color:#aaa">
+                <span data-i18n="threshold_label">Práh detekce (variance threshold):</span> <span id="csi_thr_lbl">0.50</span>
+            </label>
+            <input type="range" id="csi_thr" min="0.01" max="3.0" step="0.01" value="0.5"
+                   oninput="$('csi_thr_lbl').innerText=parseFloat(this.value).toFixed(2)">
+
+            <label style="display:block; margin-top:10px; font-size:0.85rem; color:#aaa">
+                <span data-i18n="hysteresis">Hystereze (exit multiplier):</span> <span id="csi_hyst_lbl">0.70</span>
+            </label>
+            <input type="range" id="csi_hyst" min="0.30" max="0.95" step="0.01" value="0.7"
+                   oninput="$('csi_hyst_lbl').innerText=parseFloat(this.value).toFixed(2)">
+
+            <label style="display:block; margin-top:10px; font-size:0.85rem; color:#aaa">
+                <span data-i18n="window_size">Velikost okna (vzorky):</span> <span id="csi_win_lbl">75</span>
+            </label>
+            <input type="range" id="csi_win" min="10" max="200" step="5" value="75"
+                   oninput="$('csi_win_lbl').innerText=this.value">
+
+            <label style="display:block; margin-top:10px; font-size:0.85rem; color:#aaa">
+                <span data-i18n="pub_interval">Interval publikace (ms):</span> <span id="csi_pub_lbl">1000</span>
+            </label>
+            <input type="range" id="csi_pub" min="200" max="5000" step="100" value="1000"
+                   oninput="$('csi_pub_lbl').innerText=this.value">
+
+            <div class="section-title" data-collapsed style="margin-top:14px">GENERÁTOR PROVOZU</div>
+            <div class="stat-row">
+                <span data-i18n="tgen_mode">Režim</span>
+                <select id="csi_tmode" style="width:auto; padding:4px 8px" onchange="$('csi_udp_port_row').style.display=this.value==='udp'?'flex':'none'">
+                    <option value="udp">UDP</option>
+                    <option value="icmp">ICMP Ping</option>
+                </select>
+            </div>
+            <div id="csi_udp_port_row" class="stat-row">
+                <span data-i18n="tgen_port">Cílový port</span>
+                <input type="number" id="csi_tport" value="7" min="1" max="65535" style="width:80px">
+            </div>
+            <label style="display:block; margin-top:8px; font-size:0.85rem; color:#aaa">
+                <span data-i18n="tgen_pps">Paketů/s (PPS):</span> <span id="csi_pps_lbl">100</span>
+            </label>
+            <input type="range" id="csi_tpps" min="10" max="500" step="10" value="100"
+                   oninput="$('csi_pps_lbl').innerText=this.value">
+
+            <button onclick="saveCSIConfig()" style="margin-top:12px" data-i18n="save_config">Uložit konfiguraci</button>
+
+            <div class="section-title"  data-i18n="wifi_ap">WIFI AP (CSI)</div>
+            <div style="font-size:0.75rem; color:#888; margin-bottom:6px" data-i18n="wifi_ap_hint">
+                Přepnutí AP pro CSI senzor. Uložení vyžaduje reboot. Prázdné heslo ponechá stávající; tlačítko default obnoví údaje ze <code>secrets.h</code>.
+            </div>
+            <label style="font-size:0.85rem" data-i18n="wifi_ssid">SSID</label>
+            <input type="text" id="csi_wifi_ssid" maxlength="32" placeholder="—" oninput="csiWifiSelectionChanged()" style="margin-bottom:6px">
+            <label style="font-size:0.85rem" data-i18n="wifi_pass">Heslo</label>
+            <input type="password" id="csi_wifi_pass" maxlength="64" placeholder="(nemění se pokud prázdné při edit)" data-i18n-ph="ph_wifi_pass_hint" style="margin-bottom:6px">
+            <button id="csi_wifi_scan_btn" onclick="startCsiWifiScan()" class="sec" data-i18n="wifi_scan">🔎 Vyhledat okolní WiFi</button>
+            <div style="font-size:0.72rem; color:#777; margin-top:4px" data-i18n="wifi_scan_hint">Scan na několik sekund pozastaví CSI příjem.</div>
+            <div id="csi_wifi_scan_status" style="font-size:0.78rem; color:#aaa; min-height:1.1em; margin-top:6px"></div>
+            <div id="csi_wifi_scan_results" class="wifi-scan-list"></div>
+            <div style="display:flex; gap:6px; flex-wrap:wrap">
+                <button onclick="saveCsiWifi()" class="warn" style="flex:2; min-width:140px" data-i18n="save_reboot">💾 Uložit a rebootovat</button>
+                <button onclick="resetCsiWifi()" class="sec" style="flex:1; min-width:120px" data-i18n="wifi_use_default">↩️ Compile-time default</button>
+            </div>
+
+            <div class="section-title" data-collapsed data-i18n="actions">AKCE</div>
+            <div style="display:flex; flex-wrap:wrap; gap:6px">
+                <button class="sec" style="flex:1; min-width:120px" onclick="csiCalibrate()" data-i18n="auto_calib">📐 Auto-kalibrace prahu (10s)</button>
+                <button class="sec" style="flex:1; min-width:120px" onclick="csiResetBaseline()" data-i18n="reset_baseline">♻️ Reset idle baseline</button>
+                <button class="sec" style="flex:1; min-width:120px" onclick="csiReconnect()" data-i18n="reconnect_wifi">📶 Reconnect WiFi</button>
+            </div>
+            <div id="csi_calib_bar" style="display:none; height:6px; background:#333; margin-top:8px; border-radius:3px; overflow:hidden">
+                <div id="csi_calib_fill" style="height:100%; width:0%; background:var(--accent); transition:width 0.3s"></div>
+            </div>
+            <div style="font-size:0.75rem; color:#777; margin-top:8px">
+                <span data-i18n="csi_help"><b>Auto-kalibrace:</b> 10 sekund vzorkuje variance v klidu, nastaví práh = mean × 1.5. Použij když je v místnosti nikdo.<br>
+                <b>Reset baseline:</b> vyčistí naučené idle hodnoty (turbulence, fáze). Po přesunu senzoru.<br>
+                <b>Reconnect WiFi:</b> přerušení / RSSI dropy řeší restart asociace.</span>
+            </div>
+
+            <div class="section-title" data-collapsed style="margin-top:14px" data-i18n="site_learning">SITE LEARNING (dlouhodobé)</div>
+            <div class="stat-row">
+                <span data-i18n="learn_status">Stav učení</span>
+                <span id="csi_learn_status" style="font-weight:bold">—</span>
+            </div>
+            <div class="stat-row">
+                <span data-i18n="learn_elapsed">Uplynulo / cíl</span>
+                <span id="csi_learn_elapsed">—</span>
+            </div>
+            <div style="height:6px; background:#333; margin-top:4px; border-radius:3px; overflow:hidden">
+                <div id="csi_learn_fill" style="height:100%; width:0%; background:var(--accent); transition:width 0.3s"></div>
+            </div>
+            <div id="csi_learn_progress_lbl" style="display:none; text-align:right; font-size:0.75rem; color:#aaa; margin-top:3px">—</div>
+            <div class="stat-row" style="margin-top:6px">
+                <span data-i18n="learn_samples">Přijaté / zamítnuté (pohyb / radar)</span>
+                <span id="csi_learn_samples">—</span>
+            </div>
+            <div class="stat-row">
+                <span data-i18n="learn_bssid_resets">BSSID resety</span>
+                <span id="csi_learn_bssid">—</span>
+            </div>
+            <div class="stat-row">
+                <span data-i18n="learn_thr_est">Odhad prahu</span>
+                <span id="csi_learn_thr_est">—</span>
+            </div>
+
+            <label style="display:block; margin-top:10px; font-size:0.85rem; color:#aaa">
+                <span data-i18n="learn_duration">Délka učení:</span> <span id="csi_learn_dur_lbl">48 h</span>
+            </label>
+            <input type="range" id="csi_learn_dur" min="0.5" max="168" step="0.5" value="48"
+                   oninput="$('csi_learn_dur_lbl').innerText=fmtLearnDur(this.value)">
+
+            <div style="display:flex; flex-wrap:wrap; gap:6px; margin-top:8px">
+                <button class="sec" style="flex:1; min-width:120px" onclick="csiStartLearning()" data-i18n="learn_start">▶️ Spustit učení</button>
+                <button class="sec" style="flex:1; min-width:120px" onclick="csiStopLearning()" data-i18n="learn_stop">⏹ Zastavit</button>
+                <button class="sec" style="flex:1; min-width:120px" onclick="csiClearLearned()" data-i18n="learn_clear">🗑 Smazat model</button>
+            </div>
+
+            <div class="section-title" data-collapsed style="margin-top:14px" data-i18n="learned_model">NAUČENÝ MODEL</div>
+            <div class="stat-row"><span data-i18n="learned_ready">Model připraven</span><span id="csi_lm_ready">—</span></div>
+            <div class="stat-row"><span data-i18n="learned_thr">Naučený práh</span><span id="csi_lm_thr">—</span></div>
+            <div class="stat-row"><span data-i18n="learned_mean">Průměrná variance</span><span id="csi_lm_mean">—</span></div>
+            <div class="stat-row"><span data-i18n="learned_std">Směrodatná odchylka variance</span><span id="csi_lm_std">—</span></div>
+            <div class="stat-row"><span data-i18n="learned_max">Maximální variance</span><span id="csi_lm_max">—</span></div>
+            <div class="stat-row"><span data-i18n="learned_samples">Vzorků</span><span id="csi_lm_samples">—</span></div>
+            <div class="stat-row"><span data-i18n="learn_refresh">Vzorky obnovy EMA</span><span id="csi_lm_refresh">—</span></div>
+            <div style="font-size:0.75rem; color:#777; margin-top:8px">
+                <span data-i18n="learn_help"><b>Site learning:</b> dlouhodobé vzorkování variance v prázdné místnosti (doporučeno 24–72 h). Radar-gate (LD2412) odfiltruje statické lidi. Po dokončení se automaticky nastaví <code>threshold = mean + 3×std</code>. <b>Učení přežívá OTA flash</b> (uloženo v NVS). Smazat model = reset na tovární hodnoty.</span>
+            </div>
+
+            <div class="section-title" data-collapsed style="margin-top:14px">MODEL STANOVIŠTĚ (kandidát / použít / vrátit)</div>
+            <div id="csi_sm_wrap" style="font-size:0.85rem">
+              <div class="stat-row"><span>Aktivní</span><span id="csi_sm_active">—</span></div>
+              <div class="stat-row"><span>Kandidát</span><span id="csi_sm_cand">—</span></div>
+              <div class="stat-row"><span>Předchozí</span><span id="csi_sm_prev">—</span></div>
+              <div class="stat-row"><span>Rozdíl (kandidát vs. aktivní)</span><span id="csi_sm_diff">—</span></div>
+              <div id="csi_sm_note" style="font-size:0.78rem; color:#aaa; margin-top:4px"></div>
+              <div style="display:flex; flex-wrap:wrap; gap:6px; margin-top:8px">
+                <button class="sec" id="csi_sm_apply" style="flex:1; min-width:110px" onclick="csiApplyModel()">✅ Použít kandidáta</button>
+                <button class="sec" id="csi_sm_discard" style="flex:1; min-width:110px" onclick="csiDiscardCandidate()">🗑 Zahodit kandidáta</button>
+                <button class="sec" id="csi_sm_rollback" style="flex:1; min-width:110px" onclick="csiRollbackModel()">↩ Vrátit předchozí</button>
+              </div>
+              <div style="font-size:0.75rem; color:#777; margin-top:8px">
+                Dokončené učení vytvoří <b>kandidáta</b> — detekce používá <b>aktivní</b> model, dokud kandidáta nepoužiješ. Původní model zůstane pro návrat; učení alarm nikdy nemění.
+              </div>
+            </div>
+
+            <div class="section-title" data-collapsed style="margin-top:14px">CSI DIAGNOSTIKA (P1 · read-only)</div>
+            <div style="font-size:0.85rem">
+              <div class="stat-row"><span>Stav</span><span id="csi_dg_health">—</span></div>
+              <div class="stat-row"><span>Poslední rozhodnutí</span><span id="csi_dg_decision">—</span></div>
+              <div class="stat-row"><span>Stínový model (kandidát)</span><span id="csi_dg_shadow">—</span></div>
+              <div class="stat-row"><span>Prstenec událostí</span><span id="csi_dg_events">—</span></div>
+              <div style="font-size:0.75rem; color:#777; margin-top:8px">
+                Diagnostika pouze pro čtení. <b>Stínový model</b> běží souběžně — <b>BEZ VLIVU NA ALARM</b>. Podrobnosti: <code>/api/csi/{decision,health,events,shadow}</code>.
+              </div>
+            </div>
+
+            <div class="section-title" data-collapsed style="margin-top:14px" data-i18n="ml_mlp">ML (MLP 17→18→9→1)</div>
+            <div class="stat-row">
+                <span data-i18n="ml_enabled_lbl">ML povoleno</span>
+                <label class="switch"><input type="checkbox" id="csi_ml_en" onchange="saveMLConfig()"><span class="slider"></span></label>
+            </div>
+            <div class="stat-row">
+                <span data-i18n="ml_motion_lbl">ML stav</span>
+                <span id="csi_ml_motion_val" style="font-weight:bold">—</span>
+            </div>
+            <div class="stat-row">
+                <span data-i18n="ml_prob_lbl">Pravděpodobnost</span>
+                <span id="csi_ml_prob_val">—</span>
+            </div>
+            <label style="display:block; margin-top:10px; font-size:0.85rem; color:#aaa">
+                <span data-i18n="ml_threshold_lbl">ML práh (enter):</span> <span id="csi_ml_thr_lbl">0.50</span>
+            </label>
+            <input type="range" id="csi_ml_thr" min="0.05" max="0.95" step="0.01" value="0.50"
+                   oninput="$('csi_ml_thr_lbl').innerText=parseFloat(this.value).toFixed(2)"
+                   onchange="saveMLConfig()">
+            <div style="font-size:0.75rem; color:#777; margin-top:8px">
+                <span data-i18n="ml_help"><b>MLP klasifikátor:</b> 17 featur (statistiky turbulence + fáze + DSER/PLCR) → 18→9→1 sigmoid. Trénováno na espectre datasetu (F1 = 0.852). Enter ≥ threshold, exit = threshold × 0.70, N/M smoothing 4/5 z 6 oken. Výstup jde do fusion jako 3. signál.</span>
+            </div>
+        </div>
+    </div>
+
+    <!-- OTA -->
+    <div class="card">
+        <div class="stat-row"><span data-i18n="fw_update_title">Aktualizace FW</span></div>
+        <input type="file" id="fw_file" accept=".bin">
+        <label style="display:block; margin-top:6px; font-size:0.9em">
+            <input type="checkbox" id="ota_cold_reboot" checked>
+            <span data-i18n="ota_cold_label">Před OTA restartovat (doporučeno)</span>
+        </label>
+        <div id="ota_status" style="margin-top:4px; font-size:0.85em; color:#aaa; min-height:1.1em"></div>
+        <div id="ota_bar" style="height:5px; background:#333; margin-top:5px; width:0%; transition:width 0.2s; background:var(--accent)"></div>
+        <button id="btn_ota" onclick="uploadFW()" data-i18n="upload_fw">Nahrát Firmware</button>
+        <button id="btn_espota" onclick="prepareEspota()" class="sec" data-i18n="ota_espota_prepare">Připravit espota okno</button>
+        <p style="font-size:0.7rem; color:#888; margin:6px 0 0 0" data-i18n="ota_espota_help">Pro flash nástrojem espota.py (UDP 3232) místo nahrání souboru. Otevře dočasné okno (odpojí CSI WiFi, odstaví CSI/MQTT, pozastaví radar), aby espota spolehlivě prošlo. Reboot není potřeba.</p>
+
+        <hr style="border:none; border-top:1px solid #333; margin:14px 0 10px">
+        <div class="stat-row"><span data-i18n="pull_ota_title">Pull OTA z URL</span></div>
+        <div style="font-size:0.75rem; color:#777; margin-bottom:6px">
+            <span data-i18n="pull_ota_help">ESP si stáhne firmware sám z dané URL. Funguje s HTTPS. Přesměrování (redirect) se z bezpečnostních důvodů nenásleduje — zadej přímou URL na .bin. MD5 je povinné a slouží jako hlavní kontrola integrity firmware.</span>
+        </div>
+        <input type="text" id="pull_url" placeholder="https://example.com/firmware.bin" style="width:100%; box-sizing:border-box; margin-bottom:6px">
+        <input type="text" id="pull_auth" placeholder="Bearer …" style="width:100%; box-sizing:border-box; margin-bottom:6px">
+        <input type="text" id="pull_md5" maxlength="32" placeholder="MD5 checksum (required)" data-i18n-ph="ph_md5_required" style="width:100%; box-sizing:border-box; margin-bottom:6px">
+        <div id="pull_status" style="margin-top:4px; font-size:0.85em; color:#aaa; min-height:1.1em"></div>
+        <button id="btn_pull" onclick="pullFW()" class="sec" data-i18n="pull_ota_btn">⤓ Stáhnout a flashnout</button>
+        <details style="margin-top:10px; font-size:0.8em">
+            <summary>HTTPS CA profil</summary>
+            <div id="ota_trust_status" style="margin:6px 0; color:#aaa">Načítám stav…</div>
+            <textarea id="ota_ca_pem" maxlength="3072" placeholder="-----BEGIN CERTIFICATE-----" style="width:100%; min-height:90px; box-sizing:border-box"></textarea>
+            <button type="button" onclick="saveOtaTrust()" class="sec">Uložit CA pro HTTPS Pull OTA</button>
+            <button type="button" onclick="clearOtaTrust()" class="sec">Smazat CA</button>
+            <p style="color:#888">Certifikát je write-only; záloha konfigurace jej neobsahuje. HTTP na privátní LAN zůstává kompatibilní, ale není transportně ověřené.</p>
+        </details>
+    </div>
+  </div>
+
+  <div id="toast" data-i18n="saved">Uloženo</div>
+
+<script>
+__BUILD_APP__
+</script>
+</body>
+</html>

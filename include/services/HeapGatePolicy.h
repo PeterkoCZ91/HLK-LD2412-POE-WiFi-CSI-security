@@ -27,10 +27,24 @@
 // These thresholds are byte-addressable-heap bytes: the node's normal working
 // band is ~36-45 kB free / ~15-20 kB largest, and the field OOMs struck
 // between 1.4 and 13 kB free, so closing starts above that whole range.
+//
+// Release 5.7.1 recalibration (bench dev6, 2026-09-06): the "~36-45 kB
+// normal" band above is stale for this build. A clean /api/restart with no
+// web load showed free heap at 46 kB before MQTT connects, dropping to and
+// permanently settling at ~32 kB once MQTT connects (PubSubClient/socket
+// state held for the connection's life, not a leak — see
+// docs/RELEASE_5.7.1_VALIDATION.md). At the OLD close threshold of 14 kB,
+// that left WebAdmissionPolicy only ~1.3 kB of slack over its own admitted
+// reserve at the node's real steady-state baseline — a short bounded HTTP/SSE
+// stress test still triggered an oom_gate restart even with maxInFlight=4 /
+// reserveBytes=8 KiB. Raised close/open thresholds by 6 kB each to restore a
+// real margin against the measured ~32 kB baseline (this now admits only
+// ~1 concurrent request at that baseline instead of ~2 — verify against a
+// fresh stress run before assuming it holds).
 struct HeapGateConfig {
     bool     enabled           = true;
-    uint32_t closeFreeBytes    = 14 * 1024;
-    uint32_t openFreeBytes     = 22 * 1024;
+    uint32_t closeFreeBytes    = 20 * 1024;
+    uint32_t openFreeBytes     = 28 * 1024;
     uint32_t closeLargestBytes = 6 * 1024;
     uint32_t openLargestBytes  = 10 * 1024;
 };

@@ -58,19 +58,19 @@ jobs:
           [ -f include/known_devices.h ] || cp include/known_devices.h.example include/known_devices.h
 
       - name: Build ${{ matrix.env }}
-        run: pio run -e ${{ matrix.env }}
+        run: python3 tools/build_firmware.py -e ${{ matrix.env }}
 
       # C-3: soft flash/RAM budget. The linker already hard-fails on partition
       # or IRAM overflow; this trips earlier so creep toward the OTA ceiling or
       # a sudden size regression fails CI before the next OTA image won't fit.
-      # Re-runs `pio run` (up-to-date after the build above) only to reprint the
-      # partition-relative memory-usage percentages, which `--target size` omits.
+      # Reuses the isolated build log; a direct pio run would switch back to
+      # the shared package directory and undermine framework isolation.
       - name: Size budget ${{ matrix.env }}
-        run: bash tools/check_size_budget.sh ${{ matrix.env }}
+        run: bash tools/check_size_budget.sh ${{ matrix.env }} .pio/build-${{ matrix.env }}.log
 
       - name: Firmware size report
         if: always()
-        run: pio run -e ${{ matrix.env }} --target size 2>&1 | tail -40 || true
+        run: tail -40 .pio/build-${{ matrix.env }}.log || true
 
       # C-2: one unambiguous manifest per artifact. The version is read from the
       # *binary* (not platformio.ini) so it reflects what was actually compiled —
@@ -80,10 +80,19 @@ jobs:
         if: success()
         run: |
           BIN=.pio/build/${{ matrix.env }}/firmware.bin
-          VER=$(strings "$BIN" | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+[A-Za-z0-9.-]*-poe-wifi' | head -1)
+          VER=$(strings "$BIN" | sed -nE 's/.*POE2412_FW_VERSION=(v[0-9]+\.[0-9]+\.[0-9]+[A-Za-z0-9.-]*).*/\1/p' | sort -u)
+          if [[ "$VER" == *$'\n'* ]]; then
+            echo "Conflicting firmware version markers" >&2
+            exit 1
+          fi
+          VER=${VER#POE2412_FW_VERSION=}
+          if [ -z "$VER" ]; then
+            echo "Firmware version marker missing from $BIN" >&2
+            exit 1
+          fi
           {
             echo "env=${{ matrix.env }}"
-            echo "version=${VER:-UNKNOWN}"
+            echo "version=$VER"
             echo "git=${GITHUB_SHA::12}"
             echo "flash_bytes=$(stat -c%s "$BIN")"
             echo "sha256=$(sha256sum "$BIN" | cut -d' ' -f1)"
@@ -121,6 +130,11 @@ jobs:
       - name: Run native unit tests
         run: pio test -e native
 
+      - name: Run feedback tooling tests
+        run: |
+          python -m pip install numpy==2.4.4 scikit-learn==1.8.0
+          python -m unittest discover -s tools/tests -v
+
   cppcheck:
     name: cppcheck static analysis
     runs-on: ubuntu-latest
@@ -151,8 +165,16 @@ jobs:
         with:
           node-version: "20"
 
-      # C-3: the dashboard JS is embedded in a C++ raw string literal, so the
-      # compiler never parses it — a syntax error builds green and only breaks
-      # in the browser. Parse every <script> block with `node --check`.
-      - name: Check embedded GUI JavaScript syntax
+      # C-3: the dashboard JS is (since T7) built from web/src/*.js into a C++
+      # raw string literal, so the compiler never parses the generated header
+      # — a syntax error builds green and only breaks in the browser. Parse
+      # the sources directly with `node --check`.
+      - name: Check GUI JavaScript syntax
         run: bash tools/check_web_js.sh
+
+      # T7: include/web_interface.h is generated from web/src/* by
+      # tools/build_web.py — fail loudly if someone edited the sources
+      # without regenerating (or edited the generated header directly) so
+      # the two can never silently drift apart.
+      - name: Check web_interface.h is up to date with web/src/*
+        run: python3 tools/build_web.py --check

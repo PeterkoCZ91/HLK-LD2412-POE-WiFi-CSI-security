@@ -15,6 +15,7 @@
 #include "services/CsiModelManager.h"
 #include "services/CsiMlSaturation.h"
 #include "services/CsiDecisionTrace.h"
+#include "services/MlLastInference.h"
 #include "services/CsiEventRing.h"
 #include "services/CsiShadowDetector.h"
 #include "services/CsiHealthReasons.h"
@@ -100,6 +101,12 @@ public:
     // P1.2 decision trace — read-only snapshot of the last motion decision
     // (navrh 17.3). Exposed via GET /api/csi/decision; purely diagnostic.
     const CsiDecisionTrace& getDecisionTrace() const { return _decisionTrace; }
+
+    // T9 — the 17-feature vector that produced the last ML decision. Lets a
+    // UI feedback button label the exact sample, not a recomputation from a
+    // buffer that has moved on. Same single-slot/staleness shape as the
+    // decision trace above.
+    bool getLastMlInference(MlLastInference& out) const { return _lastMlInference.read(out); }
 
     // P1.3 diagnostic event ring (navrh 17.2) — read-only access for
     // GET/DELETE /api/csi/events. RAM only; edges/spikes/disagreements/health.
@@ -506,6 +513,7 @@ private:
 
     // P1.2 decision trace — filled at every _updateMotionState() call
     CsiDecisionTrace _decisionTrace;
+    MlLastInferenceStore _lastMlInference;
 
     // P1.3 diagnostic event ring (RAM only). 256 events ≈ 11 KB.
     static constexpr uint16_t CSI_EVENT_RING_CAP = 256;

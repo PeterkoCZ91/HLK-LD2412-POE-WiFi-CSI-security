@@ -1,5 +1,6 @@
 #ifndef LITE_BUILD
 #include "WebRoutes.h"
+#include "services/HeapActivity.h"
 #include <esp_task_wdt.h>
 #include <vector>
 #include "ConfigManager.h"
@@ -31,6 +32,7 @@
 #include "services/SensitiveDataRedaction.h"
 #ifdef USE_CSI
 #include "services/CSIService.h"
+#include "services/MlFeedbackStore.h"
 #include "services/CsiAdaptiveThreshold.h"
 #include "services/CsiHealthReasons.h"
 #include "services/CsiModelExport.h"
@@ -363,14 +365,28 @@ void setupTelemetryRoutes() {
     });
 
     _deps.server->on("/api/health", HTTP_GET, [](AsyncWebServerRequest *request) {
+        HeapActivityScope activity(HeapActivity::HttpHealth);
         if (!checkAuth(request)) return;
         JsonDocument doc;
         doc["uptime"] = millis() / 1000;
         doc["fw_version"] = _deps.fwVersion;
+        doc["sdk_version"] = ESP.getSdkVersion();
+        doc["arduino_major"] = ESP_ARDUINO_VERSION_MAJOR;
         doc["resolution"] = _deps.config->radar_resolution;
-        doc["is_default_pass"] = (String(_deps.config->auth_user) == "admin" && String(_deps.config->auth_pass) == "admin");
-        doc["hostname"] = String(_deps.config->hostname);
-        doc["reset_history"] = _deps.preferences->getString("reset_history", "[]");
+        // Compare/assign the char[] config fields directly instead of via a
+        // temporary String — ArduinoJson copies a const char* straight into
+        // its own pool with no intermediate heap allocation; every avoided
+        // String here is one fewer malloc+free pair inside this handler's
+        // transient footprint (see docs/RELEASE_5.7.1_VALIDATION.md).
+        doc["is_default_pass"] = (strcmp(_deps.config->auth_user, "admin") == 0 &&
+                                   strcmp(_deps.config->auth_pass, "admin") == 0);
+        doc["hostname"] = _deps.config->hostname;
+        // Stored as ready-made JSON (see main.cpp reset-reason logging); embed it
+        // raw instead of as a string value — otherwise every quote inside it gets
+        // backslash-escaped, nearly doubling this field's contribution to the
+        // handler's transient JsonDocument + serialize footprint for no reason.
+        String resetHistoryJson = _deps.preferences->getString("reset_history", "[]");
+        doc["reset_history"] = serialized(resetHistoryJson);
 
         // Extended Health Stats (REQ-002)
         doc["uart_state"] = _deps.radar->getUARTStateString();
@@ -454,28 +470,50 @@ void setupTelemetryRoutes() {
         // OTA rollback state
         const esp_partition_t* running = esp_ota_get_running_partition();
         esp_ota_img_states_t ota_state;
+        const char* otaStateText = "unavailable";
         if (esp_ota_get_state_partition(running, &ota_state) == ESP_OK) {
-            doc["ota_state"] = (ota_state == ESP_OTA_IMG_PENDING_VERIFY) ? "pending_verify" :
-                               (ota_state == ESP_OTA_IMG_VALID)          ? "valid" :
-                               (ota_state == ESP_OTA_IMG_INVALID)        ? "invalid" : "unknown";
+            switch (ota_state) {
+                case ESP_OTA_IMG_NEW:            otaStateText = "new"; break;
+                case ESP_OTA_IMG_PENDING_VERIFY: otaStateText = "pending_verify"; break;
+                case ESP_OTA_IMG_VALID:          otaStateText = "valid"; break;
+                case ESP_OTA_IMG_INVALID:        otaStateText = "invalid"; break;
+                case ESP_OTA_IMG_ABORTED:        otaStateText = "aborted"; break;
+                case ESP_OTA_IMG_UNDEFINED:      otaStateText = "undefined"; break;
+                default:                         otaStateText = "unknown"; break;
+            }
         }
+        doc["ota_state"] = otaStateText;
 
         JsonObject build = doc["build"].to<JsonObject>();
         build["rx_pin"]  = RADAR_RX_PIN;
         build["tx_pin"]  = RADAR_TX_PIN;
         build["out_pin"] = RADAR_OUT_PIN;
 
+        // ETH.macAddress() and IPAddress::toString() each heap-allocate a
+        // String that ArduinoJson then copies again into its own pool. The
+        // MAC in particular was requested twice (chip.mac and ethernet.mac)
+        // — two String allocations for the same six bytes. Format both
+        // straight into stack buffers instead; zero extra heap traffic.
+        uint8_t macBytes[6];
+        ETH.macAddress(macBytes);
+        char macStr[18];
+        snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+                 macBytes[0], macBytes[1], macBytes[2], macBytes[3], macBytes[4], macBytes[5]);
+        IPAddress localIp = ETH.localIP();
+        char ipStr[16];
+        snprintf(ipStr, sizeof(ipStr), "%u.%u.%u.%u", localIp[0], localIp[1], localIp[2], localIp[3]);
+
         JsonObject chip = doc["chip"].to<JsonObject>();
         chip["model"]      = ESP.getChipModel();
         chip["revision"]   = ESP.getChipRevision();
         chip["cores"]      = ESP.getChipCores();
-        chip["mac"]        = ETH.macAddress();
+        chip["mac"]        = macStr;
         chip["flash_size"] = ESP.getFlashChipSize();
 
         JsonObject eth = doc["ethernet"].to<JsonObject>();
         eth["link_up"] = ETH.linkUp();
-        eth["ip"] = ETH.localIP().toString();
-        eth["mac"] = ETH.macAddress();
+        eth["ip"] = ipStr;
+        eth["mac"] = macStr;
         eth["speed"] = ETH.linkSpeed();
         // Flap accounting straight off the driver's own edges. link_up above is
         // a single sample and says nothing about a link that drops for 2 s at a
@@ -512,7 +550,7 @@ void setupTelemetryRoutes() {
         mqtt["port"] = _deps.config->mqtt_port;
         mqtt["user"] = strlen(_deps.config->mqtt_user) > 0 ? "***" : "";
         mqtt["id"] = _deps.config->mqtt_id;
-        mqtt["tls"] = (String(_deps.config->mqtt_port) == "8883");
+        mqtt["tls"] = (strcmp(_deps.config->mqtt_port, "8883") == 0);
 
         // Publish health diagnostics (v4.5.6 — detect stuck sessions before DMS)
         unsigned long lastPubMs = _deps.mqttService->getLastPublishTime();
@@ -3173,6 +3211,10 @@ static void _heapWmRingToJson(const HeapWatermarkRtcRing& r, JsonArray out) {
         o["discovery"]  = e.discoveryIndex;
         o["runtime_op"] = e.runtimeOp;
         o["rssi"]       = e.rssi;
+        o["http_in_flight"] = e.inFlight;
+        o["sse_clients"] = e.sseClients;
+        o["sse_waiting"] = e.sseWaiting;
+        o["activity_mask"] = e.activityMask;
     }
 }
 
@@ -3186,12 +3228,19 @@ void setupLogRoutes() {
         JsonDocument doc;
         doc["capacity"] = (uint32_t)HEAP_WM_RING_CAPACITY;
         doc["min_free_8bit"] = heapMinFreeUsable();
+        JsonObject activities = doc["activity_windows"].to<JsonObject>();
+        for (unsigned i = 0; i < (unsigned)HeapActivity::Count; ++i) {
+            JsonObject o = activities[heapActivityName(i)].to<JsonObject>();
+            const auto& stat = g_heapActivities[i];
+            o["calls"] = stat.calls.load();
+            o["drops"] = stat.drops.load();
+            o["largest_drop"] = stat.largestDrop.load();
+            o["last_ms"] = stat.lastMs.load();
+        }
         _heapWmRingToJson(g_heapWmRing, doc["current_boot"].to<JsonArray>());
         if (g_heapWmPrevBootValid)
             _heapWmRingToJson(g_heapWmPrevBoot, doc["previous_boot"].to<JsonArray>());
-        String out;
-        serializeJson(doc, out);
-        request->send(200, "application/json", out);
+        sendJsonBuffered(request, doc);
     });
 
     _deps.server->on("/api/logs", HTTP_GET, [](AsyncWebServerRequest *request) {
@@ -3998,6 +4047,78 @@ void setupCSIRoutes() {
         doc["radar_present"]         = t.radarPresent;
         doc["active_generation"]     = t.activeGeneration;
         doc["uptime_ms"]             = t.uptimeMs;
+        sendJsonBuffered(request, doc);
+    });
+
+    // POST /api/csi/feedback?label=motion|no_motion — T9 ML false-alarm
+    // feedback loop. Labels the EXACT 17-feature vector behind the last ML
+    // decision (stashed by CSIService::_runMlInference()) and persists it to
+    // the on-device feedback ring for later export/retrain. Nothing to label
+    // yet (fresh boot, ML never ran) -> 400, not a garbage write.
+    _deps.server->on(AsyncURIMatcher::exact("/api/csi/feedback"), HTTP_POST, [](AsyncWebServerRequest *request) {
+        HeapActivityScope activity(HeapActivity::FeedbackWrite);
+        if (!checkAuth(request)) return;
+        if (_deps.csiService == nullptr || _deps.mlFeedbackStore == nullptr) {
+            request->send(503, "text/plain", "CSI not available"); return;
+        }
+        if (!request->hasParam("label")) { request->send(400, "text/plain", "Missing label"); return; }
+        String labelStr = request->getParam("label")->value();
+        uint8_t label;
+        if (labelStr == "no_motion") label = 0;
+        else if (labelStr == "motion") label = 1;
+        else { request->send(400, "text/plain", "label must be motion|no_motion"); return; }
+
+        MlLastInference inf;
+        if (!_deps.csiService->getLastMlInference(inf)) {
+            request->send(503, "text/plain", "ML snapshot busy; retry"); return;
+        }
+        if (!inf.valid) { request->send(400, "text/plain", "No ML inference yet — nothing to label"); return; }
+        if ((uint32_t)(millis() - inf.uptimeMs) > ML_FEEDBACK_MAX_AGE_MS) {
+            request->send(409, "text/plain", "ML inference is stale"); return;
+        }
+
+        if (!_deps.mlFeedbackStore->addSample(inf.feats, label)) {
+            request->send(503, "text/plain", "Feedback store unavailable"); return;
+        }
+        JsonDocument doc;
+        doc["stored"] = true;
+        doc["label"] = label;
+        doc["total"] = _deps.mlFeedbackStore->count();
+        doc["capacity"] = _deps.mlFeedbackStore->capacity();
+        doc["seq"] = _deps.mlFeedbackStore->lastSeq();
+        doc["inference_uptime_ms"] = inf.uptimeMs;
+        sendJsonBuffered(request, doc);
+    });
+
+    // Paginated training export. Eight 17-float vectors bound JSON heap use;
+    // the client follows next_seq until it reaches its initial last_seq.
+    _deps.server->on(AsyncURIMatcher::exact("/api/csi/feedback/export"), HTTP_GET, [](AsyncWebServerRequest *request) {
+        HeapActivityScope activity(HeapActivity::FeedbackExport);
+        if (!checkAuthBasic(request)) return;
+        if (_deps.mlFeedbackStore == nullptr) { request->send(503, "text/plain", "CSI not available"); return; }
+        uint16_t limit = ML_FEEDBACK_PAGE_SIZE;
+        uint32_t afterSeq = 0;
+        if (request->hasParam("limit")) {
+            String text = request->getParam("limit")->value();
+            char* end = nullptr;
+            unsigned long value = strtoul(text.c_str(), &end, 10);
+            if (text.isEmpty() || text[0] < '0' || text[0] > '9' || *end || value == 0) {
+                request->send(400, "text/plain", "Invalid limit"); return;
+            }
+            limit = (uint16_t)std::min<unsigned long>(value, ML_FEEDBACK_PAGE_SIZE);
+        }
+        if (request->hasParam("after_seq")) {
+            String text = request->getParam("after_seq")->value();
+            char* end = nullptr;
+            unsigned long value = strtoul(text.c_str(), &end, 10);
+            if (text.isEmpty() || text[0] < '0' || text[0] > '9' || *end) {
+                request->send(400, "text/plain", "Invalid after_seq"); return;
+            }
+            afterSeq = value;
+        }
+
+        JsonDocument doc;
+        _deps.mlFeedbackStore->getFeedbackJSON(doc, afterSeq, limit);
         sendJsonBuffered(request, doc);
     });
 

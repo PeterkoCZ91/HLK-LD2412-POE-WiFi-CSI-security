@@ -105,10 +105,12 @@ def check_health_core(ip, auth, timeout):
         record("health/chip_temp", "FAIL", f"{temp:.1f} °C (overheating)")
 
     ota = data.get("ota_state", "unknown")
-    if ota == "valid":
+    if ota in ("valid", "new", "undefined"):
         record("health/ota_state", "PASS", ota)
+    elif ota == "pending_verify":
+        record("health/ota_state", "WARN", "pending rollback validation")
     else:
-        record("health/ota_state", "WARN", f"ota_state={ota!r}")
+        record("health/ota_state", "FAIL", f"ota_state={ota!r}")
 
     return data
 
@@ -224,7 +226,7 @@ def check_alarm(ip, auth, timeout):
 def check_site_learning(ip, auth, timeout):
     """Site-learning API contract (README-compatible action= aliases + unknown-action guard):
     - POST ?action=status (unknown action) → HTTP 400, learning must NOT start
-    - POST ?action=start&duration_s=3600  → HTTP 200, learning_active=true
+    - POST ?action=start&duration_s=3600  → HTTP 202, learning_active=true
     - POST ?action=stop                    → HTTP 200, learning_active=false
     Skips if CSI is inactive or learning is already running. Always ends with ?stop=1."""
 
@@ -268,11 +270,11 @@ def check_site_learning(ip, auth, timeout):
         status, _ = post_sl("action=start&duration_s=3600")
         time.sleep(0.5)
         active = get_csi().get("learning_active", False)
-        if status == 200 and active:
-            record("site_learning/action_start", "PASS", "HTTP 200, learning_active=true")
+        if status == 202 and active:
+            record("site_learning/action_start", "PASS", "HTTP 202, learning_active=true")
         else:
             record("site_learning/action_start", "FAIL",
-                   f"HTTP {status}, learning_active={active} (expected 200 + true)")
+                   f"HTTP {status}, learning_active={active} (expected 202 + true)")
 
         # README-documented alias: action=stop
         status, _ = post_sl("action=stop")
@@ -293,8 +295,8 @@ def check_site_learning(ip, auth, timeout):
 
 
 def check_csi_diagnostics(ip, auth, timeout):
-    """P1 CSI diagnostics contract: decision / health / events / shadow / export
-    (Basic auth), plus the import safety guard (slot=active must be rejected)."""
+    """P1/T9 CSI diagnostics contracts, including read-only feedback export
+    and mutation guards that must reject before writing anything."""
     # decision trace
     try:
         _, body = http_get(ip, "/api/csi/decision", auth=auth, timeout=timeout)
@@ -378,6 +380,39 @@ def check_csi_diagnostics(ip, auth, timeout):
             record("csi_import_guard", "FAIL", f"unexpected HTTP {exc.code} (expected 400)")
     except Exception as exc:
         record("csi_import_guard", "FAIL", str(exc))
+
+    # T9 feedback export is safe to probe even when the ring is empty.
+    try:
+        _, body = http_get(ip, "/api/csi/feedback/export?limit=1", auth=auth, timeout=timeout)
+        d = json.loads(body)
+        required = ("total", "capacity", "last_seq", "returned", "samples")
+        if (all(k in d for k in required) and isinstance(d["samples"], list)
+                and d.get("available") is True and d.get("read_error") is False
+                and d.get("schema") == "poe2412.ml-feedback.v1" and d.get("feature_count") == 17):
+            record("csi_feedback_export", "PASS",
+                   f"total={d['total']} cap={d['capacity']} returned={d['returned']}")
+        else:
+            record("csi_feedback_export", "FAIL",
+                   f"missing schema fields; got {sorted(d.keys())}")
+    except urllib.error.HTTPError as exc:
+        record("csi_feedback_export", "WARN" if exc.code in (404, 503) else "FAIL",
+               f"HTTP {exc.code} (non-CSI build?)" if exc.code in (404, 503) else f"HTTP {exc.code}")
+    except Exception as exc:
+        record("csi_feedback_export", "FAIL", str(exc))
+
+    # Invalid labels must be rejected before the store is touched.
+    try:
+        http_post(ip, "/api/csi/feedback?label=invalid", auth=auth, timeout=timeout)
+        record("csi_feedback_guard", "FAIL", "invalid label was NOT rejected")
+    except urllib.error.HTTPError as exc:
+        if exc.code == 400:
+            record("csi_feedback_guard", "PASS", "invalid label rejected (400)")
+        elif exc.code in (404, 503):
+            record("csi_feedback_guard", "WARN", f"HTTP {exc.code} (non-CSI build?)")
+        else:
+            record("csi_feedback_guard", "FAIL", f"unexpected HTTP {exc.code} (expected 400)")
+    except Exception as exc:
+        record("csi_feedback_guard", "FAIL", str(exc))
 
 
 def check_metrics(ip, auth, timeout):

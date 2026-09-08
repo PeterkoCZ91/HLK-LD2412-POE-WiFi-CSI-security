@@ -25,7 +25,14 @@ void setUp() {}
 void tearDown() {}
 
 static WebAdmissionConfig defaults() {
-    return WebAdmissionConfig();  // 8 in flight, 3 kB reserve, 14 kB floor, 10 s TTL
+    // Explicit historical configuration: keep the original dev17 policy cases
+    // pinned to the numbers that scenario was measured with, independent of
+    // later production recalibrations of the struct's own defaults below.
+    WebAdmissionConfig cfg;
+    cfg.maxInFlight = 8;
+    cfg.reserveBytes = 3u * 1024;
+    cfg.floorBytes = 14u * 1024;
+    return cfg;
 }
 
 // Heap the node sits at when idle, per the bench run.
@@ -303,8 +310,36 @@ void test_disabled_policy_accepts_everything() {
     TEST_ASSERT_EQUAL_UINT32(0, policy.rejectsConcurrency());
 }
 
+void test_production_reserve_bounds_idf5_burst() {
+    // dev6 (2026-09-06): a clean restart with no web load showed free heap
+    // settling at ~32 KiB once MQTT connects (was ~45 kB before that connect) —
+    // see docs/RELEASE_5.7.1_VALIDATION.md. floorBytes was raised from 14 to
+    // 20 KiB to restore real margin at that baseline; recheck this test's
+    // expected count if either number changes again.
+    WebAdmissionPolicy policy;
+    unsigned accepted = 0;
+    for (unsigned i = 0; i < 6; ++i)
+        accepted += policy.admit(1000, 33032, false).accepted();
+    TEST_ASSERT_EQUAL_UINT(1, accepted);
+    TEST_ASSERT_TRUE(33032 - accepted * 8192 >= policy.config().floorBytes);
+}
+
+void test_production_cap_and_recovery() {
+    WebAdmissionPolicy policy;
+    WebAdmitResult slots[4];
+    for (auto& slot : slots) {
+        slot = policy.admit(1000, 100000, false);
+        TEST_ASSERT_TRUE(slot.accepted());
+    }
+    TEST_ASSERT_FALSE(policy.admit(1000, 100000, false).accepted());
+    for (auto& slot : slots) policy.release(slot.slot);
+    TEST_ASSERT_TRUE(policy.admit(1001, 33032, false).accepted());
+}
+
 int main(int, char**) {
     UNITY_BEGIN();
+    RUN_TEST(test_production_reserve_bounds_idf5_burst);
+    RUN_TEST(test_production_cap_and_recovery);
     RUN_TEST(test_burst_of_20_against_a_still_healthy_heap_stops_at_the_cap);
     RUN_TEST(test_capped_burst_keeps_the_heap_out_of_the_panic_band);
     RUN_TEST(test_low_heap_stops_admission_long_before_the_cap);

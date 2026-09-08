@@ -20,6 +20,7 @@
 #include "services/MQTTService.h"
 #include "services/SecurityMonitor.h"
 #include "services/AuthLockout.h"
+#include "services/MqttCommandRouter.h"
 #include "services/NotificationService.h"
 #include "services/TelegramService.h"
 #include "services/LogService.h"
@@ -28,6 +29,7 @@
 #include "services/HeapWatermarkRing.h"
 #include "services/DmsPolicy.h"
 #include "services/EventLog.h"
+#include "services/MlFeedbackStore.h"
 #include "services/RuntimeOperationCoordinator.h"
 #include "services/ConfigSnapshot.h"
 #include "services/MQTTOfflineBuffer.h"
@@ -60,9 +62,8 @@
 // Defines
 // -------------------------------------------------------------------------
 #include <Update.h>
-#ifndef FW_VERSION
-#define FW_VERSION "v5.7.0"
-#endif
+#include "FirmwareVersion.h"
+#include "services/HeapActivity.h"
 #define WDT_TIMEOUT_SECONDS 60
 
 // v5.0.2-rc1: RTC slow-memory uptime tracker for finer-grained TWDT crash forensics.
@@ -150,6 +151,7 @@ RTC_NOINIT_ATTR static OomMarker g_oomMarker;
 static bool g_lastBootWasOomRestart = false;   // loop guard input, set once at boot
 static std::atomic<bool> g_oomRestartEnabled{true};   // NVS oom_restart_en
 EventLog eventLog(RAM_CAPACITY);
+MlFeedbackStore mlFeedbackStore;
 ConfigSnapshot configSnapshot;
 MQTTOfflineBuffer mqttOfflineBuffer;
 #ifndef NO_BLUETOOTH
@@ -657,7 +659,7 @@ void setup() {
     Serial.println("=============================================");
     Serial.println("   POE-2412 SECURITY NODE - BOOT SEQUENCE");
     Serial.println("=============================================");
-    Serial.print(">> FW Version: "); Serial.println(FW_VERSION);
+    Serial.println(">> " FW_VERSION_BINARY_MARKER);
     // Configured flash size (from build header) — makes the flashed variant
     // visible in the boot log. NOTE: this is the BUILD's flash_size, not the
     // physical chip (a 16MB build on an 8MB chip bootloops in the bootloader
@@ -1031,8 +1033,10 @@ void setup() {
         .configSnapshot = &configSnapshot,
         #ifdef USE_CSI
         .csiService = &csiService,
+        .mlFeedbackStore = &mlFeedbackStore,
         #else
         .csiService = nullptr,
+        .mlFeedbackStore = nullptr,
         #endif
     };
 
@@ -1095,49 +1099,26 @@ void setup() {
             } else if (strcmp(topic, t.cmd_dyn_bg) == 0) {
                 radar.startCalibration();
             } else if (strcmp(topic, t.alarm_set) == 0) {
-                String cmd = String(payload);
-                // PIN guard: if sec_mqtt_pin is set, payload must be "CMD:pin"
                 const String mqttPin = preferences.getString("sec_mqtt_pin", "");
-                bool pinOk = true;
-                String cmdBase = cmd;
-                if (mqttPin.length() > 0) {
-                    uint32_t now = millis();
-                    // Brute-force lockout: reject without even checking the PIN
-                    // while locked, so a flood of wrong PINs can't be tried at
-                    // line rate (S-0b). Shared bucket, key 0.
-                    if (mqttCmdLockout.lockedForMs(0, now) > 0) {
-                        pinOk = false;
+                MqttArmResult r = MqttCommandRouter::evaluateArmCommand(
+                    payload, mqttPin.c_str(), mqttCmdLockout, millis());
+                switch (r.decision) {
+                    case MqttArmDecision::Accepted:
+                        if (r.command == MqttArmCommand::ArmAway) securityMonitor.setArmed(true, false, false);
+                        else if (r.command == MqttArmCommand::ArmHome) securityMonitor.setArmed(true, false, true);
+                        else if (r.command == MqttArmCommand::Disarm) securityMonitor.setArmed(false);
+                        break;
+                    case MqttArmDecision::RejectedLockedOut:
                         DBG("SecMon", "MQTT alarm cmd rejected — PIN locked out");
-                    } else {
-                        int sep = cmd.indexOf(':');
-                        if (sep < 0) {
-                            // No PIN supplied. This is NOT a brute-force guess
-                            // (you can't guess a PIN without sending one), so it
-                            // must NOT count toward the lockout — otherwise HA,
-                            // whose alarm_control_panel discovery is code_*_
-                            // required:false and sends bare ARM/DISARM, would
-                            // lock the bucket and block legitimate CMD:pin
-                            // commands. Reject only.
-                            pinOk = false;
-                            DBG("SecMon", "MQTT alarm cmd '%s' rejected — PIN required", cmd.c_str());
-                        } else {
-                            cmdBase = cmd.substring(0, sep);
-                            pinOk = (cmd.substring(sep + 1) == mqttPin);
-                            if (pinOk) {
-                                mqttCmdLockout.onSuccess(0);
-                            } else {
-                                // A wrong PIN with the CMD:pin shape IS a guess —
-                                // this is the only path that feeds the lockout.
-                                mqttCmdLockout.onFailure(0, now);
-                                DBG("SecMon", "MQTT alarm cmd rejected — wrong PIN");
-                            }
-                        }
-                    }
-                }
-                if (pinOk) {
-                    if (cmdBase == "ARM_AWAY") securityMonitor.setArmed(true, false, false);
-                    else if (cmdBase == "ARM_HOME") securityMonitor.setArmed(true, false, true);
-                    else if (cmdBase == "DISARM") securityMonitor.setArmed(false);
+                        break;
+                    case MqttArmDecision::RejectedNoPin:
+                        DBG("SecMon", "MQTT alarm cmd '%s' rejected — PIN required", payload);
+                        break;
+                    case MqttArmDecision::RejectedWrongPin:
+                        DBG("SecMon", "MQTT alarm cmd rejected — wrong PIN");
+                        break;
+                    case MqttArmDecision::RejectedUnknownCommand:
+                        break;
                 }
             } else if (strstr(topic, "/supervision/alive") != nullptr) {
                 const char* start = topic + 9; // skip "security/"
@@ -1187,6 +1168,7 @@ void setup() {
     if (fsOk) DBG("FS", "LittleFS mounted — %u KB used / %u KB total", LittleFS.usedBytes()/1024, LittleFS.totalBytes()/1024);
 
     eventLog.begin(fsOk);
+    mlFeedbackStore.begin(fsOk);
     if (fsOk) configSnapshot.begin();
     if (fsOk && configManager.getConfig().mqtt_enabled) {
         mqttOfflineBuffer.begin();
@@ -1534,6 +1516,10 @@ void loop() {
             wm.discoveryIndex = (int16_t)mqttService.discoveryIndex();
             wm.mqttConnected  = mqttService.connected() ? 1 : 0;
             wm.runtimeOp      = (uint8_t)g_runtimeOperationCoordinator.status().operation;
+            if (auto* gs = GatedAsyncWebServer::active()) wm.inFlight = gs->admission().inFlight();
+            wm.sseClients = (uint8_t)events.count();
+            wm.sseWaiting = events.avgPacketsWaiting();
+            wm.activityMask = g_heapActivityMask.load();
             heapWmRingAppend(g_heapWmRing, wm);
             // DBG only — deliberately NOT systemLog: that path feeds the shared
             // 20-slot RTC ring this record was moved out of.
@@ -1571,7 +1557,10 @@ void loop() {
         }
     }
 
-    if (configManager.getConfig().mqtt_enabled) mqttService.update();
+    if (configManager.getConfig().mqtt_enabled) {
+        HeapActivityScope activity(HeapActivity::MqttLoop);
+        mqttService.update();
+    }
 #ifdef USE_CSI
     csiService.processDeferredActions();
     if (configManager.getConfig().csi_enabled) {
@@ -1657,7 +1646,10 @@ void loop() {
     }
 
     securityMonitor.update();
-    telegramBot.update();
+    {
+        HeapActivityScope activity(HeapActivity::TelegramLoop);
+        telegramBot.update();
+    }
     eventLog.flush();
 
     // dev8: MQTT outage event — retried every pass until the (cheap,
@@ -2092,6 +2084,7 @@ void loop() {
         g_sseHeapSkips.record((uint32_t)now, sseFree);
     }
     if (sseDue && sseFree >= HEAP_MIN_FOR_PUBLISH) {
+        HeapActivityScope activity(HeapActivity::SsePublish);
         lastSSE = now;
         JsonDocument doc;
         radar.getTelemetryJson(doc);

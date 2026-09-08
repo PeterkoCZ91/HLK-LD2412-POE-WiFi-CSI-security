@@ -2,9 +2,66 @@
 
 All notable changes to this project will be documented in this file.
 
-## [5.7.0] - 2026-09-04
+## [5.7.1] - 2026-09-08
 
-Reliability release, composed from dev1 through dev19 on top of the v5.6.0
+Release hardening after the 5.7.0 reliability line, built on a clean 25-hour
+bench soak of the base changes (no reboot, MQTT disconnect, Ethernet flap,
+CSI failure, web rejection, or starved processing tick — a short-lived heap
+watermark drop to 3920 bytes recovered on its own, tripwire origin
+unidentified). Concurrent HTTP/SSE load then reliably crashed the IDF5
+bench build (dev4-dev9; oom_gate / panic / interrupt WDT depending on the
+build). Root cause: the pinned AsyncTCP v3.4.10 predated
+ESP32Async/AsyncTCP#118, an upstream use-after-free fix in the
+connection-abort path that this firmware's admission-rejection code
+exercises directly under load. Bumping the pin to v3.5.0 resolved every
+reproduction that previously crashed the build, including the fastest-
+failing case found during the investigation. A hardware MQTT alarm-router
+test (arm/disarm over the real broker), ~3.6 h of bounded HTTP/SSE load
+across five concurrency/SSE combinations, and a clean 24-hour quiet soak
+(1434 samples, zero reboots) confirm the fix — parity with the 5.7.0
+validation bar. See
+[the release validation log](docs/RELEASE_5.7.1_VALIDATION.md) for full
+evidence and reproduction commands.
+
+### Added
+
+- On-device CSI/ML feedback capture and paginated export for false-alarm
+  labeling, including mutation guards and native coverage.
+- Explicit web request admission limits and persistent heap-forensics records
+  for diagnosing transient allocation pressure.
+
+### Changed
+
+- Dashboard sources now live under `web/src/` and generate the embedded
+  firmware header reproducibly.
+- MQTT alarm command authentication is handled by a dedicated, tested router.
+- Firmware versioning has one build-level source shared by every shipped
+  environment and translation unit. Release artifacts carry a unique
+  `POE2412_FW_VERSION` marker, and CI fails instead of publishing an
+  `UNKNOWN` version manifest.
+
+### Fixed
+
+- Upgraded the vendored AsyncTCP dependency (v3.4.10 → v3.5.0) to pick up an
+  upstream use-after-free fix in the connection-abort path
+  (ESP32Async/AsyncTCP#118) that this firmware's web admission policy hit
+  directly under concurrent load, crashing the node.
+- `/api/health` no longer builds several temporary `String` objects per
+  request (hostname, MAC, IP, TLS-port comparison) and embeds the reset
+  history as raw JSON instead of a double-escaped string.
+- The release smoke test now matches the asynchronous site-learning contract
+  (`202 Accepted`) and covers the CSI feedback export and invalid-label guard.
+- The radar-only build no longer reports firmware version `unknown` from the
+  Telegram status command.
+- `/api/health` now names every ESP OTA image state instead of collapsing
+  normal serial-flash states into `unknown`; smoke treats invalid states as
+  failures while allowing `new`/`undefined` outside an OTA validation cycle.
+- Heap-pressure publish skips are counted and surfaced instead of silently
+  discarding a complete publish cycle.
+
+## [5.7.0] - 2026-08-31
+
+Reliability release, composed from dev1 through dev17 on top of the v5.6.0
 base. The line opened as a detection-tuning change — the selectable adaptive
 percentile (#13) — and turned into memory and networking forensics after a
 field node spent three days in a panic streak that nobody noticed until its
@@ -15,13 +72,9 @@ earlier in the same line. Two entries correct earlier fixes from this very
 line; both are kept in the history rather than squashed away, because the
 reason each one failed is the useful part.
 
-The lab node closed the dev1-dev17 line at 177.54 h without a reboot, against
-64.14 h for the best build before it. dev18/dev19's admission and
-skip-visibility hardening closed its own two-node soak at 42.5 h, zero
-reboots on either node, the web gate never closing and zero rejected
-requests; the lab node's MQTT-reconnect rate (9.6/day) held stable against an
-independent measurement at less than half that runtime. Native coverage rises
-from 240 to 385 tests, and all five shipped firmware environments build.
+The lab node closed the line at 177.54 h without a reboot, against 64.14 h for
+the best build before it. Native coverage rises from 240 to 355 tests, and all
+five shipped firmware environments build.
 
 ### Added
 
@@ -66,17 +119,6 @@ from 240 to 385 tests, and all five shipped firmware environments build.
   `ethernet.route{eth_is_default, asserts, changes}` reports which interface
   lwIP hands outbound TCP to. Until this release the only way to answer that
   second question was a packet capture on the LAN segment.
-- **The node now says how often it drops a publish cycle, and how deep the
-  heap went when it did (dev19).** `loop()` skips the entire MQTT publish
-  block — all three tiers — and the SSE telemetry tick whenever free heap is
-  under `HEAP_MIN_FOR_PUBLISH`. Until now the only trace was a bare
-  `[WARN] Low heap — skipping MQTT publish` carrying no number and
-  rate-limited to one line per 10 s, so ten lines over a 37 h soak could
-  equally have been ten events or ten thousand. `/api/health` gains a
-  `heap_skips` object (`mqtt`, `mqtt_logged`, `sse`, `lowest_free`) that
-  counts every skip regardless of the rate limit, and the serial line now
-  reports the free heap it actually decided on, plus `largest`, `min`,
-  in-flight HTTP requests, SSE depth and the runtime operation.
 - **Selectable adaptive-threshold percentile (#13, dev1).** The rolling
   detection threshold was hard-wired to the P95 of the idle-variance window
   and is now settable to P99, which rides higher on the noise tail and cuts

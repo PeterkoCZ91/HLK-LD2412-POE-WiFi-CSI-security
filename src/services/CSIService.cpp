@@ -1227,6 +1227,13 @@ void CSIService::_runMlInference() {
                                 _lastDser, _lastPlcr,
                                 feats);
 
+    // T9: stash the exact vector behind this decision for the feedback loop.
+    MlLastInference inference;
+    memcpy(inference.feats, feats, sizeof(feats));
+    inference.uptimeMs = millis();
+    inference.valid = true;
+    _lastMlInference.publish(inference);
+
     // StandardScaler + MLP forward pass (17 -> 18 -> 9 -> 1)
     float norm[csi_ml::ML_NUM_FEATURES];
     for (uint8_t i = 0; i < csi_ml::ML_NUM_FEATURES; i++) {
@@ -1505,7 +1512,7 @@ void CSIService::update() {
 
         static uint32_t lastReconnect = 0;
         if (millis() - lastReconnect > 10000) {
-            _reconnectAttempts++;
+            _reconnectAttempts = _reconnectAttempts + 1;
             // Out-of-coverage visibility: previously this loop was silent and the
             // 30s diag below was skipped by the early return, so serial debug went
             // quiet exactly when WiFi dropped. Log each attempt with the raw WL_*

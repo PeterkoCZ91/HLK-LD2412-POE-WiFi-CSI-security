@@ -32,8 +32,11 @@ struct HeapWatermarkRecord {
     int16_t  discoveryIndex;  // -1 = HA discovery not running
     uint8_t  mqttConnected;
     uint8_t  runtimeOp;       // RuntimeOperation enum value
-    uint16_t _pad;
-};  // 32 bytes
+    uint8_t inFlight;
+    uint8_t sseClients;
+    uint32_t sseWaiting;
+    uint32_t activityMask;
+};
 
 struct HeapWatermarkRtcRing {
     uint32_t magic;
@@ -42,7 +45,7 @@ struct HeapWatermarkRtcRing {
     HeapWatermarkRecord records[HEAP_WM_RING_CAPACITY];
 };
 
-static const uint32_t HEAP_WM_RING_MAGIC = 0x48576D31;  // "HWm1"
+static const uint32_t HEAP_WM_RING_MAGIC = 0x48576D32;  // "HWm2": web/activity context
 
 // Same reflected CRC32 as LogRing — bytewise, no table; this runs at most
 // HEAP_WM_RING_CAPACITY times per boot.

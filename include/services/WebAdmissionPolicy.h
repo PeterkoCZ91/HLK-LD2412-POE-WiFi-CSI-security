@@ -75,9 +75,18 @@ enum class WebAdmit : uint8_t {
 
 struct WebAdmissionConfig {
     bool     enabled      = true;
-    uint8_t  maxInFlight  = 8;          // browsers cap at 6 sockets/host; 12 hurt the node
-    uint32_t reserveBytes = 3u * 1024;  // resident heap cost of one in-flight request
-    uint32_t floorBytes   = 14u * 1024; // kept in step with HeapGateConfig::closeFreeBytes
+    uint8_t  maxInFlight  = 4;
+    // IDF5 responses own JSON, payload, a 2872-byte send buffer and lwIP copies.
+    // The old 3 KiB estimate missed the peak: six requests exhausted 33 KiB.
+    uint32_t reserveBytes = 8u * 1024;
+    // Kept in step with HeapGateConfig::closeFreeBytes (GatedWebServer.h calls
+    // setFloorBytes() every accept) — this default only matters where nothing
+    // overrides it, e.g. native tests. Raised from 14 KiB after a bench dev6
+    // stress test still triggered an oom_gate restart with the old value: real
+    // steady-state free heap (once MQTT is connected) is ~32 KiB, not the
+    // ~45 KiB this policy's reserve math assumed — see HeapGatePolicy.h and
+    // docs/RELEASE_5.7.1_VALIDATION.md.
+    uint32_t floorBytes   = 20u * 1024;
     uint32_t slotTtlMs    = 10000;      // reclaim when the disconnect never arrives
 };
 
